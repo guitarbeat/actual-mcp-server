@@ -36,7 +36,7 @@ export function createMcpAuth(): MCPAuth | null {
   if (!config.OIDC_RESOURCE) {
     throw new Error(
       '[OIDC] AUTH_PROVIDER=oidc requires OIDC_RESOURCE to be set. ' +
-      'Example: OIDC_RESOURCE=https://actual-mcp.example.com'
+      'Example: OIDC_RESOURCE=https://actual-mcp.example.com/mcp (the Auth0 API Identifier)'
     );
   }
 

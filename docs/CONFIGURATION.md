@@ -42,6 +42,7 @@ Legend for **Source**: `schema` = validated Zod key; `raw` = read directly from
 | `MCP_BRIDGE_PUBLIC_SCHEME` | string | auto-detected | No | no | raw | `index.ts` | Advertised scheme override |
 | `MCP_BRIDGE_USE_TLS` | bool string | `false` | No | no | raw | `index.ts:277` | Deprecated alias of `MCP_ENABLE_HTTPS`; affects ONLY the advertised scheme |
 | `MCP_HTTP_BODY_LIMIT` | size string | `512kb` | No | no | schema | config | Max JSON-RPC request body (#168) |
+| `MCP_ALLOWED_ORIGINS` | csv of http(s) origins | derived | No | no | schema | config; `httpServer.ts` | Exact browser origins accepted by Streamable HTTP; invalid origins receive `403`. Empty derives from the public host and loopback |
 | `MCP_TRANSPORT_MODE` | enum | `--http` | No | no | schema | config | `--http` (stdio uses the `--stdio` flag) |
 
 ## Transport / routing
@@ -69,7 +70,7 @@ Legend for **Source**: `schema` = validated Zod key; `raw` = read directly from
 | `MCP_ALLOW_UNAUTHENTICATED` | bool string | `false` | No | no | schema | `index.ts` | #242 opt-out: only `true` lets HTTP serve unauthenticated on a non-loopback bind; otherwise the server refuses to start |
 | `OIDC_ISSUER` | url string | (none) | If oidc | no | schema | config | OIDC issuer URL |
 | `OIDC_ALLOW_INSECURE_ISSUER` | bool string | `false` | No | no | schema | `httpServer.ts` | #244 opt-out: allow an http OIDC issuer on a trusted network (default refuses non-https/non-loopback issuers at startup) |
-| `OIDC_RESOURCE` | url string | (none) | No | no | schema | config | Expected `aud` claim |
+| `OIDC_RESOURCE` | url string | (none) | No | no | schema | config | Expected `aud` claim; for Auth0, use the API Identifier exactly |
 | `OIDC_ACCEPTED_AUDIENCES` | csv string | (none) | No | no | schema | `httpServer.ts` | #245 extra accepted `aud` values beyond `OIDC_RESOURCE` (strict allowlist; for IdPs that put the client-id in `aud`, e.g. Authentik) |
 | `OIDC_JWKS_TRUSTED_HOSTS` | csv string | (none) | No | no | schema | `httpServer.ts` | #254 opt-in cross-origin JWKS hosts (`host` or `host:port`, exact match, no wildcards). For IdPs whose `jwks_uri` lives on another host, e.g. Google: `OIDC_ISSUER=https://accounts.google.com` needs `OIDC_JWKS_TRUSTED_HOSTS=www.googleapis.com`. Empty default keeps same-origin-only |
 | `OIDC_SCOPES` | csv string | (none) | No | no | schema | config | Comma-separated required scopes |

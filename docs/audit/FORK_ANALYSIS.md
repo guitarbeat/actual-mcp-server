@@ -64,7 +64,7 @@ prior verdicts forward unchanged.
     can discover the `token_endpoint`, synthesized from the issuer's OIDC discovery
     document. Needed because some IdPs (Authentik) do not expose that well-known path.
     We already serve the complementary RFC 8707/9728 protected-resource metadata
-    (`/.well-known/oauth-protected-resource`) but not this. Idea value: HIGH (unlocks the
+    (endpoint-specific `/.well-known/oauth-protected-resource/<path>`, for example `/mcp`) but not this. Idea value: HIGH (unlocks the
     built-in Claude.ai OAuth flow against standard OIDC IdPs). Security-sensitive (SSRF,
     endpoint disclosure): mandatory security review before adoption.
 - Noise (ignored): `npm audit` dependency bump, `docker-compose.yaml`/`package.json` tweaks.

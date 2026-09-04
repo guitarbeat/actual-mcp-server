@@ -208,8 +208,9 @@ For multi-user deployments with an OIDC provider (Casdoor, Keycloak, Auth0, etc.
 # .env
 AUTH_PROVIDER=oidc
 OIDC_ISSUER=https://sso.yourdomain.com
-OIDC_RESOURCE=your-client-id          # must match 'aud' claim in JWT
+OIDC_RESOURCE=https://actual-mcp.yourdomain.com/mcp  # Auth0 API Identifier; must match 'aud' exactly
 OIDC_SCOPES=                          # leave empty for Casdoor (no 'scope' claim)
+MCP_ALLOWED_ORIGINS=https://actual-mcp.yourdomain.com  # exact public browser origin(s)
 # Only for IdPs whose JWKS lives on a different host than the issuer (#254).
 # Google: issuer accounts.google.com serves keys from www.googleapis.com:
 # OIDC_JWKS_TRUSTED_HOSTS=www.googleapis.com
@@ -230,7 +231,7 @@ Principal key formats:
 
 **Casdoor note**: Casdoor JWTs do not include a `scope` claim. Set `OIDC_SCOPES=` (empty string) to disable scope enforcement.
 
-**OAuth discovery for Claude.ai / mcp-remote (#285)**: with `AUTH_PROVIDER=oidc`, the server automatically publishes both OAuth metadata documents a client needs to start a login: `/.well-known/oauth-protected-resource` (RFC 9728) and `/.well-known/oauth-authorization-server` (RFC 8414). The RFC 8414 document is re-served from your IdP's own OpenID discovery doc, which lets clients that resolve that path against the resource-server origin (and IdPs like Authentik that do not expose it where clients look) complete the flow. No configuration is required: point your OIDC client at the server's base URL and it discovers `OIDC_ISSUER`'s `authorization_endpoint` / `token_endpoint` automatically. If a client cannot find the token endpoint against a bare-OIDC IdP, confirm `AUTH_PROVIDER=oidc` is set (the endpoints exist only in OIDC mode).
+**OAuth discovery for Claude.ai / mcp-remote (#285)**: with `AUTH_PROVIDER=oidc`, the server automatically publishes both OAuth metadata documents a client needs to start a login: endpoint-specific `/.well-known/oauth-protected-resource/<path>` (RFC 9728; production `/mcp` is `/.well-known/oauth-protected-resource/mcp`) and `/.well-known/oauth-authorization-server` (RFC 8414). An unauthenticated MCP request also supplies the protected-resource URL in `WWW-Authenticate` as `resource_metadata`; clients should follow that URL when present. The RFC 8414 document is re-served from your IdP's own OpenID discovery doc, which lets clients that resolve that path against the resource-server origin (and IdPs like Authentik that do not expose it where clients look) complete the flow. No configuration is required: point your OIDC client at the server's base URL and it discovers `OIDC_ISSUER`'s `authorization_endpoint` / `token_endpoint` automatically. If a client cannot find the token endpoint against a bare-OIDC IdP, confirm `AUTH_PROVIDER=oidc` is set (the endpoints exist only in OIDC mode).
 
 ---
 

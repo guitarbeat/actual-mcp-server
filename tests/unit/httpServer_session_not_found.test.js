@@ -114,7 +114,7 @@ console.log('\n[source] tools/list discovery shim is preserved');
 // There were FOUR, not the three the extraction commit claimed: the SDK handler, the
 // no-session LobeChat path, THIS expired-session discovery shim, and stdio. The shim was
 // missed, so a LobeChat client caching a session id across a server restart would have got
-// 74 tools with NO annotations, and every one would fall back to the spec's defaults:
+// 77 tools with NO annotations, and every one would fall back to the spec's defaults:
 // readOnlyHint false, destructiveHint true, openWorldHint true. The 31 read-only tools would
 // have been presented to that client as destructive open-world writes. This is the path most
 // likely to be hit in production and least likely to be noticed, which is why it is pinned

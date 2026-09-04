@@ -31,6 +31,8 @@ import * as fs from 'node:fs';
 // `requestContext` from this module.
 import { requestContext } from '../lib/requestContext.js';
 import { buildToolListEntries } from '../lib/tool-list-entry.js';
+import { appendBearerScope } from '../lib/bearer-challenge.js';
+import { deriveAllowedOrigins, isAllowedOrigin, parseAllowedOrigins } from '../lib/origin-allowlist.js';
 export { requestContext };
 
 // Resolve the authenticated principal for the per-principal budget preference
@@ -62,6 +64,33 @@ export async function startHttpServer(
   // rather than buffered unbounded. Tunable via MCP_HTTP_BODY_LIMIT (default 512kb).
   app.use(express.json({ limit: config.MCP_HTTP_BODY_LIMIT }));
   const scheme = config.MCP_ENABLE_HTTPS ? 'https' : 'http';
+
+  const allowedOrigins = config.MCP_ALLOWED_ORIGINS.trim()
+    ? parseAllowedOrigins(config.MCP_ALLOWED_ORIGINS)
+    : deriveAllowedOrigins({
+        advertisedUrl,
+        publicHost: process.env.MCP_BRIDGE_PUBLIC_HOST,
+        publicScheme: process.env.MCP_BRIDGE_PUBLIC_SCHEME || scheme,
+        port,
+      });
+  logger.info(`[ORIGIN] Allowed origins: ${allowedOrigins.join(', ')}`);
+
+  // MCP 2025-11-25 requires invalid Origin headers to receive 403. Put this
+  // before bearer/OIDC authentication so an untrusted browser origin cannot
+  // probe the auth stack and get a misleading 401 instead.
+  const originGuard = (req: Request, res: Response, next: () => void) => {
+    const origin = req.get('origin');
+    if (origin && !isAllowedOrigin(origin, allowedOrigins)) {
+      logger.warn(`[ORIGIN] Rejected Origin ${origin}`);
+      res.status(403).json({
+        error: 'invalid_origin',
+        error_description: 'The request Origin is not allowed for this MCP endpoint.',
+      });
+      return;
+    }
+    next();
+  };
+  app.use([httpPath, '/mcp'], originGuard);
 
   // --- OIDC / mcp-auth (CF-5) ---
   // When AUTH_PROVIDER=oidc, validate JWTs and enforce budget ACL.
@@ -185,15 +214,38 @@ export async function startHttpServer(
         };
       };
 
+      const bearerAuth = mcpAuth.bearerAuth(customJwtVerify, {
+        resource: config.OIDC_RESOURCE,
+        // Audience (aud=clientId) is enforced inside customJwtVerify via jose's
+        // jwtVerify audience option (#160), not here.
+        requiredScopes,
+        showErrorDetails: process.env.NODE_ENV !== 'production',
+      });
+
+      // mcp-auth 0.2.0 emits resource_metadata but does not yet include the
+      // optional scope challenge parameter recommended by MCP 2025-11-25.
+      // Patch only response header writes, leaving its verification/error
+      // handling unchanged and avoiding token material in our own logs.
+      const bearerAuthWithScope = requiredScopes.length === 0
+        ? bearerAuth
+        : async (req: Request, res: Response, next: () => void) => {
+            const originalSetHeader = res.setHeader.bind(res);
+            res.setHeader = ((name: string | symbol, value: unknown) => {
+              if (String(name).toLowerCase() === 'www-authenticate' && typeof value === 'string') {
+                value = appendBearerScope(value, requiredScopes);
+              }
+              return originalSetHeader(name as string, value as string | number | readonly string[]);
+            }) as typeof res.setHeader;
+            try {
+              await bearerAuth(req, res, next);
+            } finally {
+              res.setHeader = originalSetHeader as typeof res.setHeader;
+            }
+          };
+
       app.use(
         [httpPath, '/mcp'],
-        mcpAuth.bearerAuth(customJwtVerify, {
-          resource: config.OIDC_RESOURCE,
-          // Audience (aud=clientId) is enforced inside customJwtVerify via jose's
-          // jwtVerify audience option (#160), not here.
-          requiredScopes,
-          showErrorDetails: process.env.NODE_ENV !== 'production',
-        }),
+        bearerAuthWithScope,
         budgetAclMiddleware as express.RequestHandler,
       );
       logger.info(`[OIDC] JWT authentication enabled. Issuer: ${config.OIDC_ISSUER}`);
@@ -468,6 +520,8 @@ export async function startHttpServer(
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           enableJsonResponse: true,
+          allowedOrigins,
+          enableDnsRebindingProtection: true,
           onsessioninitialized: async (sid: string) => {
             logger.debug(`Session initialized: ${sid}`);
             // Store the promise before starting initialization

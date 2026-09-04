@@ -13,7 +13,7 @@
 //
 // Leaving only the forward check cost exactly what you would expect. By v0.10.0 the
 // README was missing SIX tools, including the entire Schedules domain (4 tools), and
-// the section counts summed to 68 against a canonical 74. Both drifted together and
+// the section counts summed to 68 against a canonical 77. Both drifted together and
 // silently, because nothing looked in that direction. So this file now asserts:
 //
 //   1. forward:  every README-advertised name is registered  (the #234 guard)
@@ -63,9 +63,9 @@ console.log('\n[advertised-tools-sync]');
 const registry = registryNames();
 
 check('registry parsed completely (case-insensitive, no under-count)', () => {
-  // The repo ships 74 tools; the extractor must capture them all (including the
+  // The repo ships 77 tools; the extractor must capture them all (including the
   // camelCase budgets tools), so a loose floor cannot mask a partial parse.
-  assert.ok(registry.size >= 74, `expected >= 74 registered tools, got ${registry.size}`);
+  assert.ok(registry.size >= 77, `expected >= 77 registered tools, got ${registry.size}`);
 });
 
 check('every actual_<domain>_<action> name advertised in README is in IMPLEMENTED_TOOLS', () => {

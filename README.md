@@ -494,6 +494,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `MCP_HTTP_PATH` | `/http` | No | Configured HTTP endpoint routing path. `/mcp` is always available as an authenticated alias through the same middleware stack |
 | `MCP_BRIDGE_HTTP_PATH` | same as `MCP_HTTP_PATH` | No | Advertised HTTP path shown to clients (set when a reverse proxy rewrites the path) |
 | `MCP_HTTP_BODY_LIMIT` | `512kb` | No | Maximum accepted JSON-RPC request body size (e.g. `512kb`, `1mb`) |
+| `MCP_ALLOWED_ORIGINS` | _(derived)_ | No | Comma-separated exact `http(s)` origins allowed in the MCP `Origin` header. Invalid origins receive `403`; unset derives from the public host and loopback |
 | **Session Management** ||||
 | `USE_CONNECTION_POOL` | `true` | No | Enable session-based connection pooling |
 | `MAX_CONCURRENT_SESSIONS` | `15` | No | Maximum concurrent MCP sessions allowed |
@@ -504,7 +505,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `MCP_ALLOW_UNAUTHENTICATED` | `false` | No | Opt-out for required-by-default HTTP auth (#242). On a non-loopback bind with no token and no OIDC the server refuses to start; set to `true` to run open deliberately (e.g. behind your own proxy) |
 | `OIDC_ISSUER` | _(none)_ | If OIDC | OIDC issuer URL (e.g., `https://sso.example.com`) |
 | `OIDC_ALLOW_INSECURE_ISSUER` | `false` | No | Allow a plaintext (http) OIDC issuer on a trusted network (#244). Off by default (http issuer refused at startup); set `true` only for local/LAN testing |
-| `OIDC_RESOURCE` | _(none)_ | No | Expected `aud` claim in JWT (your client ID) |
+| `OIDC_RESOURCE` | _(none)_ | No | Expected `aud` claim in JWT; for Auth0, use the API Identifier exactly |
 | `OIDC_ACCEPTED_AUDIENCES` | _(none)_ | No | Extra accepted `aud` values beyond `OIDC_RESOURCE`, comma-separated (#245). For IdPs that put the client-id in `aud` (e.g. Authentik). Strict allowlist, never a wildcard |
 | `OIDC_JWKS_TRUSTED_HOSTS` | _(none)_ | No | Opt-in cross-origin JWKS hosts, comma-separated `host` or `host:port` (#254). For IdPs whose `jwks_uri` lives on another host, e.g. Google needs `www.googleapis.com`. Exact match, no wildcards; empty default keeps same-origin-only |
 | `OIDC_SCOPES` | _(none)_ | No | Comma-separated required scopes; leave empty for Casdoor |
@@ -659,13 +660,19 @@ Clients send: `Authorization: Bearer your_token_here`
 ```bash
 AUTH_PROVIDER=oidc
 OIDC_ISSUER=https://sso.yourdomain.com
-OIDC_RESOURCE=your-client-id    # must match 'aud' JWT claim
+OIDC_RESOURCE=https://actual-mcp.yourdomain.com/mcp  # Auth0 API Identifier; must match 'aud' exactly
 OIDC_SCOPES=                    # leave empty for Casdoor
 ```
 
+**Origin protection.** Streamable HTTP validates browser `Origin` headers before authentication. Set
+`MCP_ALLOWED_ORIGINS` to the public origin(s) when running behind a reverse proxy, for example
+`MCP_ALLOWED_ORIGINS=https://actual-mcp.alw.lol`. Requests without an `Origin` header remain valid for
+stdio-style and non-browser HTTP clients; an unlisted origin receives `403`.
+
 **OAuth discovery endpoints (automatic in OIDC mode).** When `AUTH_PROVIDER=oidc`, the server publishes the two metadata documents an OAuth client needs to bootstrap a login, so `mcp-remote` and Claude.ai's native connector can discover the flow without manual endpoint configuration:
 
-- `GET /.well-known/oauth-protected-resource` (RFC 9728): identifies this server as a protected resource and points at your `OIDC_ISSUER` as the authorization server.
+- `GET /.well-known/oauth-protected-resource/<path>` (RFC 9728): identifies this server as a protected resource and points at your `OIDC_ISSUER` as the authorization server. For the default `/http` listener with the `/mcp` compatibility alias, use `/.well-known/oauth-protected-resource/mcp`.
+- An unauthenticated MCP request also returns `WWW-Authenticate: Bearer ... resource_metadata="..."`; clients should follow that URL when present.
 - `GET /.well-known/oauth-authorization-server` (RFC 8414, #285): the authorization server metadata (its `authorization_endpoint` / `token_endpoint` / `registration_endpoint`), re-served from your IdP's own OpenID discovery document. This is here because several clients look for it on the resource-server origin, and some IdPs (e.g. Authentik) do not expose it where those clients look. It is fetched once at startup and served verbatim, exposes only endpoints your IdP already publishes publicly, and requires no authentication (a client reads it before it has a token). No extra configuration is needed; it is absent when `AUTH_PROVIDER` is not `oidc`.
 
 **Where the per-user budget ACL comes from.** By default the ACL is the `AUTH_BUDGET_ACL` map you maintain by hand. Since v0.10.x it can instead be derived from the Actual server's own per-file access list, so granting or revoking someone in Actual takes effect here without a config edit and a restart:

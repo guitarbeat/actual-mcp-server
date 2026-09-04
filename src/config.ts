@@ -91,6 +91,10 @@ export const configSchema = z.object({
   // Default 512kb is generous headroom over the largest legitimate batch payload
   // while bounding the memory-exhaustion surface. Raise it for bulk-import jobs.
   MCP_HTTP_BODY_LIMIT: z.string().default('512kb'),
+  // Comma-separated exact http(s) origins allowed to send an Origin header to
+  // the Streamable HTTP transport. Empty derives safe public/loopback origins
+  // from the advertised host; explicit values are validated fail-closed.
+  MCP_ALLOWED_ORIGINS: z.string().default(''),
   MAX_CONCURRENT_SESSIONS: z.string().default('15').transform(val => parseInt(val, 10)),
 
   // --- OIDC / mcp-auth (CF-5) ---

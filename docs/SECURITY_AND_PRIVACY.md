@@ -3,7 +3,7 @@
 **Project:** Actual MCP Server  
 **Version:** 0.19.3
 **Purpose:** Define security policies, privacy practices, and incident response  
-**Last Updated:** 2026-06-07
+**Last Updated:** 2026-09-04
 
 ---
 
@@ -88,8 +88,10 @@ and JWKS host for an audit trail. Empty (default) means the same-origin-only beh
 byte-identical to before.
 
 **OAuth discovery metadata endpoints (#285)**: in OIDC mode the server publishes two unauthenticated
-discovery documents so OAuth clients (mcp-remote, Claude.ai) can bootstrap a login. `/.well-known/oauth-protected-resource`
-(RFC 9728) identifies this resource server, and `/.well-known/oauth-authorization-server` (RFC 8414) is the
+discovery documents so OAuth clients (mcp-remote, Claude.ai) can bootstrap a login. The endpoint-specific
+`/.well-known/oauth-protected-resource/<path>` (RFC 9728; `/mcp` is
+`/.well-known/oauth-protected-resource/mcp`) identifies this resource server, and
+`/.well-known/oauth-authorization-server` (RFC 8414) is the
 authorization server metadata, re-served from the IdP's own OpenID discovery document because several clients
 resolve that path against the resource-server origin and some IdPs (Authentik) do not expose it there. Security
 posture: the document is fetched ONCE at startup (the same hardened fetch used for JWKS discovery: https-only issuer,
@@ -99,11 +101,22 @@ secrets, or internal hosts), and it is intentionally unauthenticated because a c
 a token. If the startup fetch fails, the server does not start in OIDC mode (fail closed), so the route is never
 registered with a partial document, and it is absent entirely when `AUTH_PROVIDER` is not `oidc`.
 
+The 401 challenge includes the protected-resource `resource_metadata` link. MCP 2025-11-25 also
+recommends a `scope` parameter when access requires scopes; the current `mcp-auth` integration does
+not add that optional challenge parameter yet, so clients should use `scopes_supported` from the
+protected-resource metadata (`mcp:access` in the Auth0 deployment).
+
+**MCP Streamable HTTP origin validation (2025-11-25):** the server validates `Origin` before authentication
+and returns `403` for an unlisted origin. Set `MCP_ALLOWED_ORIGINS` to the exact public origin(s) behind a
+reverse proxy, for example `https://actual-mcp.alw.lol`; when unset, the server derives a safe allowlist from
+the configured public host and loopback. Requests without an `Origin` header remain valid for non-browser
+clients.
+
 **Configuration**:
 ```bash
 AUTH_PROVIDER=oidc
 OIDC_ISSUER=https://sso.yourdomain.com
-OIDC_RESOURCE=your-client-id          # must match 'aud' claim in JWT
+OIDC_RESOURCE=https://actual-mcp.yourdomain.com/mcp  # Auth0 API Identifier; must match 'aud' exactly
 OIDC_SCOPES=                          # leave empty for Casdoor (no scope claim)
 AUTH_BUDGET_ACL={"alice@example.com":["budget-sync-id-1"]}
 ```

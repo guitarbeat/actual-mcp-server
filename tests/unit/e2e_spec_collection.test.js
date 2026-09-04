@@ -186,7 +186,7 @@ const DECLARED_MANUAL = {
   'mcp-client.playwright.spec.ts':
     '#384: a manual protocol diagnostic, run with `npx playwright test --config playwright.config.ts ' +
     '--project=mcp-protocol-tests` against a running server. NOT a gate. Its round-trip coverage is ' +
-    'duplicated by docker-all-tools.e2e.spec.ts (initialize plus tools/call across all 74 tools) and ' +
+    'duplicated by docker-all-tools.e2e.spec.ts (initialize plus tools/call across all 77 tools) and ' +
     'its expired-session shim assertions by tests/unit/httpServer_session_not_found.test.js. The only ' +
     'thing unique to it is the SSE connect, judged not worth a second Playwright project in the ' +
     'docker job. Wire it in if that judgement changes.',
