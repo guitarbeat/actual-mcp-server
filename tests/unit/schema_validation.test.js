@@ -121,15 +121,15 @@ async function expectCallError(tool, input, label) {
 
   if (!expectParseError(batch, {}, 'empty input — missing operations')) fail();
   if (!expectParseError(batch, { operations: 'not-array' }, 'operations must be an array')) fail();
-  if (!expectParseError(batch, { operations: [{ categoryId: 'cat_1', amount: 100 }] },
+  if (!expectParseError(batch, { operations: [{ categoryId: '10000000-0000-4000-8000-000000000001', amount: 100 }] },
     'operation missing required month')) fail();
-  if (!expectParseError(batch, { operations: [{ month: '2025-13', categoryId: 'cat_1' }] },
+  if (!expectParseError(batch, { operations: [{ month: '2025-13', categoryId: '10000000-0000-4000-8000-000000000001' }] },
     'invalid month format (month 13)')) fail();
-  if (!expectParseError(batch, { operations: [{ month: '25-01', categoryId: 'cat_1' }] },
+  if (!expectParseError(batch, { operations: [{ month: '25-01', categoryId: '10000000-0000-4000-8000-000000000001' }] },
     'invalid month format (2-digit year)')) fail();
   // Valid minimal input
   if (!expectParseOk(batch, {
-    operations: [{ month: '2026-03', categoryId: 'cat_1', amount: 10000 }],
+    operations: [{ month: '2026-03', categoryId: '10000000-0000-4000-8000-000000000001', amount: 10000 }],
   }, 'valid batch operation')) fail();
 
   // ── actual_budgets_transfer ─────────────────────────────────────────────
@@ -137,21 +137,23 @@ async function expectCallError(tool, input, label) {
 
   if (!expectParseError(transfer, {}, 'empty input — all fields required')) fail();
   if (!expectParseError(transfer,
-    { month: '2026-03', fromCategoryId: 'cat_1', toCategoryId: 'cat_2' },
+    { month: '2026-03', fromCategoryId: '10000000-0000-4000-8000-000000000001', toCategoryId: '10000000-0000-4000-8000-000000000002' },
     'missing amount')) fail();
   if (!expectParseError(transfer,
-    { month: '2026-03', fromCategoryId: 'cat_1', toCategoryId: 'cat_2', amount: 'fifty' },
+    { month: '2026-03', fromCategoryId: '10000000-0000-4000-8000-000000000001', toCategoryId: '10000000-0000-4000-8000-000000000002', amount: 'fifty' },
     'amount must be number')) fail();
   // Runtime guard: amount must be positive
   if (!await expectCallError(transfer,
-    { month: '2026-03', fromCategoryId: 'cat_1', toCategoryId: 'cat_2', amount: 0 },
+    { month: '2026-03', fromCategoryId: '10000000-0000-4000-8000-000000000001', toCategoryId: '10000000-0000-4000-8000-000000000002', amount: 0 },
     'amount=0 must be rejected at runtime')) fail();
   if (!await expectCallError(transfer,
-    { month: '2026-03', fromCategoryId: 'cat_1', toCategoryId: 'cat_2', amount: -100 },
+    { month: '2026-03', fromCategoryId: '10000000-0000-4000-8000-000000000001', toCategoryId: '10000000-0000-4000-8000-000000000002', amount: -100 },
     'negative amount must be rejected at runtime')) fail();
   // Runtime guard: fromCategoryId !== toCategoryId
   if (!await expectCallError(transfer,
-    { month: '2026-03', fromCategoryId: 'same_id', toCategoryId: 'same_id', amount: 100 },
+    // #380: a VALID uuid on both sides. With a non-UUID this case began failing at the
+    // schema, so the runtime same-category guard it exists to exercise was never reached.
+    { month: '2026-03', fromCategoryId: '10000000-0000-4000-8000-000000000001', toCategoryId: '10000000-0000-4000-8000-000000000001', amount: 100 },
     'same from/to category must be rejected at runtime')) fail();
 
   // ── actual_budgets_setAmount ────────────────────────────────────────────
@@ -159,17 +161,17 @@ async function expectCallError(tool, input, label) {
 
   if (!expectParseError(setAmount, {}, 'empty input — all fields required')) fail();
   if (!expectParseError(setAmount,
-    { month: '', categoryId: 'cat_1', amount: 100 },
+    { month: '', categoryId: '10000000-0000-4000-8000-000000000001', amount: 100 },
     'empty month string rejected (min length 1)')) fail();
   if (!expectParseError(setAmount,
     { month: '2026-03', categoryId: '', amount: 100 },
-    'empty categoryId rejected (min length 1)')) fail();
+    'empty categoryId rejected (#380: now by UUID format, not min length)')) fail();
   if (!expectParseError(setAmount,
-    { month: '2026-03', categoryId: 'cat_1', amount: 'not-a-number' },
+    { month: '2026-03', categoryId: '10000000-0000-4000-8000-000000000001', amount: 'not-a-number' },
     'string amount rejected (must be number)')) fail();
   // Valid minimal input
   if (!expectParseOk(setAmount,
-    { month: '2026-03', categoryId: 'cat_1', amount: 50000 },
+    { month: '2026-03', categoryId: '10000000-0000-4000-8000-000000000001', amount: 50000 },
     'valid setAmount')) fail();
 
   // ── actual_schedules_create ─────────────────────────────────────────────
@@ -319,22 +321,31 @@ async function expectCallError(tool, input, label) {
   if (!expectParseOk(accounts_create_tool,
     { name: 'Savings', balance: 10000 },
     'valid name + integer balance accepted')) fail();
+  // #380: `id` was REMOVED, not tightened, because upstream's api/account-create drops it
+  // and mints its own UUID. Pinned so a future "add an optional id back" reintroduces the
+  // success-lie (caller's id accepted, different id created) and this goes red first.
+  if (!('id' in accounts_create_tool.inputSchema.shape)) {
+    console.log('  \u2713 accounts_create publishes no `id` field (#380)');
+  } else {
+    console.log('  \u2717 accounts_create publishes an `id` upstream ignores (#380)');
+    fail();
+  }
 
   // ── actual_accounts_get_balance (A3) ──────────────────────────────────────
-  // Schema uses z.string().min(1) for id and .strict() — UUID not enforced
+  // #380: id is CommonSchemas.accountId (the UUID pattern) now, plus .strict().
   console.log('\n[actual_accounts_get_balance — required non-empty id, strict schema]');
   if (!expectParseError(accounts_get_balance_tool,
     {},
     'missing id rejected')) fail();
   if (!expectParseError(accounts_get_balance_tool,
     { id: '' },
-    'empty id rejected (min 1)')) fail();
+    'empty id rejected (#380: now by UUID format, not min length)')) fail();
   if (!expectParseError(accounts_get_balance_tool,
-    { id: 'acc-1', unknownField: 'bad' },
+    { id: '60000000-0000-4000-8000-000000000001', unknownField: 'bad' },
     'unknown field rejected by strict schema')) fail();
   if (!expectParseOk(accounts_get_balance_tool,
-    { id: 'any-non-empty-string' },
-    'valid non-empty id accepted')) fail();
+    { id: '60000000-0000-4000-8000-000000000001' },
+    'valid account UUID accepted (#380: was any non-empty string)')) fail();
 
   // ── actual_categories_create (C2) ─────────────────────────────────────────
   console.log('\n[actual_categories_create — required name + UUID group_id]');
@@ -377,23 +388,33 @@ async function expectCallError(tool, input, label) {
     'valid name accepted')) fail();
 
   // ── actual_payees_merge (P3) ──────────────────────────────────────────────
-  // Schema uses z.string() for targetId (no UUID enforcement) and z.array(z.string()) for mergeIds
+  // #365: targetId and every mergeIds element are CommonSchemas.payeeId (the UUID
+  // pattern), so these fixtures must be real UUIDs or a case fails for the wrong reason.
   console.log('\n[actual_payees_merge — required targetId + mergeIds array]');
   if (!expectParseError(payees_merge_tool,
     {},
     'missing both fields rejected')) fail();
   if (!expectParseError(payees_merge_tool,
-    { mergeIds: ['p2'] },
+    { mergeIds: ['22222222-2222-4222-8222-222222222222'] },
     'missing targetId rejected')) fail();
   if (!expectParseError(payees_merge_tool,
-    { targetId: 'p1' },
+    { targetId: '11111111-1111-4111-8111-111111111111' },
     'missing mergeIds rejected')) fail();
   if (!expectParseError(payees_merge_tool,
-    { targetId: 'p1', mergeIds: 'not-an-array' },
+    { targetId: '11111111-1111-4111-8111-111111111111', mergeIds: 'not-an-array' },
     'string instead of array for mergeIds rejected')) fail();
   if (!expectParseOk(payees_merge_tool,
-    { targetId: 'p1', mergeIds: ['p2', 'p3'] },
+    { targetId: '11111111-1111-4111-8111-111111111111', mergeIds: ['22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333'] },
     'valid targetId + mergeIds array accepted')) fail();
+  // #365: payee ids are the shared UUID schema on both axes now. A non-UUID is rejected
+  // at the boundary rather than travelling to the adapter to come back as "not found",
+  // and the ARRAY element type is checked too, which a bare string type never did.
+  if (!expectParseError(payees_merge_tool,
+    { targetId: 'p1', mergeIds: ['22222222-2222-4222-8222-222222222222'] },
+    'non-UUID targetId rejected')) fail();
+  if (!expectParseError(payees_merge_tool,
+    { targetId: '11111111-1111-4111-8111-111111111111', mergeIds: ['22222222-2222-4222-8222-222222222222', 'p3'] },
+    'a non-UUID inside mergeIds is rejected')) fail();
 
   // ── actual_get_id_by_name (Q1) ────────────────────────────────────────────
   console.log('\n[actual_get_id_by_name — required type enum + non-empty name]');
@@ -426,19 +447,19 @@ async function expectCallError(tool, input, label) {
     {},
     'missing both id and fields rejected')) fail();
   if (!expectParseError(rules_update_tool,
-    { id: 'rule_1' },
+    { id: '30000000-0000-4000-8000-000000000001' },
     'missing fields rejected')) fail();
   if (!expectParseError(rules_update_tool,
     { fields: {} },
     'missing id rejected')) fail();
   if (!expectParseError(rules_update_tool,
-    { id: 'rule_1', fields: { stage: 'invalid-stage' } },
+    { id: '30000000-0000-4000-8000-000000000001', fields: { stage: 'invalid-stage' } },
     'invalid stage enum in fields rejected')) fail();
   if (!expectParseOk(rules_update_tool,
-    { id: 'rule_1', fields: {} },
+    { id: '30000000-0000-4000-8000-000000000001', fields: {} },
     'valid id + empty fields object accepted')) fail();
   if (!expectParseOk(rules_update_tool,
-    { id: 'rule_1', fields: { stage: 'pre' } },
+    { id: '30000000-0000-4000-8000-000000000001', fields: { stage: 'pre' } },
     'valid id + stage=pre accepted')) fail();
 
   // ── actual_transactions_create (T1) ───────────────────────────────────────
@@ -474,6 +495,27 @@ async function expectCallError(tool, input, label) {
 
   // ── actual_transactions_uncategorized (cases 7–16) ───────────────────────
   console.log('\n[actual_transactions_uncategorized — schema validation]');
+  // actual_transactions_update: the id is REQUIRED (#380).
+  //
+  // This is the regression test for a live success-lie. The id was `.optional()` with the
+  // describe "optional for smoke tests, required for actual usage", and the handler did
+  // `if (!input.id) return { success: true }`, so a call with no id reported SUCCESS and
+  // wrote nothing. A model that omitted the id was told its edit had landed. Reproduced
+  // before the fix: zero raw writes, `{"success":true}`.
+  console.log('\n[actual_transactions_update: #380 required id]');
+  {
+    const txn_update_tool = await import('../../dist/src/tools/transactions_update.js').then(m => m.default);
+    if (!expectParseError(txn_update_tool,
+      { fields: { notes: 'x' } },
+      '#380: missing id rejected (was: reported success and wrote nothing)')) fail();
+    if (!expectParseError(txn_update_tool,
+      { id: 'not-a-uuid', fields: { notes: 'x' } },
+      '#380: non-UUID id rejected at the schema')) fail();
+    if (!expectParseOk(txn_update_tool,
+      { id: '50000000-0000-4000-8000-000000000001', fields: { notes: 'x' } },
+      'valid id + fields accepted')) fail();
+  }
+
   const uncategorized_tool = await import('../../dist/src/tools/transactions_uncategorized.js').then(m => m.default);
 
   // Case 7: invalid startDate format
@@ -481,10 +523,21 @@ async function expectCallError(tool, input, label) {
     { startDate: '2024/01/01' },
     'invalid startDate format (slash-separated) rejected')) fail();
 
-  // Case 8: invalid accountId format (non-UUID)
-  if (!expectParseError(uncategorized_tool,
+  // Case 8, INVERTED by #388: a non-UUID accountId is now ACCEPTED BY THE SCHEMA on purpose.
+  //
+  // This field is an OPTIONAL FILTER, and #380's sweep gave it `CommonSchemas.accountId` along
+  // with the required lookup ids. Under that schema a caller passing an account NAME got
+  // "Invalid uuid" and no way to learn the id, while the other eleven optional filters resolved
+  // the name and answered with it. Rejecting at the schema is what makes the better answer
+  // impossible: the handler never runs. So the schema is permissive HERE and the refusal happens
+  // in the handler, via adapter.resolveFilterId.
+  //
+  // The refusal itself is pinned by tests/unit/filter_id_tool_wiring.test.js, which calls this
+  // tool with a name and requires a typed refusal naming the id. Do not "restore" the strict
+  // schema without deleting that, or the tool will reject before it can help.
+  if (!expectParseOk(uncategorized_tool,
     { accountId: 'not-a-uuid' },
-    'non-UUID accountId rejected')) fail();
+    '#388: non-UUID accountId accepted by the schema so the handler can resolve it')) fail();
 
   // Case 9: invalid limit type (string instead of number)
   if (!expectParseError(uncategorized_tool,
@@ -521,10 +574,11 @@ async function expectCallError(tool, input, label) {
     { startDate: '01/31/2024' },
     'startDate in MM/DD/YYYY format rejected')) fail();
 
-  // Case 16: accountId non-UUID string (different shape)
-  if (!expectParseError(uncategorized_tool,
+  // Case 16, INVERTED by #388 for the reason at case 8. This shape is the exact one that
+  // motivated it: a caller passing the account's NAME.
+  if (!expectParseOk(uncategorized_tool,
     { accountId: 'my-account-name' },
-    'non-UUID accountId string rejected')) fail();
+    '#388: an account NAME reaches the handler, which refuses it with the id it resolves to')) fail();
 
   // Valid: all fields omitted (uses defaults)
   if (!expectParseOk(uncategorized_tool,

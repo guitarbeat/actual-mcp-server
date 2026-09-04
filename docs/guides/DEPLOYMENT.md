@@ -41,7 +41,7 @@ npm install
 
 # Configure environment
 cp .env.example .env
-# Edit .env to set ACTUAL_SERVER_URL, ACTUAL_PASSWORD, ACTUAL_BUDGET_SYNC_ID at minimum
+# Edit .env to set ACTUAL_SERVER_URL, ACTUAL_BUDGET_SYNC_ID, and ACTUAL_PASSWORD or ACTUAL_SESSION_TOKEN
 
 # Build TypeScript
 npm run build
@@ -57,6 +57,8 @@ The server starts at `http://localhost:3600/http` by default.
 ```bash
 ACTUAL_SERVER_URL=http://localhost:5006
 ACTUAL_PASSWORD=your_password
+# Or use a session token (leave ACTUAL_PASSWORD empty):
+# ACTUAL_SESSION_TOKEN=your_session_token
 ACTUAL_BUDGET_SYNC_ID=your-sync-id-here
 ```
 
@@ -201,7 +203,7 @@ docker compose down
 git clone https://github.com/agigante80/actual-mcp-server.git
 cd actual-mcp-server
 cp .env.example .env
-# Set ACTUAL_SERVER_URL, ACTUAL_PASSWORD, ACTUAL_BUDGET_SYNC_ID, MCP_SSE_AUTHORIZATION
+# Set ACTUAL_SERVER_URL, ACTUAL_BUDGET_SYNC_ID, ACTUAL_PASSWORD or ACTUAL_SESSION_TOKEN, MCP_SSE_AUTHORIZATION
 
 # 2. Start production stack
 docker compose --profile production up -d

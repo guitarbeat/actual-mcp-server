@@ -16,7 +16,7 @@ This guide covers connecting AI clients (LibreChat, LobeChat, or any MCP-compati
 ┌─────────────┐   MCP/HTTP   ┌──────────────────┐   Actual API   ┌──────────────┐
 │  AI Client  │ ◄──────────► │  Actual MCP      │ ◄───────────► │   Actual     │
 │ (LibreChat  │              │  Server          │               │   Budget     │
-│  LobeChat)  │              │  (74 tools)      │               │   Server     │
+│  LobeChat)  │              │  (77 tools)      │               │   Server     │
 └─────────────┘              └──────────────────┘               └──────────────┘
 ```
 
@@ -65,7 +65,7 @@ Then restart LibreChat:
 docker restart ai-librechat
 ```
 
-Verify tools loaded. In the LibreChat UI you should see **74 tools** listed under the MCP server entry.
+Verify tools loaded. In the LibreChat UI you should see **77 tools** listed under the MCP server entry.
 
 ### LibreChat with OIDC
 
@@ -96,7 +96,7 @@ In the LobeChat UI:
    - **Authorization**: `Bearer YOUR_TOKEN_HERE`
 4. Click **Save**
 
-LobeChat will automatically discover all 74 tools.
+LobeChat will automatically discover all 77 tools.
 
 ---
 
@@ -198,9 +198,8 @@ sudo certbot certonly --standalone -d actual-mcp.yourdomain.com
 
 > **This is inbound auth only.** `AUTH_PROVIDER=oidc` controls how MCP **clients** authenticate
 > **to this server**. It does not change how this server authenticates **to Actual Budget**, which
-> is always `ACTUAL_PASSWORD`. The two are independent: you can run OIDC here with a
-> password-authenticated Actual upstream, and enabling OIDC on your Actual Budget server does not
-> remove this server's need for `ACTUAL_PASSWORD`. A third credential,
+> uses either `ACTUAL_PASSWORD` or `ACTUAL_SESSION_TOKEN`. The two layers are independent: you can
+> run OIDC here with a password- or session-token-authenticated Actual upstream. A third credential,
 > `ACTUAL_BUDGET_PASSWORD`, is unrelated to both: it decrypts an E2E-encrypted budget file.
 
 For multi-user deployments with an OIDC provider (Casdoor, Keycloak, Auth0, etc.):
@@ -244,7 +243,7 @@ After connecting an AI client, verify:
 curl http://localhost:3600/health
 # Expected: {"status":"ok","initialized":true,...}
 
-# 2. Tools loaded (should list 74 tools)
+# 2. Tools loaded (should list 77 tools)
 curl -s -X POST http://localhost:3600/http \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
@@ -253,7 +252,7 @@ curl -s -X POST http://localhost:3600/http \
 ```
 
 In your AI client you should see:
-- ✅ 74 tools loaded with `actual_` prefix
+- ✅ 77 tools loaded with `actual_` prefix
 - ✅ `actual_server_info` tool available
 - ✅ Natural language queries returning results
 

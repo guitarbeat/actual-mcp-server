@@ -36,6 +36,11 @@ const FILES = [
   '.github/CONTRIBUTING.md', 'docker/description/long.md', 'docker/description/short.md', 'src/lib/constants.ts',
   'tests/manual/tests/sanity.js', 'tests/manual/runner.js', 'tests/e2e/README.md', 'tests/manual/README.md',
   'tests/e2e/docker-all-tools.e2e.spec.ts',
+  // The api-design-principles SKILL states the tool total in its opening lines, and both
+  // `tool-author` and `ticket-gate` read it. It sat at "71-tool set" while
+  // IMPLEMENTED_TOOLS was 74, because this scan could not see `.claude/skills/**` (#377
+  // review, L8).
+  '.claude/skills/api-design-principles/SKILL.md',
 ];
 
 /**
@@ -47,6 +52,9 @@ const FILES = [
 export const TOTAL_PATTERNS = [
   // Distinctive TOTAL phrasings (safe in any file; never match a subset "(N tools)" header).
   { re: /\ball (\d{2,3}) tools\b/gi, label: 'all N tools' },
+  // The api-design-principles skill states the total in its frontmatter `description:`,
+  // which the phrasings above do not match, so it drifted silently.
+  { re: /(\d{2,3})-tool set\b/g, label: 'N-tool set' },
   { re: /\*\*(\d{2,3}) tools\*\* across/g, label: '**N tools** across' },
   { re: /\*\*(\d{2,3}) tools\*\* listed/g, label: '**N tools** listed' },
   { re: /E2E \((\d{2,3}) tools\)/g, label: 'E2E (N tools)' },

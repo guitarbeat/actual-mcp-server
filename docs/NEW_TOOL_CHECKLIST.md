@@ -14,6 +14,7 @@ Use this file every time a new tool is added. Print or open it alongside your ed
 - [ ] Tool file created: `src/tools/<domain>_<action>.ts`
 - [ ] Exported from `src/tools/index.ts`
 - [ ] Added to `IMPLEMENTED_TOOLS` in `src/actualToolsManager.ts`
+- [ ] **Classified in `src/lib/tool-annotations.ts`** (#379): put it in exactly one of `READ_ONLY`, `DESTRUCTIVE` or `ADDITIVE`, and if it writes, decide idempotence. `npm run build && node tests/unit/tool_annotations.test.js` FAILS if you skip this (the guard reads `dist/`, so build first), and it checks the read-only claim against the adapter call graph
 - [ ] Adapter function(s) exist (or created) in `src/lib/actual-adapter.ts`
 - [ ] `npm run build` passes with zero errors
 
@@ -41,7 +42,7 @@ Use this file every time a new tool is added. Print or open it alongside your ed
 - [ ] Both a positive scenario and a not-found/negative scenario described in the prompt instructions
 
 ### E2E Tests
-- [ ] Tool's happy-path call added to the appropriate `tests/e2e/suites/<domain>.ts` file
+- [ ] Tool's happy-path call added to `tests/e2e/docker-all-tools.e2e.spec.ts`, and confirmed collected with `npx playwright test --list --config playwright.config.docker.ts` (#366: the old `tests/e2e/suites/` path never executed)
 - [ ] `EXPECTED_TOOL_COUNT` default bumped in `tests/manual/tests/sanity.js` (the only place that asserts an exact tool count)
 - [ ] `describe('Docker E2E - ALL <N> TOOLS', ...)` block-name count updated in `tests/e2e/docker-all-tools.e2e.spec.ts` (cosmetic label only; the spec does not assert a count, and `mcp-client.playwright.spec.ts` only checks `tools.length > 0`)
 - [ ] `npm run test:e2e` passes
@@ -129,6 +130,33 @@ Verify with:
 ```bash
 npm run verify-tools
 ```
+
+---
+
+### Step 2b: Classify the tool for clients (#379)
+
+Add the tool to the right sets in `src/lib/tool-annotations.ts`. This is what the server
+PUBLISHES to clients as MCP annotations, so a model can tell a read from a delete before
+calling it.
+
+- [ ] If it changes nothing at all, add it to `READ_ONLY`. Claim this only when you are
+      certain: a wrong `readOnlyHint: true` is worse than no annotation, because clients
+      use it to decide what needs confirming.
+- [ ] If it writes, decide two things. Is it **destructive** (removes or replaces data:
+      the `*_delete` family, `payees_merge`, `budgets_import`, and `accounts_close`, which
+      REMOVES a zero-transaction account)? Is it **idempotent** (does calling it twice with
+      the same arguments leave the same state)? Creates are not idempotent;
+      `budgets_holdForNextMonth` is not either, because upstream ADDS to the buffer.
+- [ ] `openWorldHint` is handled for you: everything is a closed world except
+      `actual_bank_sync`. Only touch `OPEN_WORLD` if your tool reaches a third-party service.
+- [ ] Run `npm run build && node tests/unit/tool_annotations.test.js`. The guard reads the
+      compiled table from `dist/`, so an unbuilt tree validates the PREVIOUS classification.
+      It derives read-versus-write from the adapter call graph and will tell you if your
+      classification disagrees with your code.
+
+**Do not make any code in `src/` branch on an annotation.** The MCP spec says clients must
+treat annotations as untrusted, so they can never carry an authorisation or safety decision.
+Keep those in `budget-acl.ts` and the adapter guards.
 
 ---
 
@@ -506,7 +534,7 @@ When implementing a new lookup tool, the `call` function should:
 | `src/lib/actual-adapter.ts` | **Add** adapter method if new API call needed |
 | `tests/unit/generated_tools.smoke.test.js` | **Add** stub response to `stubResponses` map (if new adapter method); add input example; add to `resultWrappers[]`, `successTools[]`, or custom `if (n === '...')` shape assertion |
 | `tests/unit/schema_validation.test.js` | **Add** negative schema tests for complex schemas |
-| `tests/e2e/suites/<domain>.ts` | **Add** happy-path call for the new tool |
+| `tests/e2e/docker-all-tools.e2e.spec.ts` | **Add** happy-path call for the new tool (the only E2E file that runs) |
 | `tests/manual/tests/sanity.js` | **Update** `EXPECTED_TOOL_COUNT` default (the only exact-count gate) |
 | `tests/e2e/docker-all-tools.e2e.spec.ts` | **Update** the `describe(...)` block-name count label (cosmetic) |
 | `tests/manual/tests/<module>.js` | **Add** positive + negative test block |

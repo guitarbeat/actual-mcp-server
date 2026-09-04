@@ -18,8 +18,10 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { isApiInitialized, setApiInitialized } from './apiState.js';
+import { withApiLock, isApiLockHeld } from './apiLock.js';
+import { loadBudgetTracked } from './budgetLoader.js';
 import { withOpTimeout } from './opTimeout.js';
-import { actualApiInitOptions } from './actual-init-config.js';
+import { initializeActualApi } from './actual-init-config.js';
 
 const DEFAULT_DATA_DIR = path.resolve(os.homedir() || '.', '.actual');
 
@@ -288,25 +290,42 @@ class ActualConnectionPool {
     }
 
     try {
+      // #390 round 2: hold the api mutex across init + download.
+      //
+      // Recording the loaded budget and checking it inside the lock only NARROWED the race
+      // while this mutator stayed outside it. Reproduced: a pooled read passed the
+      // precondition, parked at an await still holding the lock, a new session opened here on
+      // a different budget, and the first session's raw call then executed against it. The
+      // window is not small: it is the whole duration of an operation, and since #378 made the
+      // drain sequential, the whole duration of a batch, with one check at the start.
+      //
+      // Safe against the non-reentrant mutex: the two callers of getConnection
+      // (actualConnection's session-open helper and switchBudget's slow path) are both OUTSIDE
+      // any withApiLock block. switchBudget's own downloadBudget takes the lock separately and
+      // has already released it before it reaches here.
+      await withApiLock(async () => {
       // Bound the session-open init/download (#270): this is the HTTP exposure.
       // A stalled upstream here would otherwise hang session open unbounded and,
       // because the api singleton is process-global, wedge other sessions too.
-      await withOpTimeout(() => (api.init as any)(actualApiInitOptions(DATA_DIR, SERVER_URL, PASSWORD)), 'pool init');
+      await withOpTimeout(
+        () => initializeActualApi(DATA_DIR, SERVER_URL, PASSWORD),
+        'pool init',
+      );
 
       logger.info(`[ConnectionPool] Downloading budget for session: ${sessionId}`);
 
-      if (BUDGET_PASSWORD) {
-        const apiWithOptions = api as typeof api & { downloadBudget: (id: string, options?: { password: string }) => Promise<void> };
-        await withOpTimeout(() => apiWithOptions.downloadBudget(BUDGET_SYNC_ID, { password: BUDGET_PASSWORD }), 'pool downloadBudget');
-      } else {
-        await withOpTimeout(() => api.downloadBudget(BUDGET_SYNC_ID), 'pool downloadBudget');
-      }
+      // #390: the shared tracked loader, not a hand-written download. It clears the record
+      // BEFORE starting and keeps an abandoned load registered, so a session-open download that
+      // outruns ACTUAL_OP_TIMEOUT_MS cannot silently re-point the singleton later.
+      await loadBudgetTracked(BUDGET_SYNC_ID, BUDGET_PASSWORD, 'pool downloadBudget');
 
       // Mark the singleton as live only AFTER the budget is downloaded (#270):
       // setting it before downloadBudget left a poisoning window where the
       // adapter's pool-cooperation branch could reuse a connection whose budget
       // never loaded (a stalled/failed download would leak isApiInitialized=true).
       setApiInitialized(true);
+      }); // #390: end of the api-mutex block. Everything after this is pool bookkeeping and
+          // touches no singleton state, so it does not need the lock.
 
       conn = {
         sessionId,
@@ -328,16 +347,29 @@ class ActualConnectionPool {
       logger.error(`[ConnectionPool] Failed to initialize connection for session ${sessionId}:`, err);
 
       // Clean up the failed connection attempt
-      // Try to shutdown the API to leave it in a clean state for the next attempt
-      try {
+      // Try to shutdown the API to leave it in a clean state for the next attempt.
+      //
+      // #390 round 3: UNDER THE MUTEX, like the init above it. Locking the mutator and leaving
+      // its compensating mutator unlocked closes nothing: reproduced as this cleanup's
+      // api.shutdown() firing while ANOTHER session's operation was in flight inside the lock,
+      // so that operation observed a torn-down api. The lock is re-acquired rather than held
+      // across the whole try, because the init block released it on the way out and this
+      // function is never called from inside a lock (both callers are outside one).
+      // #393 review: the lock ITSELF can reject now (it settles an abandoned budget load on
+      // acquisition), and this is a CLEANUP path. If that rejection escaped, `setApiInitialized(false)`
+      // and the connections.delete below would be skipped and the caller would receive
+      // "abandoned budget load timed out" instead of the real session-open failure. Cleanup
+      // must not be able to fail louder than the thing it is cleaning up after, so the whole
+      // acquisition is swallowed here, not just the shutdown call.
+      await withApiLock(async () => {
         const maybeApi = api as unknown as { shutdown?: Function };
         if (typeof maybeApi.shutdown === 'function') {
           await (maybeApi.shutdown as () => Promise<unknown>)();
           logger.debug(`[ConnectionPool] Cleaned up failed connection for session: ${sessionId}`);
         }
-      } catch (cleanupErr) {
+      }).catch((cleanupErr) => {
         logger.debug(`[ConnectionPool] Error during cleanup (ignoring): ${cleanupErr}`);
-      }
+      });
       // Singleton is back to torn-down state regardless of cleanup outcome.
       setApiInitialized(false);
 
@@ -370,19 +402,24 @@ class ActualConnectionPool {
     }
 
     try {
+      // #390 round 2: same reasoning as getConnection above; this mutates the same
+      // process-global singleton, so it takes the same mutex.
+      await withApiLock(async () => {
       // Bound the session-open init/download (#270), same as getConnection.
-      await withOpTimeout(() => (api.init as any)(actualApiInitOptions(DATA_DIR, SERVER_URL, PASSWORD)), 'pool init');
+      await withOpTimeout(
+        () => initializeActualApi(DATA_DIR, SERVER_URL, PASSWORD),
+        'pool init',
+      );
 
-      if (BUDGET_PASSWORD) {
-        const apiWithOptions = api as typeof api & { downloadBudget: (id: string, options?: { password: string }) => Promise<void> };
-        await withOpTimeout(() => apiWithOptions.downloadBudget(BUDGET_SYNC_ID, { password: BUDGET_PASSWORD }), 'pool downloadBudget');
-      } else {
-        await withOpTimeout(() => api.downloadBudget(BUDGET_SYNC_ID), 'pool downloadBudget');
-      }
+      // #390: the shared tracked loader, not a hand-written download. It clears the record
+      // BEFORE starting and keeps an abandoned load registered, so a session-open download that
+      // outruns ACTUAL_OP_TIMEOUT_MS cannot silently re-point the singleton later.
+      await loadBudgetTracked(BUDGET_SYNC_ID, BUDGET_PASSWORD, 'pool downloadBudget');
 
       // Mark live only after a successful download (#270): avoids the poisoning
       // window where a stalled/failed download would leak isApiInitialized=true.
       setApiInitialized(true);
+      }); // #390: end of the api-mutex block.
 
       this.sharedConnection = {
         sessionId: 'shared',
@@ -415,8 +452,87 @@ class ActualConnectionPool {
    * recreates it, or an infra-error drop where the next request re-establishes
    * the connection: in those cases the transport must survive.
    */
-  async shutdownConnection(sessionId: string, opts: { evict?: boolean } = {}): Promise<void> {
+  async shutdownConnection(sessionId: string, opts: { evict?: boolean; onlyIfExpired?: boolean } = {}): Promise<void> {
+    // #392: acquire the api mutex, because this calls api.shutdown() on the PROCESS-GLOBAL
+    // singleton. Without it, the idle sweep or an explicit session close can tear the api down
+    // while ANOTHER session's operation is in flight inside the lock, and that operation then
+    // observes a torn-down api. Reproduced during #390's security review for the sibling cleanup
+    // site, which #390 fixed; these were the paths it left behind.
+    //
+    // NOT reentrant, so this variant is for callers that do NOT hold the lock. Callers that DO
+    // must call shutdownConnectionLocked directly; wrapping there would deadlock, and the symptom
+    // is a ~30s stall ended by #270's timeout rather than an obvious hang. The audit of which is
+    // which is recorded on shutdownConnectionLocked.
+    // #392 review (BLOCKING): the acquisition itself can REJECT. Since #393, taking the api lock
+    // settles any abandoned budget load and THROWS on timeout, so this wrapper gained a rejection
+    // path the old body never had (it was try/catch/finally end to end). Its callers are cleanup
+    // paths that do not expect one: `cleanupIdleConnections` is invoked from `setInterval`
+    // unawaited, and "abandoned budget load timed out" is not in `rejection-allowlist.ts`, so the
+    // escape reached `src/index.ts`'s unhandledRejection handler and called process.exit(1). That
+    // is the exact defect #393 fixed one level up in the write drain, reintroduced at a new
+    // acquisition site.
+    //
+    // So the acquisition is swallowed, matching the established pattern in the session-open
+    // cleanup above: cleanup must not fail louder than the thing it is cleaning up after.
+    // The entry is still torn down on that path, unless the caller asked for expiry to be
+    // re-checked and the session came back, which is the sweep's own contract. Tearing down
+    // matters because a stuck load must not make idle sessions un-evictable: the pool would fill
+    // to MAX_CONCURRENT_SESSIONS and start refusing new sessions with nothing in the log saying
+    // why. The unlocked shutdown in this handler is acceptable for a specific reason worth
+    // stating: while a registration is stuck, EVERY lock acquisition throws, so no operation can
+    // be running inside the lock at the moment this path fires.
+    await withApiLock(() => this.shutdownConnectionLocked(sessionId, opts)).catch(async (err) => {
+      logger.error(
+        `[ConnectionPool] Could not acquire the api lock to shut down ${sessionId}; ` +
+          `tearing the entry down without it: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await this.shutdownConnectionLocked(sessionId, { ...opts, expectUnlocked: true }).catch(() => { /* cleanup is best effort */ });
+    });
+  }
+
+  /**
+   * The body of shutdownConnection, for callers that ALREADY hold the api mutex.
+   *
+   * #392 call-site audit, done explicitly rather than by inspection because the mutex is not
+   * reentrant and getting it wrong produces a stall that reads as a slow upstream server:
+   *
+   *   HOLDS the lock, so calls this variant:
+   *     - actual-adapter withActualApi pooled branch, infra-error drop
+   *     - actual-adapter withActualApiWrite, sync failure and infra-error drop
+   *     - actual-adapter processWriteQueue drain, sync failure and batch error
+   *   Does NOT hold it, so calls the wrapping shutdownConnection:
+   *     - actual-adapter switchBudget slow path (its own withApiLock block has closed by then)
+   *     - actualConnection.shutdownActualForSession (session close)
+   *     - this.cleanupIdleConnections (the idle sweep)
+   *
+   *   Since #412, `shutdownAll` HOLDS the lock (one acquisition for the whole teardown instead of
+   *   one per session) and therefore calls this variant directly. Its fallback path runs unlocked
+   *   on purpose and passes `expectUnlocked` to say so.
+   */
+  async shutdownConnectionLocked(sessionId: string, opts: { evict?: boolean; onlyIfExpired?: boolean; expectUnlocked?: boolean } = {}): Promise<void> {
+    // #411: assert the precondition rather than documenting it. The audit above says which callers
+    // hold the lock; this is what keeps that audit true as call sites are added.
+    //
+    // A WARNING, not a throw, and deliberately so: this is reached from cleanup paths, and a false
+    // positive that threw would turn a tidy-up into an outage, which is a worse trade than the
+    // hazard it guards. The nearest legitimate exception is the fallback in shutdownConnection
+    // itself, which runs unlocked ON PURPOSE when the acquisition failed, so it passes
+    // `expectUnlocked` to say so.
+    if (!opts.expectUnlocked && !isApiLockHeld()) {
+      logger.warn(
+        `[ConnectionPool] shutdownConnectionLocked called for ${sessionId} without the api mutex. ` +
+          'Callers that do not hold it must use shutdownConnection, which acquires it.',
+      );
+    }
     const conn = this.connections.get(sessionId);
+
+    // #392 review: the idle sweep decides who is expired BEFORE waiting for the mutex, and that
+    // wait is no longer negligible. Re-checking here means a session that was touched while we
+    // queued keeps its connection instead of being closed mid-conversation.
+    if (opts.onlyIfExpired && conn && !this.isExpired(conn)) {
+      logger.debug(`[ConnectionPool] ${sessionId} was touched while waiting for the api lock; not evicting`);
+      return;
+    }
 
     if (!conn || !conn.initialized) {
       return;
@@ -457,9 +573,36 @@ class ActualConnectionPool {
   }
 
   /**
-   * Shutdown the shared connection
+   * Acquire the mutex and tear down the shared connection.
+   *
+   * #412 left this with NO caller in `src/`: `shutdownAll` now holds the lock itself and calls the
+   * Locked variant. It is kept, rather than deleted, because `USE_CONNECTION_POOL=false` uses the
+   * shared connection and a future teardown path for it must not hand-roll the acquisition. That
+   * is a deliberate decision rather than an oversight: knip does not analyse class members, so
+   * nothing else would have flagged it, and CLAUDE.md's own lesson from `adapter.deleteRule` is
+   * that a callerless wrapper left reachable is how the next caller finds the unguarded path.
    */
   async shutdownSharedConnection(): Promise<void> {
+    await withApiLock(() => this.shutdownSharedConnectionLocked()).catch(async (err) => {
+      logger.error(
+        `[ConnectionPool] Could not acquire the api lock to shut down the shared connection; ` +
+          `tearing it down without it: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await this.shutdownSharedConnectionLocked().catch(() => { /* cleanup is best effort */ });
+    });
+  }
+
+  /** The body of shutdownSharedConnection, for callers that already hold the api mutex. */
+  async shutdownSharedConnectionLocked(opts: { expectUnlocked?: boolean } = {}): Promise<void> {
+    // #411: same precondition check as shutdownConnectionLocked. Round 2 pointed out that keeping
+    // the callerless wrapper (M3) is only defensible if the guard that would catch a future
+    // hand-rolled caller exists on BOTH variants.
+    if (!opts.expectUnlocked && !isApiLockHeld()) {
+      logger.warn(
+        '[ConnectionPool] shutdownSharedConnectionLocked called without the api mutex. ' +
+          'Callers that do not hold it must use shutdownSharedConnection, which acquires it.',
+      );
+    }
     if (!this.sharedConnection?.initialized) {
       return;
     }
@@ -493,12 +636,36 @@ class ActualConnectionPool {
     try {
       logger.info('[ConnectionPool] Force closing any stale connections from previous instance');
       
-      // Try to shutdown the API if it was left initialized
-      const maybeApi = api as unknown as { shutdown?: Function };
-      if (typeof maybeApi.shutdown === 'function') {
-        await (maybeApi.shutdown as () => Promise<unknown>)();
-        logger.info('[ConnectionPool] Successfully closed stale API connection');
-      }
+      // Try to shutdown the API if it was left initialized.
+      //
+      // #411 put this under the api mutex: it was the last api.shutdown() running without it.
+      // #416 then separated the two failures it was conflating. The body is a raw api.shutdown(),
+      // which can reject on its own, and reporting that as "could not take the api lock" sent the
+      // reader to the wrong subsystem while the retry repeated the call that had just failed.
+      //
+      // So: the guarded shutdown happens INSIDE the lock, matching every other shutdown path
+      // (which check isApiInitialized first, per #164, or a second call surfaces as
+      // "not initialized"). The catch below therefore genuinely means the ACQUISITION failed, and
+      // its fallback runs the same guarded shutdown once, unlocked and best effort.
+      const guardedShutdown = async () => {
+        if (!isApiInitialized()) return;
+        const maybeApi = api as unknown as { shutdown?: Function };
+        if (typeof maybeApi.shutdown !== 'function') return;
+        try {
+          await (maybeApi.shutdown as () => Promise<unknown>)();
+          logger.info('[ConnectionPool] Successfully closed stale API connection');
+        } catch (shutdownErr) {
+          logger.debug(`[ConnectionPool] Stale API connection would not close (ignoring): ${shutdownErr}`);
+        } finally {
+          setApiInitialized(false);
+        }
+      };
+      await withApiLock(guardedShutdown).catch(async (lockErr) => {
+        logger.debug(
+          `[ConnectionPool] Could not take the api lock to close a stale connection: ${lockErr}`,
+        );
+        await guardedShutdown();
+      });
     } catch (err) {
       // Ignore errors - connection may not have been initialized
       logger.debug('[ConnectionPool] No stale connections to close (or already closed)');
@@ -547,7 +714,15 @@ class ActualConnectionPool {
         // in the same window (#167). This is the path that previously drifted:
         // the pool's autonomous timer removed an entry httpServer's separate
         // timer knew nothing about.
-        await this.shutdownConnection(sessionId, { evict: true });
+        //
+        // #392 review: RE-CHECK expiry, because the decision above was taken before the lock and
+        // the eviction now waits for it. Before #392 that wait was effectively zero; since #378
+        // made drains sequential, one lock hold is the SUM of a batch's operations, so it is
+        // bounded only by batch length times ACTUAL_OP_TIMEOUT_MS. A session that was idle when
+        // marked can be active again by the time the lock arrives, and evicting it then closes
+        // its transport mid-conversation. Deciding and acting on the same side of the mutex is
+        // what makes the decision mean anything.
+        await this.shutdownConnection(sessionId, { evict: true, onlyIfExpired: true });
       }
     }
   }
@@ -570,14 +745,39 @@ class ActualConnectionPool {
     // singleton ("not initialized" during graceful shutdown). Sessions are few
     // (15 max) and shutdown is rare, so sequential is fine. The first call does
     // the real shutdown; the isApiInitialized() guard makes the rest no-ops.
-    // Snapshot the keys: shutdownConnection deletes from `connections`.
-    for (const sessionId of [...this.connections.keys()]) {
-      await this.shutdownConnection(sessionId);
-    }
-
-    if (this.sharedConnection?.initialized) {
-      await this.shutdownSharedConnection();
-    }
+    // #412: ONE acquisition for the whole teardown, not one per session.
+    //
+    // Since #392 each shutdownConnection takes the api mutex, and since #393 acquiring it settles
+    // any abandoned budget load, bounded, and throws on timeout while KEEPING the registration. So
+    // with a stuck load, N sessions cost N times ACTUAL_OP_TIMEOUT_MS: 15 sessions at the 30s
+    // default is 450 seconds, and Docker sends SIGKILL after a 10 second grace period. The
+    // container died with a page of "could not acquire" lines and no clean api.shutdown().
+    //
+    // Acquiring once also makes the teardown ONE critical section rather than 16, which is more
+    // correct: nothing can interleave between the sessions being torn down.
+    //
+    // Swallowed for the same reason the per-session wrapper swallows: this is a cleanup path, and
+    // a stuck load must not stop the entries being removed. The fallback repeats the loop with the
+    // Locked variants, which is safe because nothing can be holding the lock while a registration
+    // is stuck (every acquisition throws in that state).
+    const teardown = async (expectUnlocked = false) => {
+      // Snapshot the keys: shutdownConnectionLocked deletes from `connections`.
+      for (const sessionId of [...this.connections.keys()]) {
+        await this.shutdownConnectionLocked(sessionId, { expectUnlocked });
+      }
+      if (this.sharedConnection?.initialized) {
+        await this.shutdownSharedConnectionLocked({ expectUnlocked });
+      }
+    };
+    await withApiLock(() => teardown()).catch(async (err) => {
+      logger.error(
+        `[ConnectionPool] Could not acquire the api lock for shutdownAll; tearing down without it: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      // `expectUnlocked`: this path runs without the mutex ON PURPOSE, so #411's warning would
+      // otherwise fire once per session at the exact moment the code chose not to take it.
+      await teardown(true).catch(() => { /* cleanup is best effort */ });
+    });
 
     logger.info('[ConnectionPool] All connections shut down');
   }

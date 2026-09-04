@@ -22,11 +22,13 @@ Legend for **Source**: `schema` = validated Zod key; `raw` = read directly from
 | Variable | Type | Default | Required | Secret | Source | Read site(s) | Notes |
 |----------|------|---------|----------|--------|--------|--------------|-------|
 | `ACTUAL_SERVER_URL` | url string | (none) | Yes | no | schema | config | Actual Budget server URL |
-| `ACTUAL_PASSWORD` | string | (none) | Yes | yes | schema | config | Actual Budget server password (Zod default is the empty string) |
+| `ACTUAL_PASSWORD` | string | empty | One of password/token | yes | schema | config | Actual Budget server password; omit when using `ACTUAL_SESSION_TOKEN` only |
+| `ACTUAL_SESSION_TOKEN` | string | (none) | One of password/token | yes | schema | config; `actual-init-config.ts` | Actual server session token, passed to `@actual-app/api` as `sessionToken` and never substituted into the password field |
 | `ACTUAL_BUDGET_SYNC_ID` | string | (none) | Yes | no | schema | config | Default budget sync ID |
 | `ACTUAL_BUDGET_PASSWORD` | string | (none) | No | yes | schema | config; also raw at `actualConnection.ts:33`, `ActualConnectionPool.ts:255,338` | E2E encryption password |
 | `ALLOW_INSECURE_UPSTREAM` | bool string | `false` | No | no | schema | config | Allow `http://` upstream with an encryption password set (#161) |
 | `ACTUAL_OP_TIMEOUT_MS` | int string (ms) | `30000` | No | no | schema | config; read at `actual-adapter.ts` `withOpTimeout` | Per-operation timeout bounding every upstream call (init, download, sync, op body) so a stall cannot hold the global API mutex forever (#270). `0` disables |
+| `ACTUAL_IMPORT_TIMEOUT_MS` | int string (ms) | `600000` | No | no | schema | config; read at `budgetLoader.ts` `importBudgetTracked` | Separate bound for a budget import, which is long by nature rather than stalled. An import is a tracked load, so every other session waits on it while it runs; the general operation bound made one tenant's import a process-wide stall (#407). `0` disables |
 
 ## MCP server
 
@@ -46,7 +48,7 @@ Legend for **Source**: `schema` = validated Zod key; `raw` = read directly from
 
 | Variable | Type | Default | Required | Secret | Source | Read site(s) | Notes |
 |----------|------|---------|----------|--------|--------|--------------|-------|
-| `MCP_HTTP_PATH` | path | `/http` | No | no | raw | `index.ts:195` | The path the server LISTENS on |
+| `MCP_HTTP_PATH` | path | `/http` | No | no | raw | `index.ts:195` | Configured listen path; `/mcp` is also registered as an alias through the identical auth, ACL, body-limit, session, and transport chain |
 | `MCP_BRIDGE_HTTP_PATH` | path | same as `MCP_HTTP_PATH` | No | no | raw | `index.ts:281` | The path ADVERTISED to clients (falls back to `MCP_HTTP_PATH`) |
 
 ## Sessions / pool

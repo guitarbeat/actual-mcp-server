@@ -24,13 +24,13 @@ Actual MCP Server is a [Model Context Protocol](https://modelcontextprotocol.io/
 ┌─────────────┐   MCP/HTTP    ┌──────────────────┐   Actual API   ┌──────────────┐
 │  LibreChat  │ ◄───────────► │  Actual MCP      │ ◄───────────► │   Actual     │
 │  LobeChat   │               │  Server          │               │   Budget     │
-│  (remote)   │               │  (74 tools)      │               │   Server     │
+│  (remote)   │               │  (77 tools)      │               │   Server     │
 └─────────────┘               └──────────────────┘               └──────────────┘
 
 ┌─────────────┐   MCP/stdio   ┌──────────────────┐   Actual API   ┌──────────────┐
 │  Claude     │ ◄───────────► │  Actual MCP      │ ◄───────────► │   Actual     │
 │  Desktop    │               │  Server          │               │   Budget     │
-│  (local)    │               │  (74 tools)      │               │   Server     │
+│  (local)    │               │  (77 tools)      │               │   Server     │
 └─────────────┘               └──────────────────┘               └──────────────┘
 ```
 
@@ -38,14 +38,14 @@ Actual MCP Server is a [Model Context Protocol](https://modelcontextprotocol.io/
 
 Most Actual Budget MCP implementations are simple stdio bridges designed for single-user, local use with Claude Desktop. This project goes further:
 
-- **74 tools, the most comprehensive coverage available.** Accounts, transactions, categories, payees, tags, notes, rules, budgets, batch operations, bank sync, and more. Covers the reachable Actual Budget API with no genuine gaps.
+- **77 tools, the most comprehensive coverage available.** Accounts, transactions, categories, payees, tags, notes, rules, budgets, batch operations, bank sync, and more. Covers the reachable Actual Budget API with no genuine gaps.
 - **HTTP and stdio transport.** Runs as a real remote server for LibreChat/LobeChat (`--http`), or as a direct local process for Claude Desktop (`--stdio`). No Docker or HTTP server is needed for local use.
 - **6 exclusive ActualQL-powered tools.** Search and summarise transactions by month, amount, category, or payee using Actual Budget's native query engine. Aggregated results, no raw data dumped into the AI context window.
 - **Multi-budget switching at runtime.** Configure multiple budget files and let the AI switch between them mid-conversation with `actual_budgets_switch`. Works on both transports: HTTP keys the active budget to the MCP session, and stdio (Claude Desktop, Claude Code, Cursor) gets a synthetic per-process session so a switch is scoped to that process rather than shared globally (#348).
 - **Multi-user ready with OIDC.** Secure every session with JWKS-validated JWTs and per-user budget ACLs. No shared tokens required.
-- **Production-grade reliability.** Connection pooling (up to 15 concurrent sessions), automatic retry with exponential backoff, and a full test suite (unit + E2E + integration).
+- **Production-grade reliability on both transports.** HTTP connection pooling (up to 15 concurrent sessions), and a long-lived stdio process that logs in ONCE and reuses that connection for every tool call instead of re-authenticating per call, so Claude Desktop and Claude Code stay fast and a burst of calls no longer risks a per-call login storm against the upstream limiter. Automatic retry with exponential backoff, and a full test suite (unit + E2E + integration).
 
-> **Verified working** with [LibreChat](https://www.librechat.ai/), [LobeChat](https://lobehub.com/home), and [Claude Desktop](https://claude.ai/download). All 74 tools tested end-to-end. Any MCP-compatible client should work.
+> **Verified working** with [LibreChat](https://www.librechat.ai/), [LobeChat](https://lobehub.com/home), and [Claude Desktop](https://claude.ai/download). All 77 tools tested end-to-end. Any MCP-compatible client should work.
 
 ---
 
@@ -123,7 +123,7 @@ Also available on Docker Hub: `agigante80/actual-mcp-server:latest`
 ```bash
 git clone https://github.com/agigante80/actual-mcp-server.git
 cd actual-mcp-server
-cp .env.example .env        # fill in ACTUAL_SERVER_URL, ACTUAL_PASSWORD, ACTUAL_BUDGET_SYNC_ID
+cp .env.example .env        # fill in ACTUAL_SERVER_URL, ACTUAL_BUDGET_SYNC_ID, and a password or session token
 
 docker compose --profile production up -d   # production: MCP server listens on :3600
 # or
@@ -178,7 +178,7 @@ Add to `claude_desktop_config.json` (see [docs/guides/MCP_CLIENTS_SETUP.md](docs
 }
 ```
 
-> **No token needed.** stdio runs as a local process owned by your user. The transport itself is the security boundary. All 74 tools are available.
+> **No token needed.** stdio runs as a local process owned by your user. The transport itself is the security boundary. All 77 tools are available.
 >
 > **`MCP_BRIDGE_DATA_DIR` should be an absolute path.** Without one, the data directory resolves relative to wherever the client spawns the process, which can be unpredictable. The directory is created automatically on first run.
 
@@ -304,21 +304,22 @@ For Claude Desktop (stdio), restart Claude after upgrading.
 
 ## Available Tools
 
-**74 tools** across all categories. All tools use the `actual_<category>_<action>` naming convention.
+**77 tools** across all categories. All tools use the `actual_<category>_<action>` naming convention.
 
-### Accounts (7)
+### Accounts (8)
 
 | Tool | Description |
 |------|-------------|
 | `actual_accounts_list` | List all accounts |
 | `actual_accounts_create` | Create new account |
-| `actual_accounts_update` | Update account details |
+| `actual_accounts_update` | Update account details. An id that does not exist is refused rather than creating a partial record |
 | `actual_accounts_delete` | Permanently delete account |
-| `actual_accounts_close` | Close account (soft delete) |
-| `actual_accounts_reopen` | Reopen closed account |
+| `actual_accounts_close` | Close account. An account with NO transactions is REMOVED by Actual, not closed |
+| `actual_accounts_reopen` | Reopen closed account. An id that is not an account is refused rather than creating one |
 | `actual_accounts_get_balance` | Get account balance at a date |
+| `actual_account_flow_summary` | Explain the exact balance change across a set of accounts over a date range: external income, expense outflow, credits, uncategorized inflows, and transfers into, out of, or within the selection, with an exact reconciliation |
 
-### Transactions (14)
+### Transactions (16)
 
 **Standard (6)**
 
@@ -340,16 +341,18 @@ For Claude Desktop (stdio), restart Claude after upgrading.
 | `actual_transactions_uncategorized` | Summary of uncategorized transactions (totalCount, totalAmount, per-account breakdown); pass `includeTransactions:true` for paginated rows |
 | `actual_transactions_update_batch` | Apply many transaction updates in ONE call (`updates: [{ id, fields }]`); returns per-item success and failure counts |
 
-**Exclusive ActualQL-powered (6)**, unique to this MCP server
+**Exclusive ActualQL-powered (8)**, unique to this MCP server
 
 | Tool | Description |
 |------|-------------|
+| `actual_transactions_aggregate` | Deterministic integer-cent totals grouped by month, category, category group, payee, or account; transfers excluded via `transfer_id` and split children counted once |
 | `actual_transactions_search_by_month` | Search by month using `$month` transform |
 | `actual_transactions_search_by_amount` | Find by amount range |
 | `actual_transactions_search_by_category` | Search by category name |
 | `actual_transactions_search_by_payee` | Find by payee/vendor |
 | `actual_transactions_summary_by_category` | Spending summary grouped by category |
 | `actual_transactions_summary_by_payee` | Top vendors with totals and counts |
+| `actual_recurring_expenses_summary` | Detect recurring charges (subscriptions, bills) from posted history: cadence (with date-drift and month-end tolerance), latest amount, price changes, occurrences, annualized cost, and active or inactive state |
 
 ### Transfers (1)
 
@@ -406,10 +409,10 @@ For Claude Desktop (stdio), restart Claude after upgrading.
 | `actual_budgets_get_all` | List available budget files |
 | `actual_budgets_getMonths` | List budget months |
 | `actual_budgets_getMonth` | Get budget for a specific month |
-| `actual_budgets_setAmount` | Set category budget amount |
+| `actual_budgets_setAmount` | Set category budget amount. The month must be one the budget has (see `actual_budgets_getMonths`) |
 | `actual_budgets_transfer` | Transfer amount between categories |
 | `actual_budgets_setCarryover` | Enable/disable carryover |
-| `actual_budgets_holdForNextMonth` | Hold funds for next month |
+| `actual_budgets_holdForNextMonth` | Hold funds for next month. Actual clamps the hold to what is left to budget, so the response reports the amount actually held |
 | `actual_budgets_resetHold` | Reset hold status |
 | `actual_budgets_export` | Export the active budget as a `.zip` into `ACTUAL_EXPORT_DIR`; returns path, byte size and sha256, never the file contents |
 | `actual_budgets_import` | Restore a budget from an Actual `.zip` or a YNAB4/YNAB5 export. **Destructive:** the budget id comes from the archive, so re-importing an export *replaces* that budget's data rather than making a copy. Also loads the imported budget, changing the session's active budget |
@@ -471,11 +474,13 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 |----------|---------|----------|-------------|
 | **Actual Budget Connection** ||||
 | `ACTUAL_SERVER_URL` | _(none)_ | Yes | URL of your Actual Budget server. Use the same URL you type in your browser: `http://localhost:5006` (local), `http://192.168.1.x:5006` (network), `https://actual.yourdomain.com` (domain), or `http://actual:5006` (container name if on the same Docker network) |
-| `ACTUAL_PASSWORD` | _(none)_ | Yes | Login password for your Actual Budget **server**, the one you type on its own login screen. Not the same as `ACTUAL_BUDGET_PASSWORD` (which decrypts an E2E-encrypted budget) and unrelated to `AUTH_PROVIDER=oidc` (which controls how MCP *clients* authenticate to this server, not how this server authenticates to Actual). This server always signs in to Actual with a password, so upstream password login must stay enabled |
+| `ACTUAL_PASSWORD` | _(empty)_ | One of password/token | Login password for your Actual Budget **server**. Leave empty when using `ACTUAL_SESSION_TOKEN`. This is unrelated to inbound MCP client authentication and to `ACTUAL_BUDGET_PASSWORD` |
+| `ACTUAL_SESSION_TOKEN` | _(none)_ | One of password/token | Session-token alternative for authenticating this server to Actual. Passed to `@actual-app/api` as `sessionToken`; when used alone, the password login path is not attempted. Treat as a secret |
 | `ACTUAL_BUDGET_SYNC_ID` | _(none)_ | Yes | Budget Sync ID from Actual (Settings then Sync ID) |
 | `ACTUAL_BUDGET_PASSWORD` | _(none)_ | No | Optional encryption password for encrypted budgets |
 | `ALLOW_INSECURE_UPSTREAM` | `false` | No | Allow an `http://` upstream even when `ACTUAL_BUDGET_PASSWORD` is set (#161). Off by default so a plaintext upstream plus an encryption password is refused |
 | `ACTUAL_OP_TIMEOUT_MS` | `30000` | No | Per-operation timeout (ms) for every upstream Actual API call (init, budget download, sync, and each tool operation). A stalled call rejects after this bound so it cannot hold the global API mutex forever and hang subsequent tool calls (#270). Set to `0` to disable |
+| `ACTUAL_IMPORT_TIMEOUT_MS` | `600000` | No | Separate, larger timeout (ms) for a budget import, which is legitimately long rather than stalled. An import is a tracked load, so every other session waits on it; bounding it at the general operation timeout turned one tenant's large import into a process-wide stall (#407). Set to `0` to disable |
 | **MCP Server Settings** ||||
 | `MCP_BRIDGE_PORT` | `3600` | No | Port for MCP server to listen on |
 | `MCP_BRIDGE_BIND_HOST` | `0.0.0.0` | No | Host address to bind server to (`0.0.0.0` = all interfaces) |
@@ -486,7 +491,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `MCP_BRIDGE_USE_TLS` | `false` | No | Set to `true` to advertise `https://` in the server URL (for reverse-proxy setups where TLS is terminated upstream) |
 | **Transport Configuration** ||||
 | `MCP_TRANSPORT_MODE` | `--http` | No | Transport mode. Only `--http` is a valid value; stdio is selected via the `--stdio` CLI flag, not this var |
-| `MCP_HTTP_PATH` | `/http` | No | HTTP endpoint routing path |
+| `MCP_HTTP_PATH` | `/http` | No | Configured HTTP endpoint routing path. `/mcp` is always available as an authenticated alias through the same middleware stack |
 | `MCP_BRIDGE_HTTP_PATH` | same as `MCP_HTTP_PATH` | No | Advertised HTTP path shown to clients (set when a reverse proxy rewrites the path) |
 | `MCP_HTTP_BODY_LIMIT` | `512kb` | No | Maximum accepted JSON-RPC request body size (e.g. `512kb`, `1mb`) |
 | **Session Management** ||||
@@ -590,7 +595,7 @@ stdio is the simplest way to connect Claude Desktop directly to Actual Budget. T
 - No auth token. Process ownership is the security boundary.
 - All logs go to stderr so they never corrupt the JSON-RPC framing on stdout
 - The process exits when stdin closes (Claude Desktop shutting down)
-- All 74 tools are available, identical to HTTP mode
+- All 77 tools are available, identical to HTTP mode
 
 **Start manually to verify:**
 
@@ -689,7 +694,7 @@ See [AI Client Setup, OIDC](docs/guides/AI_CLIENT_SETUP.md#oidc-authentication-m
 | Command | What It Tests | Requires Live Server |
 |---------|---------------|---------------------|
 | `npm run build` | TypeScript compilation | No |
-| `npm run test:unit-js` | 74-tool smoke, schema validation, auth ACL | No |
+| `npm run test:unit-js` | 77-tool smoke, schema validation, auth ACL | No |
 | `npm run test:adapter` | Adapter, retry logic, concurrency | No |
 | `npm run test:e2e` | MCP protocol compliance (Playwright) | No |
 | `npm run test:e2e:docker:full` | Full stack integration | Yes (Docker) |
@@ -774,4 +779,10 @@ The software is provided **as-is**, without warranty of any kind. The author acc
 
 ---
 
-**Version:** 0.11.6 | **Tool Count:** 74 (verified LibreChat-compatible)
+**Version:** 0.19.3 | **Tool Count:** 77 (verified LibreChat-compatible)
+
+## Sponsor
+
+I build and maintain this in my own time. It is free, it stays free, and it gets maintained either way.
+
+If it saved you some time and you feel like saying thanks, you can do that at [github.com/sponsors/agigante80](https://github.com/sponsors/agigante80). Entirely optional, and nothing about the project changes either way.

@@ -1,5 +1,7 @@
 // Auto-generated index for all tool modules
 export { default as entities_search } from './entities_search.js';
+export { default as account_flow_summary } from './account_flow_summary.js';
+export { default as recurring_expenses_summary } from './recurring_expenses_summary.js';
 export { default as accounts_close } from './accounts_close.js';
 export { default as accounts_create } from './accounts_create.js';
 export { default as accounts_delete } from './accounts_delete.js';
@@ -49,6 +51,7 @@ export { default as schedules_delete } from './schedules_delete.js';
 export { default as schedules_get } from './schedules_get.js';
 export { default as schedules_update } from './schedules_update.js';
 export { default as server_info } from './server_info.js';
+export { default as transactions_aggregate } from './transactions_aggregate.js';
 export { default as transactions_create } from './transactions_create.js';
 export { default as transactions_delete } from './transactions_delete.js';
 export { default as transactions_filter } from './transactions_filter.js';

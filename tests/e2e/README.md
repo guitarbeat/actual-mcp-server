@@ -13,23 +13,17 @@ tests/e2e/
 ├── README.md                          ← this file
 ├── run-docker-e2e.sh                  ← Docker orchestrator: bootstrap 4-container stack,
 │                                         run Playwright inside Docker network, then tear down
-├── mcp-client.playwright.spec.ts      ← Protocol compliance: initialize → tools/list →
+├── mcp-client.playwright.spec.ts      ← MANUAL (#384, CI does not run it). Protocol:
+│                                         initialize → tools/list →
 │                                         tools/call → SSE streaming; spawns its own server
 │                                         process (or reuses Docker via USE_DOCKER_MCP_SERVER)
-├── docker.e2e.spec.ts                 ← Smoke + health checks against Docker stack
-├── docker-all-tools.e2e.spec.ts      ← Comprehensive coverage of all 74 tools (~80 named tests)
-└── suites/                            ← Domain suite files (registration functions)
-    ├── shared-context.ts              ← SharedState / TestContext types + createSharedState()
-    ├── server.ts                      ← server_info, server_get_version, session_*
-    ├── accounts.ts                    ← accounts_* (7 tools)
-    ├── categories.ts                  ← category_groups_* + categories_* (8 tools)
-    ├── payees.ts                      ← payees_* + payee_rules_* (6 tools)
-    ├── transactions.ts                ← transactions_* (13 tools)
-    ├── budgets.ts                     ← budgets_* + budget_updates_batch (11 tools)
-    ├── rules.ts                       ← rules_* (4 tools)
-    ├── schedules.ts                   ← schedules_* (4 tools)
-    ├── advanced.ts                    ← bank_sync, query_run, get_id_by_name
-    └── deletes.ts                     ← all delete operations (ordered by dependency)
+├── docker.e2e.spec.ts                 ← MANUAL (#384, CI does not run it). Smoke checks
+├── fixtures.ts                        ← Playwright fixtures: the `mcp` client plus the
+│                                         make* factories that provision and tear down test
+│                                         data. Import `test` from HERE, not @playwright/test
+├── tsconfig.json                      ← typecheck project for this dir (npm run typecheck:e2e)
+└── docker-all-tools.e2e.spec.ts      ← Comprehensive coverage of all 77 tools; the ONLY
+                                        file that carries E2E assertions (see the #366 note)
 ```
 
 Also see:
@@ -72,14 +66,50 @@ npm run test:e2e:docker:smoke       # ~11 tests, ~20 seconds
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_SERVER_URL` | `http://mcp-server-test:3600` | MCP server URL |
-| `EXPECTED_TOOL_COUNT` | `74` | Expected tool count (must match `actualToolsManager.ts`) |
+| `EXPECTED_TOOL_COUNT` | `77` | Expected tool count (must match `actualToolsManager.ts`) |
 | `USE_DOCKER_MCP_SERVER` | `true` | Set to `false` to spawn a local server (mcp-client spec only) |
 
 ---
 
 ## Spec Files
 
-### `mcp-client.playwright.spec.ts` (343 lines)
+### What CI actually runs (#384, #383)
+
+**Only `docker-all-tools.e2e.spec.ts`, and since #383 it runs TWICE**: once over HTTP inside the
+runner container, then once over stdio from the HOST (`run-docker-e2e.sh` step 6b, reaching the
+server by `docker exec`, because the runner container has no route to a stdio server). Four tests
+are HTTP-only, each saying why at the test, so the stdio project skips exactly those four and
+otherwise matches HTTP (read the totals from `npx playwright test --list`, do not pin them; they are
+currently 105 collected, so 101 pass plus 4 skip over stdio). The two legs run in SEPARATE processes,
+so the module-scoped pacer does not span them; the 75s cool-down in `run-docker-e2e.sh`
+(`STDIO_COOLDOWN_S`) drains Actual's rate-limit window between them, and #419 (v0.16.13) is what
+keeps each leg under the ceiling by logging a stdio process in once rather than per call.
+
+The stdio leg is OPT-IN and OFF in CI until #423: step 6b runs only when `RUN_STDIO_E2E=true`, which
+CI does not set. Two blockers are tracked in #423: a strict-Playwright startup error (the HTML report
+nests inside `test-results`) and a rate-limit tail on the write-heavy block (a throttled `api.sync()`
+closes the budget, forcing a re-download + re-login). Run it locally with `RUN_STDIO_E2E=true`
+(ADVISORY unless `STDIO_E2E_GATING=true`); #423 fixes both, enables it in CI, and makes it gating.
+
+Both workflows invoke `npm run test:e2e:docker:full`,
+which selects the `docker-e2e-full` project, which collects that one file. Every other spec in this
+directory is a MANUAL diagnostic, and that is a decision rather than an oversight.
+
+That distinction matters because this repository has twice shipped tests that never ran (#366 and
+#382), and the guard added after the second one asserted only that a spec was COLLECTED. Collected
+is not run: `mcp-protocol-tests` and `docker-e2e-smoke` are both real projects that CI never
+selects. `tests/unit/e2e_spec_collection.test.js` now follows the whole chain (workflow, then
+`run-docker-e2e.sh`, then project, then `testMatch`) and fails on a spec that is collected but run
+by no CI project, unless that spec is listed in its `DECLARED_MANUAL` map with a reason. So the
+table below is enforced, not merely documented.
+
+| Spec | Runs in CI? | Why |
+|---|---|---|
+| `docker-all-tools.e2e.spec.ts` | **yes, TWICE** | the gate, over HTTP (`docker-e2e-full`) and then stdio (`docker-e2e-full-stdio`, #383) |
+| `mcp-client.playwright.spec.ts` | no, manual | round trip duplicated by docker-all-tools, session shim covered by `tests/unit/httpServer_session_not_found.test.js`; only the SSE connect is unique |
+| `docker.e2e.spec.ts` | no, manual | the smoke level, for fast local feedback; its assertions are a subset of docker-all-tools |
+
+### `mcp-client.playwright.spec.ts` (343 lines), MANUAL and not a gate
 
 **Purpose:** MCP protocol compliance — verifying JSON-RPC envelope shapes, SSE
 streaming, and session lifecycle.
@@ -88,7 +118,7 @@ streaming, and session lifecycle.
 - Read-only; no budget mutations
 - Tests: `initialize` handshake, `tools/list` shape, `tools/call` round-trip, streaming
 
-### `docker.e2e.spec.ts` (452 lines)
+### `docker.e2e.spec.ts` (452 lines), MANUAL and not a gate
 
 **Purpose:** Smoke + integration checks against the production Docker stack.
 
@@ -96,18 +126,30 @@ streaming, and session lifecycle.
 - Tests: `/health` endpoint, tool count, a handful of CRUD operations
 - Verifies the Docker image works end-to-end with a real Actual Budget connection
 
-### `docker-all-tools.e2e.spec.ts` (~1430 lines)
+### `docker-all-tools.e2e.spec.ts`
 
-**Purpose:** Comprehensive named tests for all 74 tools — success paths + error/negative paths.
+**Purpose:** Comprehensive named tests for all 77 tools: success paths plus error and negative paths.
 
-- All tests share a single MCP session (`sessionId`) initialized in `beforeAll`
-- Tests run sequentially within a `test.describe` block; each **create** test stores
-  an ID in `testContext`, which later **update**, **delete**, and **list-absence** tests consume
-- `DELETE OPERATIONS` section: 6 named delete tests that both verify correctness and
-  clean up test data
-- `afterAll` is **fallback cleanup only** — it fires only if a delete test was skipped or failed
-- Domain suite files in `suites/` contain the same tests broken into registration functions
-  for incremental adoption; currently the spec runs tests inline for simplicity and proven stability
+- Every test is **self-provisioning** (#375): it asks `fixtures.ts` for what it needs, and
+  everything it creates is removed in fixture teardown, which runs even when the test fails
+- Any single test can be run alone. `npx playwright test --config playwright.config.docker.ts
+  --grep 'actual_accounts_get_balance'` passes rather than skipping
+- Tests share one MCP session per worker (cached in `fixtures.ts`), but no test depends on
+  DATA another test created. The file documents its one exception: the export/import round
+  trip changes the session's ACTIVE BUDGET, so it runs last and registers its switch-back as
+  teardown
+- `DELETE OPERATIONS` section: 6 named delete tests, each of which creates the object it
+  deletes and then asserts its absence from the corresponding list
+- There is no `afterAll`. It was fallback cleanup for the shared-context design, and the
+  fixtures replaced it
+- **#366:** `suites/` used to hold the same tests split into per-domain registration
+  functions, extracted in 2026-03 "for incremental adoption". The adoption never happened:
+  nothing ever imported `register*Tests` and no Playwright `testMatch` covered the
+  directory, so none of it ever executed. Meanwhile CLAUDE.md, the tool checklist, the issue
+  templates and two agent definitions all started naming it as the place to add E2E
+  coverage, so tests written there were silently inert. The directory was removed and every
+  pointer now names this spec. Add E2E coverage here, and confirm it is collected with
+  `npx playwright test --list --config playwright.config.docker.ts`.
 
 ---
 
@@ -129,26 +171,40 @@ mirrors this logic for plain-JS callers in `tests/manual/`. If the MCP envelope 
 
 ---
 
-## Test Data
+## Test Data (the fixtures)
 
-Entities created by E2E tests are ephemeral and cleaned up by named delete tests.
-The `testContext` object in `docker-all-tools.e2e.spec.ts` accumulates IDs:
+Entities are created per test and removed in teardown. Ask for the factory you need:
 
+```ts
+import { test, expect, today, currentMonth, uniqueSuffix, CLEANUP_ORDER } from './fixtures.js';
+
+test('actual_something - does the thing', async ({ mcp, makeAccount, makeCategory }) => {
+  const account = await makeAccount();          // removed in teardown
+  const category = await makeCategory();        // creates its own group too, both removed
+  ...
+});
 ```
-testContext shape:
-  accountId        ← written by actual_accounts_create
-  accountName      ← written by actual_accounts_create
-  categoryGroupId  ← written by actual_category_groups_create
-  categoryId       ← written by actual_categories_create
-  payeeId          ← written by actual_payees_create
-  payeeId2         ← written by actual_payees_create (second payee; cleared after merge test)
-  transactionId    ← written by actual_transactions_create (may be unavailable in CI budget)
-  ruleId           ← written by actual_rules_create
-  ruleWithoutOpId  ← written by actual_rules_create (no-op variant)
-  rulesUpsertId    ← written by actual_rules_create_or_update (idempotency test)
-  scheduleOneOffId ← written by actual_schedules_create (one-off variant)
-  scheduleRecurId  ← reserved for recurring schedule (populated in suites/schedules.ts)
-```
+
+| Fixture | Gives you | Notes |
+|---------|-----------|-------|
+| `mcp` | `call` (unwrapped result), `raw` (full envelope), `post` (arbitrary JSON-RPC) | `call` throws on a tool error, so negative tests use `rejects.toThrow` |
+| `makeAccount({ name?, balance?, seedTransaction? })` | `{ id, name }` | Pass `seedTransaction: true` for any test that CLOSES the account: Actual deletes a zero-transaction account on close instead of closing it |
+| `makeCategoryGroup({ name? })` | `{ id, name }` | |
+| `makeCategory({ name?, group? })` | `{ id, name, groupId }` | Creates a group when none is passed |
+| `makePayee({ name? })` | `{ id, name }` | |
+| `makeTransaction({ account, amount?, date?, notes?, payee?, category? })` | `{ id, accountId, notes }` | |
+| `makeRule({ categoryId, marker?, withoutOp? })` | `{ id }` | |
+| `makeSchedule({ name?, date?, amount? })` | `{ id, name }` | |
+| `cleanup` | `add(priority, label, fn)` | For anything no factory owns (a tag, a note). Use a `CLEANUP_ORDER` constant, never a bare number |
+
+Deletes have a required order, so all factories share ONE registry sorted by `CLEANUP_ORDER`
+(`note`, `transaction`, `tag`, `rule`, `schedule`, `payee`, `category`, `categoryGroup`,
+`account`, then `activeBudget` last). Playwright's own teardown order follows the order the
+TEST declared its fixtures, which is not the order referential integrity needs. That is why
+the registry exists.
+
+Every cleanup step swallows its own error: a delete test removes its object, and the matching
+teardown step then correctly finds nothing to do.
 
 ---
 
@@ -160,8 +216,10 @@ These rules apply to everyone adding or modifying tests in this directory.
 
 - **Soft target: 500 lines per spec file.** Files over 700 lines **must** be evaluated for a
   domain split.
-- `docker-all-tools.e2e.spec.ts` is currently above this limit and is explicitly tracked for
-  refactoring. Do not use it as a size reference for new files.
+- `docker-all-tools.e2e.spec.ts` is above this limit. #366 rejected a per-domain split
+  (`suites/` was exactly that, and it never executed), and #375 removed the shared context
+  that made the size dangerous, so the file is long but no longer coupled. Do not use it as a
+  size reference for new files.
 
 ### Environment variables
 
@@ -172,8 +230,10 @@ These rules apply to everyone adding or modifying tests in this directory.
 
 ### Session management
 
-- Tests in `docker-all-tools.e2e.spec.ts` share a single `sessionId` from `beforeAll`. Do not
-  create a new session inside an individual test.
+- The `mcp` fixture caches one session per worker process. Do not create a session inside a
+  test; ask for `mcp`.
+- A session is not data a test can corrupt, which is why it is shared. DATA is not shared:
+  provision it with a factory.
 - Session lifecycle tests belong in `mcp-client.playwright.spec.ts`.
 
 ### Retry behaviour
@@ -182,30 +242,40 @@ These rules apply to everyone adding or modifying tests in this directory.
   `playwright.config.ts` and `playwright.config.docker.ts`) handles transient flakiness.
 - Use `retryRequest()` only for `fetch`/`request` calls, not for Playwright `test` assertions.
 
-### Named assertions vs. `afterAll` cleanup
+### Cleanup and read-back
 
-- Every tool that performs a mutation **must** have a corresponding named delete/revert test.
-- `afterAll` is **fallback-only** — it verifies nothing. Don't rely on it as the primary cleanup.
+- Provision through a factory so teardown is automatic. For anything no factory owns, call
+  `cleanup.add(...)` with a `CLEANUP_ORDER` priority, and register it BEFORE the work, so a
+  failed assertion still tears down.
+- Every tool that performs a mutation **must read the state back and assert it**. Calling a
+  write tool and asserting only that it returned is the #350 failure mode: it passes whether
+  or not the write had any effect.
 - Delete tests must verify absence: call the list tool after deletion and assert the ID is gone.
 
 ### Error path coverage
 
 - Each tool test should include at least one **negative test**: call the tool with a sentinel
   UUID (`00000000-0000-0000-0000-000000000000`) and assert an error response.
-- Negative tests use `try/catch` and log `console.log('✓ Error correctly returned...')`.
-- Do not use `expect().toThrow()` for MCP tool calls — the tool call itself succeeds (HTTP 200);
-  the error is in the JSON-RPC response body.
+- Prefer `await expect(mcp.call(...)).rejects.toThrow(/pattern/i)`. The `mcp.call` helper
+  throws on a JSON-RPC error, so this reads directly. The older rule here said not to use
+  `toThrow` because the raw HTTP call returns 200 with the error in the body. That is true of
+  `request.post`, not of `mcp.call`.
+- Use `mcp.post(...)` when the test needs to inspect the raw JSON-RPC error envelope itself.
 
 ### Adding a new tool test
 
-1. Find or create the correct domain section in `docker-all-tools.e2e.spec.ts` (ordered by
-   domain, alphabetical within domain). Add the same test to the corresponding suite file
-   under `tests/e2e/suites/` for future reference.
-2. Add a named `test(...)` for the happy path, including read-back of the created/updated value.
+1. Find or create the correct domain section in `docker-all-tools.e2e.spec.ts`, which is the
+   only E2E file Playwright collects (#366).
+2. Add a named `test(...)` for the happy path. Destructure the fixtures it needs
+   (`async ({ mcp, makeAccount }) => ...`) rather than reaching for anything file-scoped, and
+   include a read-back of the created or updated value.
 3. Add a named `test(...)` for the negative path (sentinel UUID or missing required field).
-4. If the tool creates an entity: store the returned ID in `testContext`, add a corresponding
-   delete test in the `DELETE OPERATIONS` section with a list-absence assertion.
-5. Update `EXPECTED_TOOL_COUNT` in every spec that checks tool count if you added a new tool.
+4. If the tool creates an entity no factory covers, either add a factory to `fixtures.ts` or
+   register `cleanup.add(...)` in the test itself.
+5. Confirm the test is collected AND runs alone:
+   `npx playwright test --list --config playwright.config.docker.ts`, then the same command
+   with `--grep 'your test name'`. A test that skips when run alone has a hidden dependency.
+6. Run `npm run typecheck:e2e`. Playwright transpiles specs without typechecking them.
 
 ### Do not
 
@@ -213,7 +283,10 @@ These rules apply to everyone adding or modifying tests in this directory.
 - Add `baseURL` interaction patterns — specs call `MCP_SERVER_URL` directly.
 - Hardcode credentials, server hostnames, or port numbers.
 - Skip the negative test for any tool that accepts a UUID parameter.
-- Define helpers locally in spec or suite files — always import from `tests/shared/e2e-helpers.ts`.
+- Define helpers locally in spec files. Import transport helpers from
+  `tests/shared/e2e-helpers.ts` and fixtures from `tests/e2e/fixtures.ts`.
+- Read an id out of a variable another test wrote. That is the coupling #375 removed; every
+  test provisions its own.
 
 ---
 
@@ -221,5 +294,5 @@ These rules apply to everyone adding or modifying tests in this directory.
 
 | Limitation | Detail |
 |------------|--------|
-| 4 skipped transaction tests | `actual_transactions_get/update/update_batch/delete` depend on `testContext.transactionId` which `actual_transactions_create` can't capture in the CI test budget (budget returns "ID not available"). Pre-existing; not a regression. |
+| ~~4 skipped transaction tests~~ | Fixed in #375. `makeTransaction` resolves the id by filtering the account when `transactions_create` returns "ID not available", so these four run rather than skipping. The suite reports 0 skips. |
 | `budgets_list_available` / `budgets_switch` excluded | Single-budget CI environment — these tools are covered only in the live manual integration suite. |

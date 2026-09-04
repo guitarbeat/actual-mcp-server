@@ -4,9 +4,52 @@
 // is re-exported from actual-adapter.ts and is unit-tested directly. The #178
 // operator support (LIKE / NOT LIKE / IS NULL, throw-on-unsupported) lives here.
 
+import { getFieldType } from '../actual-schema.js';
+
 // Strip a single pair of surrounding quotes from a SQL value literal.
 function _stripWhereQuotes(s: string): string {
   return s.trim().replace(/^['"]|['"]$/g, '');
+}
+
+// #421: split an IN-list body on commas that are OUTSIDE quoted literals, so a legitimate value
+// containing a comma (e.g. 'Smith, John') stays ONE element. A naive split(',') both broke such
+// values and, with the element check below, turned them into a confusing rejection.
+function _splitInList(valuesStr: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (const ch of valuesStr) {
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      cur += ch;
+    } else if (ch === ',') {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// #421: whether an IN-list element is safe to feed into upstream's `$oneof`, which stringifies each
+// element as `'${id}'` with NO escaping. Two conditions, and both matter:
+//   1. It must be WELL FORMED: a number, or a single-/double-quoted string with no embedded quote of
+//      the same kind, so a crafted element like `'b') UNION SELECT 1 --'` (unbalanced) is rejected.
+//   2. The value that ACTUALLY REACHES `$oneof` must contain no single quote. `_stripWhereQuotes`
+//      removes the outer pair of EITHER quote kind and upstream always re-wraps in SINGLE quotes, so
+//      a double-quoted element hiding a single quote (`"x' UNION SELECT 1 --"`) is well formed by (1)
+//      yet its inner `'` would terminate upstream's wrapper. Checking the stripped value closes that.
+// A legitimate `'groceries'`, `'Smith, John'`, `"cash"`, `100` or `-5.5` passes both.
+function _isSafeInListElement(raw: string): boolean {
+  const t = raw.trim();
+  const wellFormed = /^'[^']*'$/.test(t) || /^"[^"]*"$/.test(t) || /^-?\d+(?:\.\d+)?$/.test(t);
+  if (!wellFormed) return false;
+  return !_stripWhereQuotes(t).includes("'");
 }
 
 // Coerce a SQL value literal to a number when it looks numeric, else keep the
@@ -19,7 +62,40 @@ function _coerceWhereValue(s: string): string | number {
   return isNaN(n) ? v : n;
 }
 
-export function parseWhereClause(query: any, whereClause: string): any {
+// #420: coerce a SQL literal to a real JavaScript boolean, for a column the schema types as
+// boolean. ActualQL requires a genuine JS boolean here: its compiler only tags a value as
+// `boolean` from `typeof value === 'boolean'`, and `castInput` has no string-to-boolean or
+// integer-to-boolean branch, so `"true"` and `1` are both rejected with the exact errors #420
+// reports.
+//
+// Accepts `true`/`false` case-insensitively AND `1`/`0`. The integer form is accepted on purpose:
+// the tool advertises SQL, and every mainstream engine (SQLite, which is Actual's own store, plus
+// MySQL/MariaDB/SQL Server/Postgres) treats `1`/`0` as booleans. Refusing it would make this tool
+// stricter than the database it models. A value that is neither throws, naming the column and the
+// value, because a bad boolean literal is a caller mistake we can describe precisely.
+function _coerceBoolean(field: string, s: string): boolean {
+  const v = _stripWhereQuotes(s).toLowerCase();
+  if (v === 'true' || v === '1') return true;
+  if (v === 'false' || v === '0') return false;
+  throw new Error(
+    `Invalid boolean value for column "${field}": ${JSON.stringify(_stripWhereQuotes(s))}. ` +
+    `Use true or false (1 or 0 are also accepted).`,
+  );
+}
+
+// Whether the schema types `field` (a plain or joined column) as boolean, given the base table.
+// An unknown field is NOT boolean, so its value is left untouched: this is what keeps a string
+// comparison like `notes = 'true'` a string, and the query validator handles the unknown-field
+// case separately.
+function _isBooleanField(tableName: string | undefined, field: string): boolean {
+  return tableName !== undefined && getFieldType(tableName, field) === 'boolean';
+}
+
+// `tableName` is the FROM table, used to look up column types so boolean literals can be coerced
+// (#420). It is optional only so the many existing unit tests that assert non-boolean behaviour
+// need not all pass it; the production call site in actual-adapter.ts always does. When it is
+// absent, no field resolves as boolean and the pre-#420 behaviour is exactly preserved.
+export function parseWhereClause(query: any, whereClause: string, tableName?: string): any {
   // OR is not supported. Detect it up front and fail loudly. Without this guard
   // a clause like `amount = 100 OR amount < 0` is left as a single fragment by
   // the AND-splitter, and the comparison regex's greedy value capture swallows
@@ -77,8 +153,30 @@ export function parseWhereClause(query: any, whereClause: string): any {
     const inMatch = trimmedCondition.match(/^([\w.]+)\s+IN\s+\((.+)\)$/i);
     if (inMatch) {
       const [, field, valuesStr] = inMatch;
-      const values = valuesStr.split(',').map(_coerceWhereValue);
-      query = query.filter({ [field]: { $oneof: values } });
+      const rawValues = _splitInList(valuesStr);
+      if (_isBooleanField(tableName, field)) {
+        // #420: `$oneof` STRINGIFIES every element (upstream `compiler.ts` emits
+        // `'${String(id)}'`), so `is_parent IN (true, false)` would compile to
+        // `IN ('true','false')` against a 0/1 column and silently match nothing, which is worse
+        // than the loud error we produce today. Expand to `$or` of equalities instead: each inner
+        // equality then routes through `castInput(..., 'boolean')` and works. `$or` is a real
+        // ActualQL condition key (compiler.ts handles `field === '$or'` via `compileOr`).
+        const orConditions = rawValues.map((v) => ({ [field]: _coerceBoolean(field, v) }));
+        query = query.filter({ $or: orConditions });
+      } else {
+        // #421: every element must be safe before it reaches upstream's unescaped `$oneof`. Reject a
+        // value that could terminate its own quote (single- OR double-quote wrapped) and smuggle
+        // trailing SQL.
+        for (const raw of rawValues) {
+          if (!_isSafeInListElement(raw)) {
+            throw new Error(
+              `Invalid value in IN list for column "${field}": ${JSON.stringify(raw.trim())}. ` +
+              `Each value must be a number or a quoted string with no embedded quote.`,
+            );
+          }
+        }
+        query = query.filter({ [field]: { $oneof: rawValues.map(_coerceWhereValue) } });
+      }
       continue;
     }
 
@@ -96,7 +194,12 @@ export function parseWhereClause(query: any, whereClause: string): any {
         '!=': '$ne',
       };
       const actualOp = operatorMap[operator];
-      const finalValue = _coerceWhereValue(valueStr);
+      // #420: on a boolean column the literal must reach ActualQL as a real JS boolean, not the
+      // string "true" or the number 1. Only = and != are meaningful for a boolean; the ordering
+      // operators are left to their normal path, where ActualQL will reject them for a boolean as
+      // it does today, rather than us inventing an ordering the column does not have.
+      const isBool = _isBooleanField(tableName, field) && (actualOp === '$eq' || actualOp === '$ne');
+      const finalValue = isBool ? _coerceBoolean(field, valueStr) : _coerceWhereValue(valueStr);
       if (actualOp === '$eq') {
         // Simple equality can use the direct field: value shorthand.
         query = query.filter({ [field]: finalValue });

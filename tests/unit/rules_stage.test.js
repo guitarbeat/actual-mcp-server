@@ -55,6 +55,10 @@ const baseInput = (extra = {}) => ({
   // runs offline; without these it tries a real login and dies on invalid-password.
   apiDefault.init = async () => {};
   apiDefault.downloadBudget = async () => {};
+  // #396: loadBudgetTracked probes with getBudgetMonths after every download, because a
+  // resolved downloadBudget is not proof a budget is open. This file never models an
+  // unloaded singleton, so the probe always succeeds here.
+  apiDefault.getBudgetMonths = async () => ['2026-01'];
   apiDefault.shutdown = async () => {};
 
   const adapterMod = await import('../../dist/src/lib/actual-adapter.js');
@@ -64,7 +68,10 @@ const baseInput = (extra = {}) => ({
   let sent = null;
   adapter.createRule = async (rule) => { sent = rule; return 'rule-id-1'; };
   adapter.updateRule = async (id, fields) => { sent = { id, ...fields }; return null; };
-  adapter.withWriteSession = async (fn) => fn();
+  // NOTE: there is deliberately no `adapter.withWriteSession` stub here. #376 moved the
+  // read-match-write cycle into adapter.upsertRule, so these cases drive the REAL guard
+  // through the write queue. Stubbing withWriteSession as a pass-through would remove the
+  // thing under test, which is why the file no longer does it.
   adapter.getRules = async () => ([]);
 
   const create = (await import('../../dist/src/tools/rules_create.js')).default;

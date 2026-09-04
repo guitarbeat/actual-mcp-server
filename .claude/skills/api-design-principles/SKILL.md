@@ -1,6 +1,6 @@
 ---
 name: api-design-principles
-description: API design principles for the actual-mcp-server MCP tool surface (and REST/GraphQL in general). Use when adding or revising an MCP tool, reviewing tool schemas for consistency across the 71-tool set, or establishing tool-design standards. The general REST/GraphQL material is the reference; the project section maps it to MCP tools.
+description: API design principles for the actual-mcp-server MCP tool surface (and REST/GraphQL in general). Use when adding or revising an MCP tool, reviewing tool schemas for consistency across the 77-tool set, or establishing tool-design standards. The general REST/GraphQL material is the reference; the project section maps it to MCP tools.
 ---
 
 <!-- api-design-principles-version: 1 -->
@@ -37,11 +37,92 @@ as the underlying principles, and apply them through these project rules (from C
   by `tests/unit/schema_json_openai_compat.test.js`), and give every field a `.describe()`.
 - **Types are fixed by convention, not per-tool invention.** Amounts are always integer cents
   (`5000` = $50.00, never decimal dollars). Dates are `YYYY-MM-DD` strings, never `Date.now()`.
-  IDs use `CommonSchemas.accountId` / the shared UUID pattern.
+  IDs use `CommonSchemas.<entity>Id`, and `tests/unit/tool_id_schema_drift.test.js` fails the
+  build if an id-shaped field does not (#380). Note this line USED to be aspirational: when
+  the guard was written, 33 of 41 id fields were on one of three looser forms (a bare
+  `z.string()`, a `.min(1).max(64)` bound, or an inline `UUID_PATTERN` meaning the identical
+  thing), so `accounts_update.id` was published as a UUID while `categories_update.id` was
+  published as any string. A convention four fifths of the surface ignores is not a
+  convention, which is why it is now enforced rather than stated.
+
+  The guard's exception list is the honest part: an MCP `sessionId` and a bank's
+  `imported_id` are not Actual UUIDs and must not be typed as one, and the OPTIONAL FILTER
+  ids (`transactions_filter`, the `search_by_*` family) are deliberately still loose,
+  because tightening them turns "a name returns nothing" into "a name is a schema error",
+  which is a behaviour change needing its own decision.
 - **Errors are messages, not status codes.** There is no HTTP status layer at the tool boundary:
   use the shared helpers `notFoundMsg()` / `constraintErrorMsg()` from `src/lib/errors.ts` so a
-  "not found" or constraint failure reads consistently across all 71 tools. Domain/validation
+  "not found" or constraint failure reads consistently across all 77 tools. Domain/validation
   errors must not drop the pooled connection (see `_shouldDropPoolOnError` in `actual-adapter.ts`).
+- **The refusal SHAPE is fixed by the taxonomy below, and decided by TYPE, never by prose.**
+  The bullet above governs the wording; this one governs which response shape carries it.
+
+- **Annotations describe a tool; they never authorise it (#379).** Every tool publishes MCP
+  `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint` from
+  `src/lib/tool-annotations.ts`. The spec is explicit that these are HINTS and that clients
+  must treat them as untrusted, so no code in `src/` may branch on one. They are for the
+  client's benefit, not the server's. Note the defaults are already conservative
+  (`destructiveHint` and `openWorldHint` both default to TRUE), so the useful work is
+  declaring what is SAFE and correcting `openWorldHint`, which is wrong for every tool here
+  except `actual_bank_sync`. An annotation that lies is worse than none, which is why
+  `tests/unit/tool_annotations.test.js` checks each claim against the adapter call graph.
+
+### The refusal taxonomy (#377)
+
+"You asked for something that cannot happen" had five different shapes across this surface, and
+the two tools using the structured shape picked it by substring-matching the adapter's English.
+A copy-edit to a message in `actual-adapter.ts` could therefore flip a published contract with
+nothing red to show for it. Three rules, in the order you should apply them:
+
+1. **The requested end state ALREADY HOLDS** (closing an already-closed account, reopening an
+   already-open one): return **SUCCESS**, with a field naming the non-change
+   (`alreadyClosed: true`, `alreadyOpen: true`, `removed: true`). This is #347's idempotence
+   argument: the caller's intent is satisfied, so reporting failure would be a lie. Do NOT
+   invent a refusal for it.
+
+   **Deleting an id that does not exist is NOT this case, on this surface.**
+   `rules_delete`, `category_groups_delete`, `schedules_delete`, `payees_delete`,
+   `categories_delete` and `tags_delete` all THROW a `NotFoundRefusal`, and #376
+   re-committed to that when it moved those guards into the adapter. The single exception is `actual_accounts_delete`, which
+   verifies AFTER the write and therefore reports success for an absent id; its own file and
+   `docs/audit/write-effect-audit.md` explain why (a close-then-reopen leaves an id that no
+   listing returns, so a pre-check would refuse a request whose intent is already satisfied).
+   Follow the majority: a delete of an unknown id throws.
+2. **The request NAMES SOMETHING THAT DOES NOT EXIST, or upstream will not do it**: **THROW**.
+   It is a caller error, and MCP's error channel is where a model can see it and self-correct.
+   Throw a typed refusal from `src/lib/errors.ts`: `NotFoundRefusal(entity, id, listTool)` or
+   `OutOfRangeRefusal(message, value)`, both of which extend `PreflightRefusal` and mean "the
+   operation was not attempted and nothing was written".
+3. **`{ success: false, error }` earns its place ONLY where a tool genuinely has a
+   partial-success or multi-outcome contract.** Two tools return it without having one
+   (`budgets_setAmount` from #89, `transactions_create` from #359); both are historical, and
+   converting them is a published-contract change that is deliberately NOT bundled with the
+   typed error. If you are writing a NEW tool, rule 2 applies: throw.
+
+**When a tool must map a refusal to a structured shape, ask the type, not the text:**
+
+```ts
+import { isPreflightRefusal } from '../lib/errors.js';
+// ...
+} catch (error) {
+  if (isPreflightRefusal(error)) return { success: false as const, error: msg };
+  throw new Error(`Failed to ...: ${msg}`);   // a genuine failure must NOT be swallowed
+}
+```
+
+Use `isPreflightRefusal()` rather than a bare `instanceof`: it also checks a `Symbol.for` brand,
+so a duplicate module instance cannot silently downgrade a refusal into a generic failure.
+
+**The other half of the rule is that a NON-refusal must never be swallowed into the refusal
+shape.** A transport or upstream error reported to a model as a tidy "category not found" is an
+error it will try to fix by changing the category id, forever. Prose matching had exactly this
+bug in the other direction: any message containing "not found" and "category" was converted,
+including an upstream error that merely mentioned both words.
+
+**Known deviations**, so the list is honest rather than aspirational: `notes_update` returns
+`{ error }` with no `success` field at all, and `adapter.createTransfer` returns
+`{ success: false, error }` from the ADAPTER rather than throwing. Both predate this taxonomy
+and are tracked on #377 for a separate, deliberate contract change.
 - **Versioning is the product version, not a URL prefix.** The tool set evolves under the `VERSION`
   file and `vX.Y.Z` tags; there is no `/v1/` path. A breaking tool-schema change is a considered
   release event, not a silent edit (adding a tool is a minor bump; changing a field contract needs

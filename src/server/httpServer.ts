@@ -30,6 +30,7 @@ import * as fs from 'node:fs';
 // Re-exported here for backward compatibility with any callers that imported
 // `requestContext` from this module.
 import { requestContext } from '../lib/requestContext.js';
+import { buildToolListEntries } from '../lib/tool-list-entry.js';
 export { requestContext };
 
 // Resolve the authenticated principal for the per-principal budget preference
@@ -205,6 +206,17 @@ export async function startHttpServer(
   // safe fallback if index didn't provide implementedTools
   const toolsList: string[] = Array.isArray(implementedTools) ? implementedTools : [];
 
+  // #379: one resolver, one builder, for all THREE tools/list paths below: the SDK handler,
+  // the no-session LobeChat compatibility path, and the expired-session LobeChat discovery
+  // shim. They each assembled the payload independently, so anything added to the published
+  // surface had to be added three times, and the shim was in fact missed on the first pass.
+  const resolveToolMeta = (name: string) => ({
+    description: actualToolsManager.getTool(name)?.description,
+    schema:
+      (toolSchemas && toolSchemas[name]) ||
+      (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name),
+  });
+
   // Session liveness and idle timing are owned solely by the connection pool
   // (#167). httpServer no longer runs its own idle timer or activity map; it
   // owns only the transport objects. When the pool removes a session (idle
@@ -312,26 +324,7 @@ export async function startHttpServer(
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       logger.debug('[TOOLS LIST] Listing available tools');
       logger.debug(`[TOOLS LIST] toolsList length: ${toolsList.length}`);
-      const tools = toolsList.map((name: string) => {
-        const schemaFromParam = toolSchemas && toolSchemas[name];
-  const schemaFromManager = (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name);
-        const schema = schemaFromParam || schemaFromManager;
-        
-        // Ensure inputSchema is a valid JSON Schema object with required properties
-        const inputSchema = schema && typeof schema === 'object' && Object.keys(schema).length > 0
-          ? schema
-          : { type: 'object', properties: {}, additionalProperties: false };
-        
-        // Get the actual tool description from the tool definition
-        const tool = actualToolsManager.getTool(name);
-        const description = tool?.description || `Tool ${name}`;
-        
-        return {
-          name,
-          description,
-          inputSchema,
-        };
-      });
+      const tools = buildToolListEntries(toolsList, resolveToolMeta);
       logger.debug(`[TOOLS LIST] Returning ${tools.length} tools`);
       return { tools };
     });
@@ -407,26 +400,7 @@ export async function startHttpServer(
     // Handle this case directly without going through the transport
     if (!sessionId && method === 'tools/list') {
       logger.debug('[LOBECHAT COMPAT] Handling tools/list without session directly');
-      const tools = toolsList.map((name: string) => {
-        const schemaFromParam = toolSchemas && toolSchemas[name];
-        const schemaFromManager = (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name);
-        const schema = schemaFromParam || schemaFromManager;
-        
-        // Ensure inputSchema is a valid JSON Schema object with required properties
-        const inputSchema = schema && typeof schema === 'object' && Object.keys(schema).length > 0
-          ? schema
-          : { type: 'object', properties: {}, additionalProperties: false };
-        
-        // Get the actual tool description from the tool definition
-        const tool = actualToolsManager.getTool(name);
-        const description = tool?.description || `Tool ${name}`;
-        
-        return {
-          name,
-          description,
-          inputSchema,
-        };
-      });
+      const tools = buildToolListEntries(toolsList, resolveToolMeta);
       
       res.json({
         jsonrpc: '2.0',
@@ -575,24 +549,7 @@ export async function startHttpServer(
           // This allows LobeChat's backend to discover available tools even with expired sessions
           if (method === 'tools/list') {
             logger.debug('[LOBECHAT COMPAT] Handling tools/list with expired/invalid session - returning tools for discovery');
-            const tools = toolsList.map((name: string) => {
-              const schemaFromParam = toolSchemas && toolSchemas[name];
-              const schemaFromManager = (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name);
-              const schema = schemaFromParam || schemaFromManager;
-              
-              const inputSchema = schema && typeof schema === 'object' && Object.keys(schema).length > 0
-                ? schema
-                : { type: 'object', properties: {}, additionalProperties: false };
-              
-              const tool = actualToolsManager.getTool(name);
-              const description = tool?.description || `Tool ${name}`;
-              
-              return {
-                name,
-                description,
-                inputSchema,
-              };
-            });
+            const tools = buildToolListEntries(toolsList, resolveToolMeta);
             
             res.json({
               jsonrpc: '2.0',

@@ -7,12 +7,19 @@ export default createTool({
   name: 'actual_accounts_create',
   description: 'Create a new account in Actual Budget',
   schema: z.object({ 
-    id: z.string().optional(), 
+    // #380: the `id` field was REMOVED rather than tightened. Upstream ignores it:
+    // `handlers['api/account-create']` destructures only name, offbudget, closed and the
+    // balance, so `insertWithUUID` always mints a fresh UUID (verified against the
+    // @actual-app/api source shipped in dist/index.js.map). A caller who supplied an id got
+    // `{ success: true }` and an account with a DIFFERENT id, then a not-found from
+    // actual_accounts_get_balance. That is the same success-lie family as #350, so
+    // publishing the field at all was the defect; typing it would only have made an
+    // unusable field look deliberate.
     name: CommonSchemas.name, 
     balance: CommonSchemas.optionalAmountCents 
   }),
   handler: async (input) => {
-    const accountPayload = { id: input.id, name: input.name, balance: input.balance };
+    const accountPayload = { name: input.name, balance: input.balance };
     return await adapter.createAccount(accountPayload, input.balance);
   },
   examples: [

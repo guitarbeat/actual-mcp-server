@@ -8,6 +8,8 @@ import { formatZodError } from './lib/zod-error-format.js';
 // ✅ List of tools already implemented in this class.
 // Adding the tool name here is considered fully implemented.
 const IMPLEMENTED_TOOLS = [
+  'actual_account_flow_summary',
+  'actual_recurring_expenses_summary',
   'actual_accounts_close',
   'actual_accounts_create',
   'actual_accounts_delete',
@@ -52,6 +54,7 @@ const IMPLEMENTED_TOOLS = [
   'actual_schedules_delete',
   'actual_schedules_get',
   'actual_schedules_update',
+  'actual_transactions_aggregate',
   'actual_transactions_create',
   'actual_transactions_delete',
   'actual_transactions_filter',

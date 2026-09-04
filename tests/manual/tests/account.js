@@ -76,9 +76,9 @@ export async function accountTests(client, context) {
     if (typeof badBalance?.error === 'string' && badBalance.error.includes('not found') && badBalance.error.includes('actual_accounts_list')) {
       console.log(`  ✓ FIXED(BUG-5): accounts_get_balance nil-UUID returns actionable error: ${badBalance.error.slice(0, 120)}`);
     } else if (typeof badBalance?.error === 'string') {
-      console.log(`  ⚠ A4: error returned but message not actionable: ${badBalance.error.slice(0, 120)}`);
+      fail(`A4: an error was returned but the message is not actionable: ${badBalance.error.slice(0, 120)}`);
     } else {
-      console.log(`  ⚠ A4: unexpected response: ${JSON.stringify(badBalance).slice(0, 120)}`);
+      fail(`A4: unexpected response: ${JSON.stringify(badBalance).slice(0, 120)}`);
     }
   }
 
@@ -104,13 +104,20 @@ export async function accountTests(client, context) {
     if (err.message.includes("unexpected field") || err.message.includes("invalidField")) {
       console.log("✓ Strict validation working (invalid field rejected)");
     } else {
-      console.log("⚠ Different error than expected:", err.message);
+      fail(`Strict validation: threw a different error than expected: ${err.message}`);
     }
   }
 
   // Add a dummy transaction (amount=0) so closeAccount sets closed=1 instead of tombstoning.
   // Actual tombstones (hard-deletes) accounts with zero transactions on close, making them
   // invisible to getAccounts and unrecoverable by reopen.
+  //
+  // #357: that behaviour is now ASSERTED rather than only worked around here. This
+  // fixture keeps a closable account for the close/reopen lifecycle below; the
+  // remove-on-close path has its own case in tests/e2e/docker-all-tools.e2e.spec.ts and
+  // in tests/unit/accounts_close.test.js. The workaround stays because the lifecycle
+  // genuinely needs an account that survives being closed, not because the hazard is
+  // undocumented.
   console.log("\nAdding dummy transaction (amount=0) to prevent tombstone-on-close...");
   const today = new Date().toISOString().slice(0, 10);
   await callTool("actual_transactions_create", {
@@ -159,5 +166,49 @@ export async function accountTests(client, context) {
     const found = Array.isArray(all) ? all.find(a => a.id === deleteAccId) : null;
     if (!found) console.log(`  ✓ Verify delete: account no longer present in list`);
     else fail(`Verify delete: account still present after delete! ${JSON.stringify(found)}`);
+  }
+
+  // #425: actual_account_flow_summary reconciles a selection's balance change end to end and
+  // separates transfers from spending. Uses two disposable accounts so the run leaves no residue.
+  // Original tool by @maxvanweenen (PR #399). Runs over BOTH transports via the dual-transport gate.
+  console.log("\nTesting actual_account_flow_summary (reconciliation + transfer separation)...");
+  {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const flowA = await callTool("actual_accounts_create", { name: `MCP-Flow-A-${ts}`, balance: 0 });
+    const flowB = await callTool("actual_accounts_create", { name: `MCP-Flow-B-${ts}`, balance: 0 });
+    const flowAId = flowA.id || flowA.result || flowA;
+    const flowBId = flowB.id || flowB.result || flowB;
+    const day = new Date().toISOString().slice(0, 10);
+    // A category-free expense (-5000) counts as expenseOutflow; a within-selection transfer must not.
+    await callTool("actual_transactions_create", { account: flowAId, date: day, amount: -5000, notes: "flow expense" });
+    await callTool("actual_transfers_create", { from_account: flowAId, to_account: flowBId, amount: 3000, date: day });
+
+    const flow = await callTool("actual_account_flow_summary", {
+      startDate: "2000-01-01", endDate: "2100-01-01", accountIds: [flowAId, flowBId],
+    });
+    const f = flow?.result ?? flow;
+    if (f?.external?.expenseOutflow === 5000) console.log("  \u2713 expenseOutflow === 5000 (uncategorized outflow counted)");
+    else fail(`account_flow_summary: expected expenseOutflow 5000, got ${JSON.stringify(f?.external)}`);
+    if (f?.transfers?.withinSelection === 3000 && f?.transfers?.netTransferEffect === 0) {
+      console.log("  \u2713 within-selection transfer separated (withinSelection 3000, netTransferEffect 0)");
+    } else {
+      fail(`account_flow_summary: transfer not separated: ${JSON.stringify(f?.transfers)}`);
+    }
+    if (f?.reconciliation?.difference === 0) console.log("  \u2713 reconciliation.difference === 0 (exact)");
+    else fail(`account_flow_summary: reconciliation not exact: ${JSON.stringify(f?.reconciliation)}`);
+
+    // NEGATIVE: an account NAME is refused with the resolved id (#388), not an empty selection.
+    try {
+      await callTool("actual_account_flow_summary", { startDate: "2025-01-01", endDate: "2025-01-31", accountIds: [`MCP-Flow-A-${ts}`] });
+      fail("account_flow_summary NEGATIVE: an account NAME was accepted (expected refusal)");
+    } catch (err) {
+      if (err.message.includes(flowAId)) console.log("  \u2713 NEGATIVE: an account NAME is refused with its resolved id");
+      else fail(`account_flow_summary NEGATIVE: refused, but the message lacks the resolved id: ${err.message.slice(0, 140)}`);
+    }
+
+    // Clean up both disposable accounts (removes their transactions too), leaving zero residue.
+    await callTool("actual_accounts_delete", { id: flowAId });
+    await callTool("actual_accounts_delete", { id: flowBId });
+    console.log("  \u2713 flow-summary disposable accounts deleted");
   }
 }

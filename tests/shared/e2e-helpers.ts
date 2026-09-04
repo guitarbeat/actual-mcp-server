@@ -98,7 +98,11 @@ export async function callTool(
     params: { name: toolName, arguments: args },
   };
 
-  const res = await retryRequest(() =>
+  // Typed explicitly: `request` is `any` (Playwright's APIRequestContext is not imported
+  // here to keep this file usable from both spec and plain-node callers), so without this
+  // the generic resolves to `unknown` and every use of `res` below is a type error. #375
+  // added `npm run typecheck:e2e`, which is what surfaced it.
+  const res = await retryRequest<{ ok(): boolean; json(): Promise<any> }>(() =>
     request.post(rpcUrl, {
       data: JSON.stringify(payload),
       headers: {
@@ -115,6 +119,116 @@ export async function callTool(
     throw new Error(`Tool ${toolName} failed: ${json.error.message}`);
   }
   return json.result;
+}
+
+/**
+ * A client-side pacer that keeps this suite under Actual's request ceiling BY CONSTRUCTION.
+ *
+ * THE NUMBERS, measured rather than guessed. Actual applies
+ * `rateLimit({ windowMs: 60_000, max: 500 })` to every request (in its bundled `app.js`,
+ * guarded by `NODE_ENV !== "development"`). We cannot simply switch the fixture to
+ * development: that makes the server proxy to a React dev server it does not ship, and it
+ * exits at boot with ERR_MODULE_NOT_FOUND on `http-proxy-middleware`.
+ *
+ * A full run of `docker-all-tools.e2e.spec.ts` puts 569 requests on that server, counted
+ * from the Actual container's own log. Since #375 every test provisions and tears down its
+ * own data, which is what pushed it there.
+ *
+ * So the suite is over the ceiling in TOTAL, and whether it trips depends only on how
+ * tightly the requests bunch. Locally the run takes about 66 seconds and no single 60s
+ * window quite reaches 500, so it passes. On a CI runner the same work finishes in 47
+ * seconds, nearly every request lands inside one window, and everything from roughly the
+ * 500th request onward fails with `PostError: Too many requests` for reasons unrelated to
+ * what those tests assert. That is the inverted signal #375 exists to remove.
+ *
+ * WHY NOT RETRY. The first attempt at this backed off and retried the throttled call. That
+ * is wrong for a CREATE, which is not idempotent: the write had already landed, so the retry
+ * came back with `A 'E2E-Group-...' category group already exists.` Pacing has no such
+ * hazard, because no request is ever sent twice.
+ *
+ * The budget is counted in TOOL CALLS, because that is what this layer can see. The AVERAGE
+ * ratio is about 1.4 Actual requests per tool call, but it is not uniform: a write call is
+ * op + sync (2 requests) and a read is 1, so a write-heavy BLOCK (the transactions and budgets
+ * runs) peaks near 1.8. At 300 calls that block reached ~540 requests and tripped the limiter
+ * (#383: 2 stdio failures at spec lines 686 to 697, over the SYNC path, after #422 removed the
+ * relogin cascade that had masked the real ratio). 230 calls at 1.8 is ~415 requests, inside
+ * 500 with margin, at the cost of a longer wall clock. The stdio leg is the tighter one: it
+ * runs host-side over docker exec and never reached the old 300 budget, so lowering it is what
+ * actually engages the pacer there.
+ */
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_CALLS_PER_WINDOW = 230;
+const recentCallTimes: number[] = [];
+
+/** Block until sending one more call keeps us inside the window budget. */
+/**
+ * Exported for #383: the stdio client paces through the SAME window as the HTTP one.
+ *
+ * Both transports drive the one Actual server, so its 500-requests-per-minute limiter counts
+ * their calls together and they must not each believe they own the whole budget.
+ *
+ * READ THIS BEFORE RELYING ON IT: module scope shares this window only WITHIN A PROCESS, and the
+ * two E2E legs are SEPARATE processes (HTTP inside the runner container, stdio on the host). So
+ * the stdio leg starts with its counter at zero while Actual's window is still full from the HTTP
+ * leg. An earlier version of this comment claimed the two legs shared a window; they do not, and
+ * CI proved it: the stdio leg's first login was refused with "Too many requests", Playwright
+ * restarted its worker after the failure, and the restart re-spawned the server and re-logged in,
+ * 39 times. The cool-down in tests/e2e/run-docker-e2e.sh is what actually bridges the two
+ * processes. This pacer covers calls within one leg.
+ */
+export async function pace(): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    while (recentCallTimes.length > 0 && now - recentCallTimes[0] >= RATE_WINDOW_MS) {
+      recentCallTimes.shift();
+    }
+    if (recentCallTimes.length < RATE_MAX_CALLS_PER_WINDOW) {
+      recentCallTimes.push(now);
+      return;
+    }
+    // Wait exactly until the oldest call leaves the window, plus a small margin.
+    const waitMs = RATE_WINDOW_MS - (now - recentCallTimes[0]) + 50;
+    console.warn(
+      `[pace] holding ${waitMs}ms: ${recentCallTimes.length} calls in the last 60s, budget ` +
+        `is ${RATE_MAX_CALLS_PER_WINDOW} (Actual rate-limits at 500 requests/min)`,
+    );
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+}
+
+/** True when a tool error is Actual's rate limiter rather than a real failure. */
+export function isRateLimitError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /too many requests|rate ?limit/i.test(msg);
+}
+
+/**
+ * `callTool`, paced so the suite cannot trip Actual's limiter.
+ *
+ * Deliberately does NOT retry. If a rate limit is seen despite the pacing then the budget
+ * above is wrong, and the run should say so loudly rather than paper over it with a retry
+ * that can duplicate a create.
+ */
+export async function callToolPaced(
+  request: any,
+  sessionId: string,
+  toolName: string,
+  args: Record<string, unknown> = {},
+): Promise<any> {
+  await pace();
+  try {
+    return await callTool(request, sessionId, toolName, args);
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      throw new Error(
+        `${(error as Error).message}\n\nThe E2E pacer did not keep this suite under Actual's ` +
+          `500 requests/minute limit. Lower RATE_MAX_CALLS_PER_WINDOW in ` +
+          `tests/shared/e2e-helpers.ts, or reduce how many entities the suite creates. Do NOT ` +
+          `fix this by retrying: a retried create is not idempotent.`,
+      );
+    }
+    throw error;
+  }
 }
 
 /**

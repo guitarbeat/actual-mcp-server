@@ -1,6 +1,6 @@
 # scripts/
 
-Utility and build scripts. All are invoked via `package.json` scripts or from within the Docker stack — none need to be run directly during normal development.
+Utility and build scripts. All are invoked via `package.json` scripts or from within the Docker stack: none need to be run directly during normal development.
 
 ## Deployment & maintenance
 
@@ -65,6 +65,12 @@ bash scripts/deploy-and-test.sh full
 |---|---|---|
 | `direct-sync/bank-sync-direct.mjs` | `npm run direct-sync` | Connect **directly** to Actual Budget (no MCP layer). Lists all accounts then runs bank sync per account. Use `-- --list` to skip sync, `-- --budget <name>` to target a specific budget, `-- --help` for all options. Reads the same `ACTUAL_*` / `BUDGET_n_*` env vars as the server; writes a timestamped JSON log to `logs/direct-sync-*.log`. Useful for diagnosing GoCardless/SimpleFIN issues and validating server connectivity independently of MCP. |
 
+## Audit maintenance
+
+| Script | npm script | Purpose |
+|--------|-----------|---------|
+| `check-write-effect-audit.mjs` | `npm run audit:write-effect` | Reports when `docs/audit/write-effect-audit.md` was taken against an older `@actual-app/api` than the one installed, and names the dispositions that depend on upstream continuing to throw. **Exits 0 in every path, deliberately.** It runs in the NON-BLOCKING `api-surface-drift` lane and must never gate a build: a check whose result changes with no commit is exactly what killed the release train in #321. |
+
 ## Versioning
 
 | Script | npm script | Purpose |
@@ -72,6 +78,8 @@ bash scripts/deploy-and-test.sh full
 | `version-bump.js` | `npm run release:patch/minor/major` | Bumps the `VERSION` file and syncs `package.json`. |
 | `version-check.js` | `npm run version:check` | Asserts `VERSION` file matches `package.json` version. Used in CI. |
 | `version-dev.js` | `npm run version:dev` | Prints a dev version string: `x.y.z-dev-<git-hash>`. |
+| `playwright-version-drift.mjs` | `npm run playwright-version-drift` | #385: asserts every `mcr.microsoft.com/playwright:v<x>` reference (the compose file plus BOTH occurrences in `ci-cd.yml`) matches the `@playwright/test` version the LOCKFILE installs, since that is what actually runs inside the container. They had drifted five minor versions apart, invisibly, because no spec drives a browser: every spec uses the `request` fixture, so the browsers baked into the image are never launched. The first browser-touching spec would have failed with an opaque launch error instead. Fails when it finds NOTHING to check, so a renamed file cannot make it vacuous. |
+| `verify-release-ticket-states.mjs` | direct invoke (the `release` skill runs it) | #405: after a release, proves no ticket was closed by ACCIDENT. Enumerates every issue reference in the released commit range, separates the ones the release INTENDED to close (a `(#N)` in a commit subject) from the ones merely mentioned in a body, and reports any mentioned-only ticket that GitHub closed by keyword. Fails CLOSED on a reference it cannot verify. The earlier checks used a timestamp window around the push and missed both #414 and #416: clock skew, queued workflows and a multi-minute release all make a window a guess, while a commit range is deterministic. |
 
 ## ACL end-to-end (#338 / #343)
 

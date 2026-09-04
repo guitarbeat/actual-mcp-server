@@ -1,7 +1,7 @@
 # Architecture
 
 **Project:** Actual MCP Server  
-**Version:** 0.11.6  
+**Version:** 0.19.3
 **Last Updated:** 2026-06-07
 
 ---
@@ -139,7 +139,7 @@
 
 ### Tool Definitions
 
-74 tools organized by category:
+77 tools organized by category:
 
 ```
 src/tools/
@@ -149,14 +149,17 @@ src/tools/
 ├── entities_search.ts                  # Pattern/fuzzy name search for accounts/categories/payees (#204)
 ├── session_list.ts                     # Session management (2 tools)
 ├── session_close.ts
-├── accounts_create.ts                  # Accounts (7 tools)
+├── accounts_create.ts                  # Accounts (8 tools)
 ├── accounts_list.ts
 ├── accounts_update.ts
 ├── accounts_delete.ts
 ├── accounts_close.ts
 ├── accounts_reopen.ts
 ├── accounts_get_balance.ts
-├── transactions_create.ts              # Transactions (13 tools)
+├── account_flow_summary.ts             # Cross-account balance-change reconciliation
+├── transactions_aggregate.ts           # Transactions (deterministic analysis)
+├── recurring_expenses_summary.ts       # Recurring-charge detection (heuristic)
+├── transactions_create.ts
 ├── transactions_get.ts
 ├── transactions_update.ts
 ├── transactions_delete.ts
@@ -338,7 +341,7 @@ actual-mcp-server/
 │   │   ├── setup.ts              # OIDC/JWKS factory (AUTH_PROVIDER=oidc)
 │   │   └── budget-acl.ts         # Per-user budget ACL (email/sub/group)
 │   │
-│   ├── tools/                    # MCP tool definitions (74 tools + index.ts)
+│   ├── tools/                    # MCP tool definitions (77 tools + index.ts)
 │   │   ├── server_info.ts        # Server info (1 tool)
 │   │   ├── session_*.ts          # Session management (2 tools)
 │   │   ├── accounts_*.ts         # Accounts (7 tools)
@@ -369,13 +372,10 @@ actual-mcp-server/
 │   ├── e2e/                      # End-to-end tests (Playwright)
 │   │   ├── mcp-client.playwright.spec.ts  # Protocol compliance tests
 │   │   ├── docker.e2e.spec.ts             # Docker smoke tests
-│   │   ├── docker-all-tools.e2e.spec.ts   # All-tools Docker E2E (~80 named tests, all 74 tools)
+│   │   ├── docker-all-tools.e2e.spec.ts   # All-tools Docker E2E (~80 named tests, all 77 tools)
 │   │   ├── run-docker-e2e.sh              # Docker test orchestrator
-│   │   └── suites/                        # Domain suite registration functions (one file per domain)
-│   │       ├── shared-context.ts          # SharedState / TestContext types
-│   │       ├── server.ts / accounts.ts / categories.ts / payees.ts
-│   │       ├── transactions.ts / budgets.ts / rules.ts / schedules.ts
-│   │       └── advanced.ts / deletes.ts
+│   │   └── (#366: the suites/ tree was removed. It never executed, and every doc that
+│   │        named it now points at docker-all-tools.e2e.spec.ts instead)
 │   ├── unit/                     # Unit tests (offline, stub adapter)
 │   │   ├── transactions_create.test.js
 │   │   ├── generated_tools.smoke.test.js
@@ -434,7 +434,7 @@ actual-mcp-server/
 5. Tool Registry Initialization
    └─> src/actualToolsManager.ts loads all tools
    └─> Validates tool schemas
-   └─> Registers 74 tools with MCP capabilities
+   └─> Registers 77 tools with MCP capabilities
 
 6. MCP Connection Setup
    └─> Create ActualMCPConnection instance

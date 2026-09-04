@@ -18,11 +18,15 @@ console.log('Running generated tools smoke tests');
   const apiMod = await import('@actual-app/api');
   const apiDefault = (apiMod.default || apiMod);
   apiDefault.sync = async () => {};
-  apiDefault.getRules = async () => [{ id: 'rule1', conditions: [] }];
+  // #371: accounts_close, accounts_reopen and budgets_holdForNextMonth used to reach the raw
+  // api directly and needed faithful raw fakes here. Their guards now live in the adapter,
+  // which this harness stubs wholesale, so the raw fakes are gone and the adapter stubs
+  // below carry the contract instead. See stubResponses for the shapes they must return.
+  apiDefault.getRules = async () => [{ id: '30000000-0000-4000-8000-000000000001', conditions: [] }];
   apiDefault.createRule = async () => 'rule-new';
   apiDefault.updateRule = async () => {};
   apiDefault.deleteRule = async () => {};
-  apiDefault.getCategoryGroups = async () => [{ id: 'grp_1', name: 'Expenses' }];
+  apiDefault.getCategoryGroups = async () => [{ id: '20000000-0000-4000-8000-000000000001', name: 'Expenses' }];
   apiDefault.deleteCategoryGroup = async () => {};
   apiDefault.getSchedules = async () => [{ id: '00000000-0000-0000-0000-000000000099' }];
   apiDefault.deleteSchedule = async () => {};
@@ -44,8 +48,20 @@ console.log('Running generated tools smoke tests');
     addTransactions: ['t1'],
     importTransactions: { added: ['t2'], updated: [], errors: [] },
     getTransactions: [{ id: 't1', amount: 100 }],
+    // #424/#425: the financial-analysis tools read one snapshot. Minimal valid shape, with the
+    // #425 balance/counterpart fields so actual_account_flow_summary reconciles (0 - 0 = 0).
+    getFinancialAnalysisSnapshot: {
+      transactions: [{ id: 't1', date: '2025-01-10', amount: -100, account: 'a1', category: 'c1' }],
+      transferCounterparts: [],
+      accounts: [{ id: 'a1', name: 'Cash' }],
+      categories: [{ id: 'c1', name: 'Food', group: 'g1' }],
+      categoryGroups: [{ id: 'g1', name: 'Expenses' }],
+      payees: [{ id: 'p1', name: 'Kroger' }],
+      openingBalances: { a1: 0 },
+      closingBalances: { a1: -100 },
+    },
     getCategories: [{ id: 'c1', name: 'Food' }],
-    getCategoryGroups: [{ id: 'grp_1', name: 'Expenses' }],
+    getCategoryGroups: [{ id: '20000000-0000-4000-8000-000000000001', name: 'Expenses' }],
     createCategory: 'c-new',
     deleteCategory: null,
     updateCategory: null,
@@ -54,39 +70,53 @@ console.log('Running generated tools smoke tests');
     updateCategoryGroup: null,
     getPayees: [{ id: 'p1', name: 'Kroger' }],
     getCommonPayees: [{ id: 'p1', name: 'Kroger' }],
-    getPayeeRules: [{ id: 'rule1', conditions: [] }],
+    getPayeeRules: [{ id: '30000000-0000-4000-8000-000000000001', conditions: [] }],
     createPayee: 'p-new',
     deletePayee: null,
     updatePayee: null,
-    mergePayees: null,
-    getRules: [{ id: 'rule1', conditions: [] }],
+    // #356: the adapter reports which ids it merged, so the stub must model that
+    // contract. Returning null here would only prove the tool tolerates a stub that
+    // does not match the code it stands in for.
+    mergePayees: ['22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333'],
+    getRules: [{ id: '30000000-0000-4000-8000-000000000001', conditions: [] }],
     createRule: 'rule-new',
     deleteRule: null,
     updateRule: null,
+    // #376: rules_create_or_update calls adapter.upsertRule now (the read-match-write
+    // cycle moved out of the tool). Its contract is { id, created }, and the tool returns
+    // that object verbatim, so a bare null here would not stand in for the real code.
+    upsertRule: { id: 'rule-upserted', created: true },
     getBudgetMonths: ['2025-12'],
     getBudgetMonth: { 
       month: '2025-12', 
       categoryGroups: [
         { 
-          id: 'grp_1', 
+          id: '20000000-0000-4000-8000-000000000001',
           name: 'Test Group',
           categories: [
-            { id: 'cat_1', name: 'Category 1', budgeted: 1000 },
-            { id: 'cat_2', name: 'Category 2', budgeted: 500 }
+            { id: '10000000-0000-4000-8000-000000000001', name: 'Category 1', budgeted: 1000 },
+            { id: '10000000-0000-4000-8000-000000000002', name: 'Category 2', budgeted: 500 }
           ]
         }
       ]
     },
     setBudgetAmount: null,
     setBudgetCarryover: null,
-    holdBudgetForNextMonth: null,
+    // #371: holdBudgetForNextMonth returns the amount ACTUALLY held. The smoke example asks
+    // for 10000, so returning that models a hold that was granted in full.
+    holdBudgetForNextMonth: 10000,
     resetBudgetHold: null,
     batchBudgetUpdates: null,
     createAccount: 'acct-new',
     updateAccount: null,
     deleteAccount: null,
-    closeAccount: null,
-    reopenAccount: null,
+    // #371: closeAccount reports WHICH outcome happened; a bare null would make the tool
+    // dereference `.name` on nothing.
+    closeAccount: { outcome: 'closed', name: 'Cash' },
+    // #369 item 5: reopenAccount reports WHICH outcome happened too, now that an
+    // already-open account is a reported non-change rather than a redundant CRDT write.
+    // A bare null would make the tool dereference `.outcome` on nothing.
+    reopenAccount: { outcome: 'reopened', name: 'Cash' },
     getAccountBalance: 12345,
     deleteTransaction: null,
     updateTransaction: null,
@@ -120,8 +150,8 @@ console.log('Running generated tools smoke tests');
     // #141: transferBudgetAmount is the new atomic adapter method.
     transferBudgetAmount: {
       transferred: 5000,
-      fromCategory: { id: 'cat_1', previousAmount: 10000, newAmount: 5000 },
-      toCategory: { id: 'cat_2', previousAmount: 0, newAmount: 5000 },
+      fromCategory: { id: '10000000-0000-4000-8000-000000000001', previousAmount: 10000, newAmount: 5000 },
+      toCategory: { id: '10000000-0000-4000-8000-000000000002', previousAmount: 0, newAmount: 5000 },
     },
   };
 
@@ -137,6 +167,16 @@ console.log('Running generated tools smoke tests');
   // stubs we set up before the tools imported).
   adapterMod.default.withWriteSession = async (fn) => fn();
 
+  // #388: `resolveFilterId` is a PRE-FLIGHT, not a value-returning read, so the flat
+  // stubResponses map above cannot express it: the value it must return depends on its
+  // argument, and returning a fixed one would make the eleven Category B tools validate
+  // against something the caller never sent. It also reaches the api by calling the module's
+  // own `getAccounts`, not the patched `adapter.getAccounts`, so without this it attempts a
+  // real connection and the smoke run fails on an auth error rather than on the tool.
+  // Here it accepts whatever it is given; the refusal behaviour is pinned by
+  // tests/unit/filter_id_tool_wiring.test.js, which calls the real thing.
+  adapterMod.default.resolveFilterId = async (_kind, value) => value;
+
   const toolNames = Object.keys(toolsIndex).filter(n => n !== 'default');
   let failures = 0;
 
@@ -150,6 +190,9 @@ console.log('Running generated tools smoke tests');
   if (name.includes('transactions_create')) inputExample.account = '00000000-0000-0000-0000-000000000001', inputExample.date = '2025-11-24', inputExample.amount = -1234, inputExample.subtransactions = [{ amount: -1000 }, { amount: -234 }]; // #305: split, children sum to amount
 
   if (name.includes('transactions_import')) inputExample.accountId = '00000000-0000-0000-0000-000000000001', inputExample.txs = [{ date: '2024-01-15', amount: 100 }];
+  if (name.includes('transactions_aggregate')) inputExample.startDate = '2025-01-01', inputExample.endDate = '2025-01-31', inputExample.groupBy = 'month';
+  if (name.includes('account_flow_summary')) inputExample.startDate = '2025-01-01', inputExample.endDate = '2025-01-31', inputExample.accountIds = ['a1'];
+  if (name.includes('recurring_expenses_summary')) inputExample.months = 12; // #426: months alone satisfies the startDate-XOR-months rule; minOccurrences/includeInactive default
   if (name.includes('transactions_get')) inputExample.accountId = 'a1'; // matches getAccounts stub { id: 'a1' } — nil-UUID would hit not-found path and return { error } without result
   if (name.includes('transactions_delete')) inputExample.id = '00000000-0000-0000-0000-000000000001';
   if (name.includes('transactions_update') && !name.includes('batch')) inputExample.id = '00000000-0000-0000-0000-000000000001', inputExample.fields = { notes: 'test', subtransactions: [{ amount: -200 }, { amount: -100 }] }; // #305: edit an existing split (-300 per runQuery stub)
@@ -163,30 +206,31 @@ console.log('Running generated tools smoke tests');
   if (name.includes('accounts_reopen')) inputExample.id = '00000000-0000-0000-0000-000000000001';
   if (name.includes('categories_create')) inputExample.name = 'Food', inputExample.group_id = '00000000-0000-0000-0000-000000000001';
   if (name.includes('categories_delete')) inputExample.id = '00000000-0000-0000-0000-000000000001';
-  if (name.includes('categories_update')) inputExample.id = 'cat_1', inputExample.fields = { name: 'Updated' };
+  if (name.includes('categories_update')) inputExample.id = '10000000-0000-4000-8000-000000000001', inputExample.fields = { name: 'Updated' };
   if (name.includes('category_groups_create')) inputExample.name = 'Expenses';
-  if (name.includes('category_groups_delete')) inputExample.id = 'grp_1';
-  if (name.includes('category_groups_update')) inputExample.id = 'grp_1', inputExample.fields = { name: 'Updated' };
+  if (name.includes('category_groups_delete')) inputExample.id = '20000000-0000-4000-8000-000000000001';
+  if (name.includes('category_groups_update')) inputExample.id = '20000000-0000-4000-8000-000000000001', inputExample.fields = { name: 'Updated' };
   if (name.includes('payees_create')) inputExample.name = 'Kroger';
-  if (name.includes('payees_delete')) inputExample.id = 'p_1';
+  // #365: payee ids are the shared UUID schema now, so these fixtures are real UUIDs.
+  if (name.includes('payees_delete')) inputExample.id = '11111111-1111-4111-8111-111111111111';
   if (name.includes('payees_update')) inputExample.id = '00000000-0000-0000-0000-000000000001', inputExample.fields = { name: 'Updated' };
-  if (name.includes('payees_merge')) inputExample.targetId = 'p_1', inputExample.mergeIds = ['p_2', 'p_3'];
-  if (name.includes('payee_rules_get')) inputExample.payeeId = 'p_1';
+  if (name.includes('payees_merge')) inputExample.targetId = '11111111-1111-4111-8111-111111111111', inputExample.mergeIds = ['22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333'];
+  if (name.includes('payee_rules_get')) inputExample.payeeId = '40000000-0000-4000-8000-000000000001';
   if (name.includes('rules_create') && !name.includes('or_update')) inputExample.conditions = [{ field: 'description', op: 'contains', value: 'test' }], inputExample.actions = [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }];
   if (name.includes('rules_create_or_update')) inputExample.conditions = [{ field: 'description', op: 'contains', value: 'test' }], inputExample.actions = [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }];
-  if (name.includes('rules_delete')) inputExample.id = 'rule1'; // matches getRules stub: { id: 'rule1' }
-  if (name.includes('rules_update')) inputExample.id = 'rule_1', inputExample.fields = { conditions: [] };
-  if (name.includes('budgets_setAmount')) inputExample.month = '2025-12', inputExample.categoryId = 'cat_1', inputExample.amount = 100;
+  if (name.includes('rules_delete')) inputExample.id = '30000000-0000-4000-8000-000000000001'; // matches getRules stub: { id: '30000000-0000-4000-8000-000000000001' }
+  if (name.includes('rules_update')) inputExample.id = '30000000-0000-4000-8000-000000000001', inputExample.fields = { conditions: [] };
+  if (name.includes('budgets_setAmount')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.amount = 100;
   if (name.includes('budgets_getMonth')) inputExample.month = '2025-12';
-  if (name.includes('budget_updates_batch')) inputExample.operations = [{ month: '2025-12', categoryId: 'cat_1', amount: 100 }];
+  if (name.includes('budget_updates_batch')) inputExample.operations = [{ month: '2025-12', categoryId: '10000000-0000-4000-8000-000000000001', amount: 100 }];
   if (name.includes('budgets_holdForNextMonth')) inputExample.month = '2025-12', inputExample.amount = 10000;
   if (name.includes('budgets_resetHold')) inputExample.month = '2025-12'; // no categoryId — tool operates on whole month
-  if (name.includes('budgets_setCarryover')) inputExample.month = '2025-12', inputExample.categoryId = 'cat_1', inputExample.flag = true;
+  if (name.includes('budgets_setCarryover')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.flag = true;
   // #332: a fixed name keeps the smoke run from accumulating timestamped files.
   if (name.includes('budgets_export')) inputExample.filename = 'smoke-export.zip';
   // #334: the schema requires exactly one of path/base64; base64 avoids needing a real file.
   if (name.includes('budgets_import')) inputExample.base64 = 'UEsDBAoAAAAAAA==', inputExample.type = 'actual';
-  if (name.includes('budgets_transfer')) inputExample.month = '2025-12', inputExample.fromCategoryId = 'cat_1', inputExample.toCategoryId = 'cat_2', inputExample.amount = 100;
+  if (name.includes('budgets_transfer')) inputExample.month = '2025-12', inputExample.fromCategoryId = '10000000-0000-4000-8000-000000000001', inputExample.toCategoryId = '10000000-0000-4000-8000-000000000002', inputExample.amount = 100;
   if (name.includes('query_run')) inputExample.query = 'SELECT * FROM transactions LIMIT 10';
   if (name.includes('bank_sync')) inputExample.accountId = 'acct_1';
   if (name.includes('budgets_switch')) inputExample.budgetName = 'My Budget';
@@ -447,12 +491,12 @@ console.log('Running generated tools smoke tests');
 
     const onBudgetAcct  = { id: 'acct-on',  name: 'Checking',   offbudget: false };
     const offBudgetAcct = { id: 'acct-off', name: 'Investment', offbudget: true  };
-    const onTxn  = { id: 'on1',  amount: -500,  category: 'cat-1', account: 'acct-on',  date: '2025-01-15' };
+    const onTxn  = { id: 'on1',  amount: -500,  category: '10000000-0000-4000-8000-000000000001', account: 'acct-on',  date: '2025-01-15' };
     const offTxn = { id: 'off1', amount: -1500, category: null,    account: 'acct-off', date: '2025-01-15' };
 
     adapterMod.default.getAccounts     = async () => [onBudgetAcct, offBudgetAcct];
     adapterMod.default.getTransactions = async () => [onTxn, offTxn];
-    adapterMod.default.getCategories   = async () => [{ id: 'cat-1', name: 'Food' }];
+    adapterMod.default.getCategories   = async () => [{ id: '10000000-0000-4000-8000-000000000001', name: 'Food' }];
     adapterMod.default.getPayees       = async () => [];
 
     const toolsToCheck = [
@@ -519,9 +563,9 @@ console.log('Running generated tools smoke tests');
       const tool = mod?.default ?? mod;
       const res  = await tool.call({
         updates: [
-          { id: 'txn-1', fields: { notes: 'a' } },
-          { id: 'txn-2', fields: { notes: 'b' } },
-          { id: 'txn-3', fields: { notes: 'c' } },
+          { id: '50000000-0000-4000-8000-000000000001', fields: { notes: 'a' } },
+          { id: '50000000-0000-4000-8000-000000000002', fields: { notes: 'b' } },
+          { id: '50000000-0000-4000-8000-000000000003', fields: { notes: 'c' } },
         ],
       });
 

@@ -76,7 +76,7 @@ export async function budgetTests(client, context) {
     budgetXferCatId = xferRes.categoryId || xferRes.id || xferRes.result || xferRes;
     console.log(`  ✓ Created second disposable category for transfer test: ${budgetXferCatId}`);
   } else {
-    console.log("  ⚠ Could not resolve owning group for context.categoryId: transfer test will be skipped");
+    fail("Could not resolve the owning group for context.categoryId, so the transfer test is skipped. A precondition this module builds itself failing is a failure, not a skip.");
   }
 
   const currentDate = new Date().toISOString().split('T')[0].substring(0, 7); // YYYY-MM
@@ -164,7 +164,7 @@ export async function budgetTests(client, context) {
       console.log(`    • ${date}  ${amount}  ${payee}`);
     }
   } catch (err) {
-    console.log("  ⚠ Could not fetch transactions after switch:", err.message);
+    fail(`Could not fetch transactions after the budget switch: ${err.message}`);
   }
 
   // ── 4. actual_budgets_switch (negative: non-existent budget name) ────────
@@ -256,7 +256,7 @@ export async function budgetTests(client, context) {
       if (typeof badRes?.error === 'string') {
         console.log(`  ✓ B4: error returned for nil-UUID categoryId: ${badRes.error.slice(0, 120)}`);
       } else {
-        console.log(`  ⚠ B4: unexpected response (API may have accepted nil UUID): ${JSON.stringify(badRes).slice(0, 120)}`);
+        fail(`B4: unexpected response, the API may have accepted the nil UUID: ${JSON.stringify(badRes).slice(0, 120)}`);
       }
     } catch (e) {
       console.log(`  ✓ B4: API rejected nil-UUID categoryId (threw): ${String(e).slice(0, 120)}`);
@@ -279,43 +279,107 @@ export async function budgetTests(client, context) {
     const catEntry = (monthData.categoryGroups || [])
       .flatMap(g => g.categories || [])
       .find(c => c.id === context.categoryId);
-    if (!catEntry) console.log("  ⚠ Verify carryover: category not found in month budget (carryover field check skipped)");
+    if (!catEntry) fail("Verify carryover: the category is not in the month budget, so the carryover check did not run at all.");
     else if (catEntry.carryover === true || catEntry.carryover === 1) console.log(`  ✓ Verify carryover: carryover=${catEntry.carryover} (enabled)`);
-    else console.log(`  ⚠ Verify carryover: carryover=${JSON.stringify(catEntry.carryover)} (API may use different field)`);
+    else fail(`Verify carryover: carryover=${JSON.stringify(catEntry.carryover)} after enabling it. "The API may use a different field" is a question this test exists to answer.`);
   }
 
   // Hold for next month
+  //
+  // #369 item 1: this block used to pass on success OR on a /nothing was held/ refusal,
+  // because the run could be pointed at any budget and To Budget was unknown. That made it
+  // a check that CANNOT FAIL: a regression to always-refusing stayed green.
+  //
+  // The fixture is controllable. An on-budget account created with a positive starting
+  // balance books that balance as INCOME for the month, and To Budget is computed from
+  // income minus what is already allocated, so seeding one guarantees the success branch.
   console.log("\nHolding budget for next month...");
-  const beforeHold = await callTool("actual_budgets_getMonth", { month: currentDate });
-  const toBudgetBefore = (beforeHold.result || beforeHold)?.toBudget ?? null;
-  await callTool("actual_budgets_holdForNextMonth", {
-    month: currentDate,
-    amount: 10000,
+  const HOLD_AMOUNT = 10000;
+  const holdSeedAccount = await callTool("actual_accounts_create", {
+    name: `Hold-Seed-${Date.now()}`,
+    balance: 500000,
   });
-  console.log("✓ Held 100.00 for next month");
-  {
-    const afterHold = await callTool("actual_budgets_getMonth", { month: currentDate });
-    const toBudgetAfter = (afterHold.result || afterHold)?.toBudget ?? null;
-    // toBudget may not reflect holdForNextMonth (Actual tracks hold internally): log informational only
-    if (toBudgetBefore !== null && toBudgetAfter !== null) {
-      console.log(`  ✓ Verify hold: toBudget before=${toBudgetBefore}, after=${toBudgetAfter} (delta=${toBudgetAfter - toBudgetBefore})`);
-    } else {
-      console.log(`  ⚠ Verify hold: toBudget field not available in response (skipped)`);
-    }
-  }
+  const holdSeedId = (holdSeedAccount && holdSeedAccount.result) || holdSeedAccount;
 
-  // Reset hold
-  console.log("\nResetting hold...");
-  await callTool("actual_budgets_resetHold", { month: currentDate });
-  console.log("✓ Hold reset");
-  {
+  try {
+    const beforeHold = await callTool("actual_budgets_getMonth", { month: currentDate });
+    const beforeMonth = (beforeHold.result || beforeHold) ?? {};
+    const toBudgetBefore = Number(beforeMonth.toBudget ?? 0);
+    const heldBefore = Number(beforeMonth.forNextMonth ?? 0);
+    // Failures route through fail() so they reach the runner's ledger (#281).
+    const holdCheck = (cond, msg) => {
+      if (cond) console.log(`  ✓ ${msg}`);
+      else fail(`actual_budgets_holdForNextMonth: ${msg}`);
+    };
+
+    holdCheck(
+      toBudgetBefore > HOLD_AMOUNT,
+      `seeded income leaves more to budget (${toBudgetBefore}) than the hold asks for (${HOLD_AMOUNT})`,
+    );
+    // Upstream `resetHold` is `setBuffer(month, 0)`: it ZEROES the buffer, it does not
+    // restore a previous value. So the two reset assertions below are only correct while
+    // the month starts with no hold. Asserting that as a PRECONDITION makes them correct by
+    // construction, and turns the one way this can go wrong into an accurate diagnosis: if
+    // an earlier run died between the hold and its teardown (the runner's wall-clock
+    // kill-switch exits 2), the leftover buffer would otherwise fail the reset checks and
+    // blame a tool that behaved correctly. Month-level budget state is invisible to the
+    // zero-residue sweep, so nothing else would report it.
+    holdCheck(
+      heldBefore === 0,
+      `the month starts with no hold (found ${heldBefore}); a leftover hold is stale fixture ` +
+        'state from an interrupted run, not a tool regression',
+    );
+
+    const res = await callTool("actual_budgets_holdForNextMonth", {
+      month: currentDate,
+      amount: HOLD_AMOUNT,
+    });
+    const payload = (res && res.result) || res || {};
+    holdCheck(payload.held === HOLD_AMOUNT, `held exactly the requested ${HOLD_AMOUNT} cents`);
+    holdCheck(!payload.partial, "a hold well inside To Budget is not clamped");
+
+    // And the money actually moved. #355 exists because upstream can hold LESS than asked
+    // (it clamps to what is left) or nothing at all, while reporting plain success.
+    const afterHold = await callTool("actual_budgets_getMonth", { month: currentDate });
+    const afterMonth = (afterHold.result || afterHold) ?? {};
+    holdCheck(
+      Number(afterMonth.forNextMonth ?? 0) - heldBefore === HOLD_AMOUNT,
+      `forNextMonth advanced by exactly ${HOLD_AMOUNT}`,
+    );
+
+    // resetHold, asserted HERE rather than after the block, because this is where the
+    // seeded income still exists and where the before-values are in scope. Undoing a hold
+    // whose exact size we just established is the only place the reset can be checked
+    // against a known number.
+    console.log("\nResetting hold...");
+    await callTool("actual_budgets_resetHold", { month: currentDate });
     const afterReset = await callTool("actual_budgets_getMonth", { month: currentDate });
-    const toBudgetAfterReset = (afterReset.result || afterReset)?.toBudget ?? null;
-    if (toBudgetBefore !== null && toBudgetAfterReset !== null) {
-      if (toBudgetAfterReset === toBudgetBefore) console.log(`  ✓ Verify resetHold: toBudget restored to ${toBudgetAfterReset}`);
-      else fail(`Verify resetHold: expected toBudget ${toBudgetBefore}, got ${toBudgetAfterReset}`);
-    } else {
-      console.log(`  ⚠ Verify resetHold: toBudget field not available in response (skipped)`);
+    const resetMonth = (afterReset.result || afterReset) ?? {};
+    holdCheck(
+      Number(resetMonth.forNextMonth ?? 0) === heldBefore,
+      `resetHold returned forNextMonth to its starting value (${heldBefore})`,
+    );
+    holdCheck(
+      Number(resetMonth.toBudget ?? 0) === toBudgetBefore,
+      `resetHold restored toBudget to ${toBudgetBefore}`,
+    );
+  } finally {
+    // Undo BOTH effects, whatever happened, so the budget is left as found.
+    //
+    // The hold has to be released BEFORE the income is removed, and releasing it is not
+    // optional: `forNextMonth` is month-level budget state, which the zero-residue sweep
+    // does NOT cover (it looks at accounts, payees, categories and the like), so a
+    // leftover hold would silently lower this month's To Budget by HOLD_AMOUNT on every
+    // run and nothing would report it. The E2E twin registers the same reset as teardown.
+    try {
+      await callTool("actual_budgets_resetHold", { month: currentDate });
+    } catch (err) {
+      fail(`could not reset the hold for ${currentDate}: ${err.message}`);
+    }
+    try {
+      await callTool("actual_accounts_delete", { id: holdSeedId });
+    } catch (err) {
+      fail(`could not remove the hold seed account ${holdSeedId}: ${err.message}. That is residue.`);
     }
   }
 
@@ -323,7 +387,7 @@ export async function budgetTests(client, context) {
   console.log("\nTesting budget transfer...");
   const targetCategoryId = budgetXferCatId;
   if (!targetCategoryId || targetCategoryId === context.categoryId) {
-    console.log("⚠ Skipping transfer test (could not create second category)");
+    skip("Skipping transfer test (could not create second category)");
   } else {
     const preTransfer = await callTool("actual_budgets_getMonth", { month: currentDate });
     const preData = preTransfer.result || preTransfer;
@@ -391,7 +455,7 @@ export async function budgetTests(client, context) {
       if (msg.includes("Source and target categories must be different")) {
         console.log(`  ✓ Same source and target correctly rejected`);
       } else {
-        console.log(`  ⚠ Same source and target rejected with unexpected message: ${msg}`);
+        fail(`Same source and target rejected, but with an unexpected message: ${msg}`);
       }
     }
   }
@@ -444,7 +508,7 @@ export async function budgetTests(client, context) {
     if (err.message.includes("YYYY-MM") || err.message.includes("invalid-date") || err.message.includes("month")) {
       console.log("✓ Error resilience: invalid-date correctly rejected by schema validation");
     } else {
-      console.log("⚠ Batch rejected but with unexpected error:", err.message);
+      fail(`Batch rejected, but with an unexpected error: ${err.message}`);
     }
   }
 
@@ -454,7 +518,7 @@ export async function budgetTests(client, context) {
       await callTool("actual_categories_delete", { id: budgetXferCatId });
       console.log(`\n✓ Cleaned up budget transfer test category (${budgetXferCatId})`);
     } catch (err) {
-      console.log(`\n  ⚠ Could not delete budget transfer category ${budgetXferCatId}: ${err.message}`);
+      fail(`Could not delete the budget transfer category ${budgetXferCatId}: ${err.message}. That is residue.`);
     }
   }
 
@@ -464,7 +528,7 @@ export async function budgetTests(client, context) {
       await callTool("actual_categories_delete", { id: budgetOwnedCatId });
       console.log(`\n✓ Cleaned up disposable budget-test category (${budgetOwnedCatId})`);
     } catch (err) {
-      console.log(`\n  ⚠ Could not delete disposable category ${budgetOwnedCatId}: ${err.message}`);
+      fail(`Could not delete the disposable category ${budgetOwnedCatId}: ${err.message}. That is residue.`);
     }
     context.categoryId = null;
   }
@@ -473,7 +537,7 @@ export async function budgetTests(client, context) {
       await callTool("actual_category_groups_delete", { id: budgetOwnedGroupId });
       console.log(`✓ Cleaned up disposable budget-test category group (${budgetOwnedGroupId})`);
     } catch (err) {
-      console.log(`  ⚠ Could not delete disposable category group ${budgetOwnedGroupId}: ${err.message}`);
+      fail(`Could not delete the disposable category group ${budgetOwnedGroupId}: ${err.message}. That is residue.`);
     }
   }
 

@@ -7,6 +7,7 @@ import logger from '../logger.js';
 import actualToolsManager from '../actualToolsManager.js';
 import { requestContext } from '../lib/requestContext.js';
 import type { ActualMCPConnection } from '../lib/ActualMCPConnection.js';
+import { buildToolListEntries } from '../lib/tool-list-entry.js';
 
 export async function startStdioServer(
   mcp: ActualMCPConnection,
@@ -48,18 +49,15 @@ export async function startStdioServer(
 
   // List tools handler — mirrors createServerInstance() in httpServer.ts
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools = toolsList.map((name: string) => {
-      const schemaFromParam = toolSchemas && toolSchemas[name];
-      const schemaFromManager = (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name);
-      const schema = schemaFromParam || schemaFromManager;
-      const inputSchema =
-        schema && typeof schema === 'object' && Object.keys(schema).length > 0
-          ? schema
-          : { type: 'object', properties: {}, additionalProperties: false };
-      const tool = actualToolsManager.getTool(name);
-      const description = tool?.description || `Tool ${name}`;
-      return { name, description, inputSchema };
-    });
+    // #379: the SAME builder the HTTP paths use. stdio is the transport Claude Desktop
+    // runs, and it previously assembled this payload independently, so an addition to the
+    // published surface could reach HTTP clients and silently miss stdio ones.
+    const tools = buildToolListEntries(toolsList, (name: string) => ({
+      description: actualToolsManager.getTool(name)?.description,
+      schema:
+        (toolSchemas && toolSchemas[name]) ||
+        (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name),
+    }));
     logger.debug(`[STDIO] tools/list → ${tools.length} tools`);
     return { tools };
   });
@@ -83,16 +81,19 @@ export async function startStdioServer(
     //   - no `principal`, or getActiveBudgetConfig() would attempt the #189
     //     preferred-budget restore for a caller that has no authenticated
     //     identity, and the env default would stop being authoritative.
-    //   - `transport: 'stdio'` is what keeps stdio OFF the pooled path.
-    //     switchBudget's slow path calls connectionPool.getConnection(), so
-    //     WITHOUT this marker the first switch would silently move stdio onto
-    //     the pooled branch: writes would then rely on api.sync() instead of the
-    //     legacy init/shutdown cycle every existing stdio persistence behaviour
-    //     is built on, and the entry would never be touched (touch() is called
-    //     only from httpServer.ts), so it would expire after the idle timeout and
-    //     be torn down by the cleanup sweep without the api lock, possibly
-    //     mid-operation. That is a far larger change than this ticket, and it is
-    //     not one we want by accident.
+    //   - `transport: 'stdio'` is what keeps stdio OFF the pooled path, and it
+    //     stays that way after #419. switchBudget's slow path calls
+    //     connectionPool.getConnection(), so WITHOUT this marker the first switch
+    //     would silently move stdio onto the pooled branch, and the entry would
+    //     never be touched (touch() is called only from httpServer.ts), so it
+    //     would expire after the idle timeout and be torn down by the cleanup
+    //     sweep without the api lock, possibly mid-operation. That is a far larger
+    //     change than we want by accident.
+    //     #419 solved the per-call upstream login WITHOUT pooling stdio: a stdio
+    //     process keeps the api singleton alive between ops in shutdownActualApi
+    //     (see _shouldKeepSingletonAlive), so the legacy branch's init no-ops
+    //     after the first login. No pool entry is created, so there is nothing for
+    //     the sweep to evict and this comment's hazard never arises.
     //   - `allowedBudgets` is absent, so under AUTH_PROVIDER=oidc switchBudget
     //     still denies. Fail closed: a local pipe must not gain budget access an
     //     HTTP caller would need an ACL for.

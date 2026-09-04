@@ -167,6 +167,13 @@ jobs:
       # --no-exit-code) exits nonzero on any unused file/export/type, so this step
       # FAILS the Lint Code job on new dead code. NOT continue-on-error by design:
       # the gate must be able to fail. The #234 baseline was cleaned in #237.
+      - name: 🧪 Type check E2E tests and fixtures
+        # #375: the root tsconfig covers src/types/generated only, and Playwright
+        # transpiles specs with esbuild without typechecking them, so `npm run build`
+        # said nothing about tests/e2e. A type error there used to surface only as a
+        # runtime failure inside the 20-minute Docker E2E job.
+        run: npm run typecheck:e2e
+
       - name: 🪦 Check for dead code (Knip)
         run: npm run knip
 
@@ -296,7 +303,7 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: version
     if: ${{ github.event.inputs.skip_tests != 'true' }}
     steps:
@@ -365,7 +372,7 @@ jobs:
         run: npm ci
 
       # Playwright browsers are NOT installed on the host: tests run inside the
-      # mcr.microsoft.com/playwright:v1.57.0-jammy Docker container (e2e-test-runner
+      # mcr.microsoft.com/playwright:v1.62.1-jammy Docker container (e2e-test-runner
       # service in docker-compose.test.yaml) which already has Playwright pre-installed.
 
       - name: 🗄️ Restore Docker image cache
@@ -392,7 +399,7 @@ jobs:
           mkdir -p /tmp/docker-image-cache
           docker save actualbudget/actual-server:latest \
             -o /tmp/docker-image-cache/actual-server.tar 2>/dev/null || true
-          docker save "mcr.microsoft.com/playwright:v1.57.0-jammy" \
+          docker save "mcr.microsoft.com/playwright:v1.62.1-jammy" \
             -o /tmp/docker-image-cache/playwright-jammy.tar 2>/dev/null || true
 
       - name: 🧹 Cleanup Docker containers

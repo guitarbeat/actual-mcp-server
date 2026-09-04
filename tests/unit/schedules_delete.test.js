@@ -1,6 +1,6 @@
 // tests/unit/schedules_delete.test.js
 // Regression test for #142: actual_schedules_delete must do exactly one
-// withWriteSession invocation, preserve notFoundMsg UX, AND preserve the
+// write-queue cycle, preserve notFoundMsg UX, AND preserve the
 // constraintErrorMsg translation for SQLite NOT NULL constraint errors.
 
 process.env.ACTUAL_SERVER_URL     = process.env.ACTUAL_SERVER_URL     ?? 'http://localhost:5006';
@@ -21,32 +21,46 @@ const VALID_UUID = '00000000-0000-0000-0000-000000000099';
   let schedulesResponse = [];
   let deleteCalls = 0;
   let deleteThrows = null;
-  apiDefault.getSchedules = async () => schedulesResponse;
-  apiDefault.deleteSchedule = async (_id) => {
+  // #376: the witness samples the drain counter from INSIDE the raw stubs, which is what
+  // distinguishes a read inside the drain from one before it. See helpers/write-cycle.mjs.
+  let witness;
+  apiDefault.getSchedules = async () => { witness?.noteRead(); return schedulesResponse; };
+  apiDefault.deleteSchedule = async (_id) => { witness?.noteWrite();
     deleteCalls++;
     if (deleteThrows) throw deleteThrows;
   };
 
-  const [tool, adapterMod] = await Promise.all([
+  // #376: the existence guard and the constraint translation MOVED from the tool into
+  // adapter.deleteSchedule. This test moved with them: stubbing adapter.withWriteSession
+  // with a pass-through counter would now stub away the thing under test, so api init is
+  // disarmed and the RAW api functions are stubbed instead, exercising the real guard.
+  const { makeCycleWitness } = await import('./helpers/write-cycle.mjs');
+  const [tool, adapterMod, errorsMod] = await Promise.all([
     import('../../dist/src/tools/schedules_delete.js').then(m => m.default),
     import('../../dist/src/lib/actual-adapter.js'),
+    import('../../dist/src/lib/errors.js'),
   ]);
-  const adapter = adapterMod.default;
+  const { isPreflightRefusal } = errorsMod;
+  apiDefault.sync = async () => {};
+  adapterMod._setSkipApiInitForTests(true);
+  witness = makeCycleWitness(adapterMod);
 
-  let withWriteSessionCalls = 0;
-  const orig = adapter.withWriteSession;
-  adapter.withWriteSession = async (fn) => { withWriteSessionCalls++; return await fn(); };
-
-  const reset = () => { withWriteSessionCalls = 0; deleteCalls = 0; deleteThrows = null; schedulesResponse = []; };
+  const cycles = () => witness.cycles();
+  const reset = () => {
+    deleteCalls = 0; deleteThrows = null; schedulesResponse = [];
+    witness.reset();
+  };
 
   console.log('\n[#142] schedules_delete: positive happy path');
   {
     reset();
     schedulesResponse = [{ id: VALID_UUID }];
     const res = await tool.call({ id: VALID_UUID });
-    check(res?.success === true,         'returns success: true');
-    check(withWriteSessionCalls === 1,   'withWriteSession called exactly once');
-    check(deleteCalls === 1,             'rawDeleteSchedule called inside callback');
+    check(res?.success === true, 'returns success: true');
+    check(deleteCalls === 1,     'rawDeleteSchedule called');
+    // The #142 property, asserted against the real queue rather than a stubbed wrapper.
+    check(witness.sharedOneCycle(),
+      'the read and the write ran in the SAME drain (#376)', witness.describe());
   }
 
   console.log('\n[#142] schedules_delete: read-side not-found throws');
@@ -57,7 +71,9 @@ const VALID_UUID = '00000000-0000-0000-0000-000000000099';
     try { await tool.call({ id: VALID_UUID }); } catch (e) { threw = e; }
     check(threw instanceof Error,                       'throws on not-found');
     check(threw?.message?.includes('Schedule'),         'error mentions Schedule');
-    check(withWriteSessionCalls === 1,                  'exactly one withWriteSession call');
+    check(isPreflightRefusal(threw),                    'and it is a typed pre-flight refusal (#377)');
+    check(witness.readInCycleNoWrite(),
+      'the read ran inside the drain and no write followed', witness.describe());
     check(deleteCalls === 0,                            'rawDeleteSchedule NOT called');
   }
 
@@ -71,7 +87,8 @@ const VALID_UUID = '00000000-0000-0000-0000-000000000099';
     check(threw instanceof Error,                       'throws on constraint error');
     check(typeof threw?.message === 'string',           'error is structured string');
     check(!threw?.message?.includes('SQLITE_CONSTRAINT'),'raw SQLite error not surfaced');
-    check(withWriteSessionCalls === 1,                  'still exactly one withWriteSession call');
+    check(witness.sharedOneCycle(),
+      'the read and the attempted delete ran in the SAME drain (#376)', witness.describe());
     check(deleteCalls === 1,                            'rawDeleteSchedule was attempted');
   }
 
@@ -81,12 +98,15 @@ const VALID_UUID = '00000000-0000-0000-0000-000000000099';
     let threw = null;
     try { await tool.call({ id: 'not-a-uuid' }); } catch (e) { threw = e; }
     check(threw instanceof Error,                       'throws on bad UUID');
-    check((threw?.message || '').includes('Invalid UUID format'), 'actionable error');
-    check(withWriteSessionCalls === 0,                  'withWriteSession NOT called on Zod fail');
+    // #380: the message comes from CommonSchemas.scheduleId now, not an inline regex, so
+    // it names the ENTITY as well as the format. Asserted on both halves rather than on
+    // the exact sentence.
+    check(/schedule ID format/i.test(threw?.message || '') && /uuid/i.test(threw?.message || ''),
+      'actionable error naming the entity and the expected format');
+    check(cycles() === 0,                               'a Zod failure never reaches the write queue at all');
     check(deleteCalls === 0,                            'rawDeleteSchedule NOT called');
   }
 
-  adapter.withWriteSession = orig;
   console.log('');
   if (failures === 0) console.log('[#142] All schedules_delete tests passed ✓');
   else { console.error(`[#142] ${failures} test(s) FAILED`); process.exit(2); }

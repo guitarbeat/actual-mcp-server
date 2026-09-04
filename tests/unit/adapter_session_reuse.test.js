@@ -33,9 +33,11 @@ import('../../dist/src/lib/actual-adapter.js').then(async ({
   _resetConnectionReuseCounterForTests,
   _setApiInitializedForTests,
   _setSkipApiInitForTests,
+  _shouldKeepSingletonAlive,
 }) => {
   const { connectionPool } = await import('../../dist/src/lib/ActualConnectionPool.js');
   const { requestContext } = await import('../../dist/src/lib/requestContext.js');
+  const { isApiInitialized } = await import('../../dist/src/lib/apiState.js');
 
   // Disarm real network calls in the legacy fallback path.
   _setSkipApiInitForTests(true);
@@ -127,8 +129,13 @@ import('../../dist/src/lib/actual-adapter.js').then(async ({
     _setApiInitializedForTests(true);
     primePoolSession('sess-err-infra');
     let observedShutdown = false;
+    // #392 split this into shutdownConnection (acquires the api lock) and
+    // shutdownConnectionLocked (for callers already holding it). The adapter's pooled error
+    // paths hold the lock, so they call the Locked variant. Spy on BOTH, because the assertion
+    // is that the pool entry was dropped, not which variant did it.
     const originalShutdown = connectionPool.shutdownConnection.bind(connectionPool);
-    connectionPool.shutdownConnection = async (sid) => {
+    const originalShutdownLocked = connectionPool.shutdownConnectionLocked.bind(connectionPool);
+    connectionPool.shutdownConnectionLocked = async (sid) => {
       if (sid === 'sess-err-infra') observedShutdown = true;
       connectionPool.connections.delete(sid);
     };
@@ -136,14 +143,16 @@ import('../../dist/src/lib/actual-adapter.js').then(async ({
     let thrown = null;
     try {
       await requestContext.run({ sessionId: 'sess-err-infra' }, async () => {
-        // Simulates a real upstream failure — auth lost mid-call.
-        await withActualApi(async () => { throw new Error('Authentication failed: too-many-requests'); });
+        // Simulates a real upstream INFRASTRUCTURE failure (connection dropped mid-call). #422:
+        // must be a non-rate-limit transient, because a rate-limit no longer drops the connection.
+        await withActualApi(async () => { throw new Error('socket hang up'); });
       });
     } catch (err) { thrown = err; }
 
     connectionPool.shutdownConnection = originalShutdown;
+    connectionPool.shutdownConnectionLocked = originalShutdownLocked;
 
-    assert(thrown !== null && /too-many-requests/.test(thrown.message),
+    assert(thrown !== null && /socket hang up/.test(thrown.message),
       'original infrastructure error propagated to caller');
     assert(observedShutdown === true,
       'connectionPool.shutdownConnection was called for the failing session');
@@ -160,8 +169,13 @@ import('../../dist/src/lib/actual-adapter.js').then(async ({
     _setApiInitializedForTests(true);
     primePoolSession('sess-err-domain');
     let observedShutdown = false;
+    // #392 split this into shutdownConnection (acquires the api lock) and
+    // shutdownConnectionLocked (for callers already holding it). The adapter's pooled error
+    // paths hold the lock, so they call the Locked variant. Spy on BOTH, because the assertion
+    // is that the pool entry was dropped, not which variant did it.
     const originalShutdown = connectionPool.shutdownConnection.bind(connectionPool);
-    connectionPool.shutdownConnection = async (sid) => {
+    const originalShutdownLocked = connectionPool.shutdownConnectionLocked.bind(connectionPool);
+    connectionPool.shutdownConnectionLocked = async (sid) => {
       if (sid === 'sess-err-domain') observedShutdown = true;
       connectionPool.connections.delete(sid);
     };
@@ -175,6 +189,7 @@ import('../../dist/src/lib/actual-adapter.js').then(async ({
     } catch (err) { thrown = err; }
 
     connectionPool.shutdownConnection = originalShutdown;
+    connectionPool.shutdownConnectionLocked = originalShutdownLocked;
 
     assert(thrown !== null && /payee_name/.test(thrown.message),
       'original domain error propagated to caller');
@@ -205,6 +220,159 @@ import('../../dist/src/lib/actual-adapter.js').then(async ({
       `pool branch skipped when _apiInitialized is false (got ${after})`);
 
     clearPoolSession('sess-stale');
+  }
+
+  // =========================================================================
+  // #419: stdio keeps the api singleton alive across ops (no per-call login),
+  // with a self-heal that tears it down on an infrastructure-level error.
+  //
+  // The skip seam's shutdownActualApi honours _shouldKeepSingletonAlive, so
+  // these cases observe the real branch decision through isApiInitialized()
+  // without driving a live api.init(). MCP_STDIO_MODE is the process signal.
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // Case 6: _shouldKeepSingletonAlive decision (pure, mutation-proof)
+  // -------------------------------------------------------------------------
+  describe('Case 6: _shouldKeepSingletonAlive decision (#419)');
+  {
+    const priorStdio = process.env.MCP_STDIO_MODE;
+    delete process.env.MCP_STDIO_MODE; // not a stdio process
+    assert(_shouldKeepSingletonAlive(0, false) === false, 'http, no active sessions -> full shutdown');
+    assert(_shouldKeepSingletonAlive(1, false) === true, 'http, active session -> keep alive');
+    assert(_shouldKeepSingletonAlive(1, true) === true, 'force does NOT defeat the active-HTTP-session keep-alive');
+    process.env.MCP_STDIO_MODE = 'true'; // stdio process
+    assert(_shouldKeepSingletonAlive(0, false) === true, 'stdio -> keep singleton alive between ops');
+    assert(_shouldKeepSingletonAlive(0, true) === false, 'stdio + forceFullShutdown -> self-heal teardown');
+    assert(_shouldKeepSingletonAlive(1, true) === true, 'an active session still wins even under force');
+    if (priorStdio === undefined) delete process.env.MCP_STDIO_MODE; else process.env.MCP_STDIO_MODE = priorStdio;
+  }
+
+  // -------------------------------------------------------------------------
+  // Case 7: stdio keeps the singleton alive: one login for N calls
+  // -------------------------------------------------------------------------
+  describe('Case 7: stdio process keeps the singleton alive across ops (#419)');
+  {
+    const priorStdio = process.env.MCP_STDIO_MODE;
+    process.env.MCP_STDIO_MODE = 'true';
+    _setApiInitializedForTests(false); // fresh process, no login yet
+    const sid = 'stdio-keepalive-1';
+    await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+      await withActualApi(async () => 'ok');
+    });
+    assert(isApiInitialized() === true,
+      'after a stdio op the singleton stays live (next init no-ops -> one login for N calls)');
+    await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+      await withActualApi(async () => 'ok2');
+    });
+    assert(isApiInitialized() === true, 'still live after a second stdio op');
+    _setApiInitializedForTests(false);
+    if (priorStdio === undefined) delete process.env.MCP_STDIO_MODE; else process.env.MCP_STDIO_MODE = priorStdio;
+  }
+
+  // -------------------------------------------------------------------------
+  // Case 8: self-heal: transient error tears down, domain error does not
+  // -------------------------------------------------------------------------
+  describe('Case 8: stdio self-heal on infrastructure error, not on domain error (#419)');
+  {
+    const priorStdio = process.env.MCP_STDIO_MODE;
+    process.env.MCP_STDIO_MODE = 'true';
+    const sid = 'stdio-selfheal-1';
+
+    _setApiInitializedForTests(false);
+    let thrown = null;
+    try {
+      await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+        // #422: a NON-rate-limit infra transient (a rate-limit would now be kept alive, see Case 10).
+        await withActualApi(async () => { throw new Error('socket hang up'); });
+      });
+    } catch (e) { thrown = e; }
+    assert(thrown !== null && /socket hang up/.test(thrown.message), 'transient error propagated');
+    assert(isApiInitialized() === false,
+      'transient error forced a full teardown (isApiInitialized reset) -> next op re-inits fresh');
+
+    _setApiInitializedForTests(false);
+    thrown = null;
+    try {
+      await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+        await withActualApi(async () => { throw new Error('Field "payee_name" does not exist'); });
+      });
+    } catch (e) { thrown = e; }
+    assert(thrown !== null && /payee_name/.test(thrown.message), 'domain error propagated');
+    assert(isApiInitialized() === true,
+      'domain error left the singleton alive (kept warm, no per-op login reintroduced)');
+
+    _setApiInitializedForTests(false);
+    if (priorStdio === undefined) delete process.env.MCP_STDIO_MODE; else process.env.MCP_STDIO_MODE = priorStdio;
+  }
+
+  // -------------------------------------------------------------------------
+  // Case 9: pool-miss warn fires at most once per process, not per call
+  // -------------------------------------------------------------------------
+  describe('Case 9: pool-miss warning suppressed once the singleton is live (#419)');
+  {
+    const priorStdio = process.env.MCP_STDIO_MODE;
+    process.env.MCP_STDIO_MODE = 'true';
+    const loggerMod = await import('../../dist/src/logger.js');
+    const log = loggerMod.default;
+    const originalWarn = log.warn.bind(log);
+    let poolMissWarns = 0;
+    log.warn = (...args) => { if (/Pool miss/.test(String(args[0]))) poolMissWarns++; return originalWarn(...args); };
+    try {
+      _setApiInitializedForTests(false); // first call warns (a real init is ahead)
+      const sid = 'stdio-warn-1';
+      for (let i = 0; i < 3; i++) {
+        await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+          await withActualApi(async () => 'ok');
+        });
+      }
+    } finally {
+      log.warn = originalWarn;
+    }
+    assert(poolMissWarns <= 1,
+      `pool-miss warn fired at most once per process, not per call (got ${poolMissWarns})`);
+    _setApiInitializedForTests(false);
+    if (priorStdio === undefined) delete process.env.MCP_STDIO_MODE; else process.env.MCP_STDIO_MODE = priorStdio;
+  }
+
+  // -------------------------------------------------------------------------
+  // Case 10 (#422): a RATE-LIMIT error must NOT tear the stdio singleton down.
+  // A rate-limit is transient (worth backing off) but does not corrupt the
+  // connection, so re-logging-in during the throttle would only add a fresh
+  // rejected login. Distinct from Case 8's non-rate-limit transient, which DOES
+  // tear down. This is the #383 relogin-cascade trigger, fixed at the source.
+  // -------------------------------------------------------------------------
+  describe('Case 10 (#422): a rate-limit error keeps the stdio singleton alive (no teardown)');
+  {
+    const priorStdio = process.env.MCP_STDIO_MODE;
+    process.env.MCP_STDIO_MODE = 'true';
+    const sid = 'stdio-ratelimit-1';
+
+    // Spaced express-default form (what the E2E server returns).
+    _setApiInitializedForTests(false);
+    let thrown = null;
+    try {
+      await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+        await withActualApi(async () => { throw new Error('Authentication failed: Too many requests, please try again later.'); });
+      });
+    } catch (e) { thrown = e; }
+    assert(thrown !== null && /too many requests/i.test(thrown.message), 'rate-limit error propagated');
+    assert(isApiInitialized() === true,
+      'a rate-limit did NOT force a teardown (singleton kept alive, no relogin storm)');
+
+    // Hyphenated code form (other server builds) behaves the same.
+    _setApiInitializedForTests(false);
+    thrown = null;
+    try {
+      await requestContext.run({ sessionId: sid, transport: 'stdio' }, async () => {
+        await withActualApi(async () => { throw new Error('Authentication failed: too-many-requests'); });
+      });
+    } catch (e) { thrown = e; }
+    assert(thrown !== null, 'hyphenated rate-limit error propagated');
+    assert(isApiInitialized() === true, 'the hyphenated rate-limit form also keeps the singleton alive');
+
+    _setApiInitializedForTests(false);
+    if (priorStdio === undefined) delete process.env.MCP_STDIO_MODE; else process.env.MCP_STDIO_MODE = priorStdio;
   }
 
   console.log(`\n[adapter-session-reuse] Results: ${passed} passed, ${failed} failed`);

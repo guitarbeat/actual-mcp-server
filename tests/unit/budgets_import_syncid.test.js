@@ -39,6 +39,9 @@ const CONFIGURED_SYNC_ID = '22222222-2222-2222-2222-222222222222';
   let downloads = 0;
   api.default.importBudget = async () => ({ id: '_imported-budget' });
   api.default.downloadBudget = async () => { downloads += 1; return { success: true }; };
+  // #396: loadBudgetTracked probes after every download. This file never models an unloaded
+  // singleton, so the probe always succeeds here.
+  api.default.getBudgetMonths = async () => ['2026-01'];
   api.default.sync = async () => {};
 
   const { requestContext } = await import('../../dist/src/lib/requestContext.js');
@@ -93,8 +96,11 @@ const CONFIGURED_SYNC_ID = '22222222-2222-2222-2222-222222222222';
     // one. That is what makes the fast path structurally unable to match.
     check(!/^[0-9a-f-]{36}$/.test(String(entry.syncId)),
       'the sentinel can never be mistaken for a configured syncId');
-    check(invalidateAllCalls === 1,
-      'and the invalidation is POOL-WIDE, so other sessions sharing the process-global api singleton are covered too');
+    // #408: TWICE, and both matter. Once BEFORE the import starts, so a timeout (the expected case
+    // for a large import) cannot skip it and leave every pool entry confidently naming the
+    // pre-import syncId; once AFTER, to record the real imported id rather than the placeholder.
+    check(invalidateAllCalls === 2,
+      `the invalidation is POOL-WIDE and runs both before and after the import (got ${invalidateAllCalls})`);
   }
 
   console.log('\n[import-syncid] REGRESSION GUARD: a switch after an import RE-DOWNLOADS');

@@ -1,26 +1,33 @@
 import config from '../config.js';
+import api from '@actual-app/api';
 
 /**
  * Options for `@actual-app/api` init.
  *
- * Actual 26+ reads `sessionToken`. Older API builds read `token`. Passing both
- * keeps session-token auth working across those versions. Empty password is
- * omitted so an unused password login path is not attempted.
+ * Actual 26+ reads `sessionToken`. Empty passwords are omitted so a token-only
+ * deployment does not attempt the password login path.
  */
 export function actualApiInitOptions(
   dataDir: string,
   serverURL: string,
   password?: string,
 ): Record<string, unknown> {
-  const sessionToken =
-    (config as { ACTUAL_SESSION_TOKEN?: string }).ACTUAL_SESSION_TOKEN ||
-    process.env.ACTUAL_SESSION_TOKEN ||
-    undefined;
+  const sessionToken = config.ACTUAL_SESSION_TOKEN || undefined;
   return {
     dataDir,
     serverURL,
     ...(password ? { password } : {}),
-    sessionToken,
-    token: sessionToken,
+    ...(sessionToken ? { sessionToken } : {}),
   };
+}
+
+/** Initialize Actual through the fork's single credential-normalization seam. */
+export async function initializeActualApi(
+  dataDir: string,
+  serverURL: string,
+  password?: string,
+): Promise<void> {
+  await (api.init as unknown as (options: Record<string, unknown>) => Promise<void>)(
+    actualApiInitOptions(dataDir, serverURL, password),
+  );
 }
