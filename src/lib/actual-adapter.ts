@@ -65,12 +65,17 @@ const {
   exportBudget: rawExportBudget,
   importBudget: rawImportBudget,
   getPreferences: rawGetPreferences,
+  getAccountGroups: rawGetAccountGroups,
+  createAccountGroup: rawCreateAccountGroup,
+  updateAccountGroup: rawUpdateAccountGroup,
+  deleteAccountGroup: rawDeleteAccountGroup,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 } = api as any;
 import { EventEmitter } from 'events';
 import observability from '../observability.js';
 import { retry, isRetryableError, isRateLimitError } from './retry.js';
 import { withOpTimeout } from './opTimeout.js';
+import { markInitFailure } from './init-failure.js';
 import { NotFoundRefusal, OutOfRangeRefusal, constraintErrorMsg } from './errors.js';
 import { findMatchingRule, type RuleCondition } from './rule-matching.js';
 import { initializeActualApi } from './actual-init-config.js';
@@ -488,13 +493,29 @@ export async function withActualApi<T>(rawOperation: () => Promise<T>): Promise<
   // touched.
   _enforceBudgetAcl();
 
-  // #276: on the FIRST successful op, warn (once) if the Actual server version is outside
-  // the range this build supports. It runs inside the op while the connection is live and
-  // reuses it via rawGetServerVersion (NOT the withActualApi-wrapped getServerVersion, which
-  // would re-enter the lock). The once-guard flips its flag synchronously, so this never
-  // repeats per session or op. It is advisory: it never throws and never blocks the op.
-  const operation = async (): Promise<T> => {
-    const result = await rawOperation();
+  // #276: on the FIRST successful op, warn (once) if the Actual server version is outside the
+  // range this build supports, reusing the live connection via rawGetServerVersion (NOT the
+  // withActualApi-wrapped getServerVersion, which would re-enter the lock).
+  //
+  // It runs AFTER withOpTimeout, not inside it. Review caught that bounding the probe was not
+  // enough while it still sat inside the operation's own timeout: its 5 seconds came out of the
+  // operation's 30, so an op that took more than ~25s and SUCCEEDED was still reported to the
+  // caller as "Actual API operation timed out", and on a deliberately lowered
+  // ACTUAL_OP_TIMEOUT_MS the probe alone could consume the entire budget. The timeout text is
+  // classed transient, so it would also drop the pooled connection. Still inside withApiLock,
+  // because it needs the connection the operation established.
+  //
+  // WHAT THIS DOES AND DOES NOT BUY, stated precisely because the first version of this comment
+  // overclaimed. The probe can no longer FAIL an operation that succeeded. It can still SLOW one,
+  // by up to SERVER_VERSION_PROBE_TIMEOUT_MS, and that bound is FIXED: it does not scale down
+  // with ACTUAL_OP_TIMEOUT_MS, so an operator who sets the 250ms floor for a fast-fail posture
+  // still pays up to ~5s of api-mutex hold against a stalled /info, and on the legacy path can
+  // pay it twice in one call (the pre-download site, then here). It is bounded and finite (at
+  // most MAX_PROBE_ATTEMPTS times per process, then never again), which is the trade being made:
+  // a diagnostic that is occasionally slow beats one that is silently disabled by a single
+  // transient failure, which is what the previous design did.
+  const runOperation = async (): Promise<T> => {
+    const result = await withOpTimeout(rawOperation);
     await checkServerVersionOnce(
       () => rawGetServerVersion() as Promise<{ version: string } | { error: string }>,
       logger,
@@ -515,7 +536,7 @@ export async function withActualApi<T>(rawOperation: () => Promise<T>): Promise<
         // #390: verify the singleton holds THIS session's budget before the operation runs.
         // Inside the lock, so no other session can change it in between.
         await ensureLoadedBudgetMatchesSession();
-        return await withOpTimeout(operation);
+        return await runOperation();
       } catch (err) {
         // Only drop the pool connection on errors that suggest the api
         // singleton itself is in a bad state. User-input validation /
@@ -544,7 +565,7 @@ export async function withActualApi<T>(rawOperation: () => Promise<T>): Promise<
     let forceFullShutdown = false;
     try {
       await initActualApiForOperation();
-      return await withOpTimeout(operation);
+      return await runOperation();
     } catch (err) {
       // #419: the stdio keep-alive branch leaves the singleton live; on an
       // infrastructure-level error it may be corrupt, so force a full teardown
@@ -734,7 +755,14 @@ async function initActualApiForOperation(): Promise<void> {
     //
     // Checking HERE covers every legacy caller in one place: both withActualApi branches,
     // withActualApiWrite, and the drain's legacy branch.
-    await ensureLoadedBudgetMatchesSession();
+    // #452: branded on the same terms as the full-init path below. This branch skips api.init()
+    // but ensureLoadedBudgetMatchesSession can still DOWNLOAD a budget (after a budgets_switch,
+    // or when another session moved the singleton), so it raises the same load failures.
+    try {
+      await ensureLoadedBudgetMatchesSession();
+    } catch (err) {
+      throw markInitFailure(err);
+    }
     return;
   }
   try {
@@ -766,7 +794,12 @@ async function initActualApiForOperation(): Promise<void> {
     logger.debug('[ADAPTER] Actual API initialized for operation');
   } catch (err) {
     logger.error('[ADAPTER] Error initializing Actual API:', err);
-    throw err;
+    // #452: mark it as an INITIALISATION failure before it leaves this function. stdio has one
+    // catch for every tool error and cannot otherwise tell "the connection could not be
+    // established" from "the tool failed", and guessing from the message misfires: a #270 op
+    // timeout reads as `timeout` and a #422 rate-limit reads as `auth_failed`. The mark is
+    // additive and non-enumerable, so nothing about the error's own propagation changes.
+    throw markInitFailure(err);
   }
 }
 
@@ -3150,7 +3183,11 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
             }
           });
         } catch (error: any) {
-          throw new Error(`Query execution failed: ${error.message}`);
+          // #452 review: `cause` preserves the ORIGINAL error, so an init-failure BRAND survives
+          // the rewrap. Without it, actual_query_run reported a failed connection as
+          // "Query execution failed: <raw upstream text>" and stdio could not recognise it,
+          // silently exempting this tool from the fix.
+          throw new Error(`Query execution failed: ${error.message}`, { cause: error });
         }
       }
     
@@ -3299,7 +3336,7 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
       throw error; // Re-throw the well-formatted validation error without wrapping
     }
     
-    throw new Error(`Query execution failed: ${errorMsg}`);
+    throw new Error(`Query execution failed: ${errorMsg}`, { cause: error });   // #452: keep the brand
   }
 }
 
@@ -3513,7 +3550,7 @@ export async function runBankSync(accountId?: string): Promise<void> {
       const retryIn = reset ? ` Retry in ~${Math.ceil(Number(reset) / 60)} minute(s).` : '';
       throw new Error(
         `Bank sync failed: GoCardless rate limit exceeded for this account.${retryIn} ` +
-        `(NORDIGEN RATE_LIMIT_EXCEEDED — account success quota exhausted)`
+        `(NORDIGEN RATE_LIMIT_EXCEEDED: account success quota exhausted)`
       );
     }
     if (
@@ -3522,10 +3559,10 @@ export async function runBankSync(accountId?: string): Promise<void> {
       errorMsg.includes('NORDIGEN_ERROR') ||
       errorMsg.includes('Failed syncing account')
     ) {
-      throw new Error(`Bank sync failed: Provider error — ${errorMsg}`);
+      throw new Error(`Bank sync failed: Provider error: ${errorMsg}`, { cause: error });
     }
 
-    throw new Error(`Bank sync failed: ${errorMsg}`);
+    throw new Error(`Bank sync failed: ${errorMsg}`, { cause: error });   // #452: keep the brand
   }
 }
 export async function getBudgets(): Promise<unknown[]> {
@@ -3772,6 +3809,69 @@ export async function getServerVersion(): Promise<{ version: string } | { error:
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+/**
+ * Account groups (#429). Upstream added these in 26.9.0; the schema arrives through a
+ * migration SHIPPED IN `@actual-app/api` and applied to the LOCAL budget file, so these
+ * work against an older sync server too: the server relays messages and does not execute
+ * the queries.
+ *
+ * One semantic worth carrying into the tool descriptions, taken from upstream's own
+ * comment on the delete path: clearing member refs is best effort under CRDT sync, so a
+ * concurrent assignment on another device can win against those nulls. Consumers must
+ * treat an account whose `account_group_id` points at a missing or tombstoned group as
+ * UNGROUPED rather than as an error.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function getAccountGroups(): Promise<any[]> {
+  return withActualApi(async () => {
+    observability.incrementToolCall('actual.account_groups.list').catch(() => {});
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await withConcurrency(() => retry(() => rawGetAccountGroups() as Promise<any[]>, { retries: 2, backoffMs: 200 }));
+  });
+}
+
+export async function createAccountGroup(group: { name: string; sort_order?: number }): Promise<string> {
+  observability.incrementToolCall('actual.account_groups.create').catch(() => {});
+  return queueWriteOperation(async () => {
+    const raw = await withConcurrency(() => retry(() => rawCreateAccountGroup(group) as Promise<string | { id?: string }>, { retries: 2, backoffMs: 200, isRetryable: isRetryableError }));
+    return normalizeToId(raw);
+    // Lands in account_groups only, so the four entity listings are untouched.
+  }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
+}
+
+export async function updateAccountGroup(id: string, fields: { name?: string; sort_order?: number }): Promise<void> {
+  observability.incrementToolCall('actual.account_groups.update').catch(() => {});
+  return queueWriteOperation(async () => {
+    // Read, decide and write inside ONE queued operation, so the existence check and the
+    // write are a single api-lock cycle and cannot be interleaved by a sibling (#371/#378).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const groups = await withConcurrency(() => retry(() => rawGetAccountGroups() as Promise<any[]>, { retries: 2, backoffMs: 200 }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (!(groups as any[]).some((g: any) => g.id === id)) {
+      throw new NotFoundRefusal('Account group', id, 'actual_account_groups_list');
+    }
+    await withConcurrency(() => retry(() => rawUpdateAccountGroup(id, fields) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    // Renames the group row itself; no account row changes, so listings are preserved.
+  }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
+}
+
+export async function deleteAccountGroup(id: string): Promise<void> {
+  observability.incrementToolCall('actual.account_groups.delete').catch(() => {});
+  return queueWriteOperation(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const groups = await withConcurrency(() => retry(() => rawGetAccountGroups() as Promise<any[]>, { retries: 2, backoffMs: 200 }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (!(groups as any[]).some((g: any) => g.id === id)) {
+      throw new NotFoundRefusal('Account group', id, 'actual_account_groups_list');
+    }
+    await withConcurrency(() => retry(() => rawDeleteAccountGroup(id) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    // NO preservesListings claim, deliberately: upstream's delete UPDATES every member
+    // account to null its account_group_id before removing the group, so the accounts
+    // listing CONTENT changes even though its id set does not. Claiming preservation here
+    // would serve a stale accounts listing to the next guard in the same drain.
+  });
+}
+
 export async function getTags(): Promise<any[]> {
   return withActualApi(async () => {
     observability.incrementToolCall('actual.tags.get').catch(() => {});
@@ -4029,6 +4129,10 @@ export default {
   getPayees,
   getCommonPayees,
   createPayee,
+  getAccountGroups,
+  createAccountGroup,
+  updateAccountGroup,
+  deleteAccountGroup,
   getTags,
   createTag,
   updateTag,
