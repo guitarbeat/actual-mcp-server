@@ -157,24 +157,53 @@ export async function callTool(
  * actually engages the pacer there.
  */
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX_CALLS_PER_WINDOW = 230;
+
+/**
+ * #423: the budget is PER TRANSPORT, because the two legs amplify a tool call very differently.
+ *
+ * Measured on 2026-09-06, with the stdio leg on its OWN Actual server (so nothing else was
+ * consuming its window): the leg makes about 112 tool calls in 2.4 minutes, never comes close to
+ * the 230 budget, and STILL trips the 500-requests-per-minute limiter about 90 seconds in. That
+ * disproves the shared-window explanation this file and #423 both carried: the overflow is
+ * request AMPLIFICATION inside one leg, not two legs sharing a ceiling.
+ *
+ * Why stdio amplifies harder than HTTP, from the adapter: stdio never gets a pool entry (that is
+ * deliberate, `transport: 'stdio'` keeps it off the pooled path), so every op runs the LEGACY
+ * branch. #419 stops that re-logging in per call, but the branch still re-selects and syncs more
+ * eagerly than a pooled HTTP session, and once a throttled sync closes the budget (#396 shape)
+ * the recovery costs a re-download plus a re-login, which is itself several requests.
+ *
+ * So the stdio leg is given a budget low enough that even a high ratio stays inside the ceiling.
+ *
+ * IT DOES BIND, and the averages say otherwise, so read this before "simplifying" it away. Review
+ * argued the branch is inert: 112 calls over 2.4 minutes is ~47 calls per minute, which cannot
+ * reach a 90-call budget. That reasoning uses the AVERAGE; the pacer uses a SLIDING 60-second
+ * window and the suite is bursty, with the write-heavy block far denser than the mean. The
+ * measurement settles it. Changing ONLY this number, with the dedicated server and the zero
+ * cool-down already in place, took the stdio leg from 4 failures to 0 AND its wall clock from
+ * 2.4 minutes to 5.2 minutes. A pacer that never slept could not have more than doubled the
+ * runtime. The extra time IS the pacer holding calls back, which is the cost being paid.
+ */
+const RATE_MAX_CALLS_PER_WINDOW =
+  process.env.MCP_TEST_TRANSPORT === 'stdio' ? 90 : 230;
 const recentCallTimes: number[] = [];
 
 /** Block until sending one more call keeps us inside the window budget. */
 /**
- * Exported for #383: the stdio client paces through the SAME window as the HTTP one.
- *
- * Both transports drive the one Actual server, so its 500-requests-per-minute limiter counts
- * their calls together and they must not each believe they own the whole budget.
+ * Exported for #383: the stdio client paces too, through its OWN budget (see above).
  *
  * READ THIS BEFORE RELYING ON IT: module scope shares this window only WITHIN A PROCESS, and the
- * two E2E legs are SEPARATE processes (HTTP inside the runner container, stdio on the host). So
- * the stdio leg starts with its counter at zero while Actual's window is still full from the HTTP
- * leg. An earlier version of this comment claimed the two legs shared a window; they do not, and
- * CI proved it: the stdio leg's first login was refused with "Too many requests", Playwright
- * restarted its worker after the failure, and the restart re-spawned the server and re-logged in,
- * 39 times. The cool-down in tests/e2e/run-docker-e2e.sh is what actually bridges the two
- * processes. This pacer covers calls within one leg.
+ * two E2E legs are SEPARATE processes (HTTP inside the runner container, stdio on the host), so
+ * neither can see the other's calls. That used to matter, because both drove one Actual server.
+ * Since #423 they drive SEPARATE servers, so each leg genuinely does own the whole ceiling of the
+ * server it talks to, and the cross-leg cool-down is no longer needed.
+ *
+ * What remains, and what the per-transport budget above is for: a leg can exceed the ceiling on
+ * its own. Measured with the legs already separated, the stdio leg tripped the limiter while
+ * holding this pacer zero times AT THE OLD 230 BUDGET. That is the observation that set the stdio
+ * budget to 90, and at 90 it does hold: see the wall-clock evidence above. Read the two together,
+ * because on their own the first sentence reads as "pacing cannot help here", which is how the
+ * cause was misdiagnosed in the first place.
  */
 export async function pace(): Promise<void> {
   for (;;) {

@@ -15,7 +15,7 @@
 // Run: node tests/unit/residue_sweep_balance_account.test.js
 
 import assert from 'node:assert';
-import { sweepResidue, EXIT_UNSAFE_BUDGET } from '../manual/residue.js';
+import { sweepResidue, assertNoResidue, EXIT_UNSAFE_BUDGET } from '../manual/residue.js';
 
 const ACCT = 'MCP-Test-2026-07-10T20-46-50-942Z-Updated'; // matches TEST_OBJECT_RE (has a timestamp)
 const ENV = { MCP_TEST_BUDGET_SYNC_ID: 'budget-x', MCP_ACTIVE_BUDGET_SYNC_ID: 'budget-x' };
@@ -126,6 +126,91 @@ await check('#280 guard: throws EXIT_UNSAFE_BUDGET when designated != active bud
     (err) => err.code === EXIT_UNSAFE_BUDGET,
   );
   assert.ok(!names(calls).some((n) => /delete|close/.test(n)), 'no destructive call before the guard threw');
+});
+
+// #451: tags are swept too. Added when the tags integration module was added, because a fixture
+// the sweep cannot SEE is one the zero-residue assertion silently certifies as absent, which
+// weakens the dual-transport release gate (#280) rather than merely leaving a stray row.
+// A tag's word lives in `tag`, not `name`, so it needs its own predicate: a test that only
+// checked the delete call would pass with the collection filter matching nothing.
+await check('sweeps a test TAG, and matches on the `tag` field not `name`', async () => {
+  const TAG = 'MCP-Test-tag-1783679144993';
+  const { callTool, calls } = makeMock({
+    actual_accounts_list: () => ({ result: [] }),
+    actual_tags_list: () => ({ result: [
+      { id: 'tag-1', tag: TAG },
+      { id: 'tag-2', tag: 'groceries' },          // a REAL user tag: must never be touched
+      { id: 'tag-3', name: TAG },                 // wrong field: must not be treated as a match
+    ] }),
+    actual_tags_delete: () => ({ success: true }),
+  });
+  await sweepResidue(callTool, ENV);
+  const deletes = calls.filter((c) => c.name === 'actual_tags_delete');
+  assert.strictEqual(deletes.length, 1, `expected exactly one tag delete, got ${deletes.length}`);
+  assert.strictEqual(deletes[0].args.id, 'tag-1', 'the wrong tag was deleted');
+});
+
+await check('a budget with only a stray test tag is NOT reported clean', async () => {
+  // residueCount must include tags, or the sweep prints "already clean" and returns without
+  // deleting, which is the failure mode this whole section exists to prevent.
+  const { callTool, calls } = makeMock({
+    actual_accounts_list: () => ({ result: [] }),
+    actual_tags_list: () => ({ result: [{ id: 'tag-1', tag: 'MCP-Test-tag-1783679144993' }] }),
+    actual_tags_delete: () => ({ success: true }),
+  });
+  await sweepResidue(callTool, ENV);
+  assert.ok(calls.some((c) => c.name === 'actual_tags_delete'), 'the stray tag was never swept');
+});
+
+// Review of #451 caught the failure LISTING omitting tags while residueCount included them, so a
+// tag-only failure printed "1 object(s) left behind:" followed by nothing at all. A gate that
+// fails without naming what failed is barely better than one that does not fail: this is the
+// exact case that fired on the first live run of the tags module, and the operator would have
+// been told a count and no name.
+await check('a tag-only residue failure NAMES the tag it found', async () => {
+  const TAG = 'MCP-Test-tag-1783679144993';
+  const { callTool } = makeMock({
+    actual_accounts_list: () => ({ result: [] }),
+    actual_tags_list: () => ({ result: [{ id: 'tag-1', tag: TAG }] }),
+  });
+  const lines = [];
+  const origLog = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  let total;
+  try {
+    total = await assertNoResidue(callTool);
+  } finally {
+    console.log = origLog;
+  }
+  assert.strictEqual(total, 1, 'the tag must be counted as residue');
+  const output = lines.join('\n');
+  assert.ok(/left behind/.test(output), `expected a failure line, got:\n${output}`);
+  assert.ok(output.includes(TAG), `the failure listing must name the tag, got:\n${output}`);
+});
+
+// The sweep PREVIEW is the other printer, and it had the same tag omission. The existing sweep
+// case above exercises the line but asserts only on the recorded callTool calls, so deleting the
+// preview line again would leave the sweep under-reporting what it is about to delete with every
+// test still green. The preview exists to be READ before anything is destroyed, so its content
+// is the assertion.
+await check('the sweep preview names the tag it is about to delete', async () => {
+  const TAG = 'MCP-Test-tag-1783679144993';
+  const { callTool } = makeMock({
+    actual_accounts_list: () => ({ result: [] }),
+    actual_tags_list: () => ({ result: [{ id: 'tag-1', tag: TAG }] }),
+    actual_tags_delete: () => ({ success: true }),
+  });
+  const lines = [];
+  const origLog = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    await sweepResidue(callTool, ENV);
+  } finally {
+    console.log = origLog;
+  }
+  const output = lines.join('\n');
+  assert.ok(/Sweep preview/.test(output), `expected a preview, got:\n${output}`);
+  assert.ok(output.includes(TAG), `the preview must name the tag it will delete, got:\n${output}`);
 });
 
 console.log(`\n[residue-sweep-balance-account] Results: ${passed} passed, ${failed} failed`);

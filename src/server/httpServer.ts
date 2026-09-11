@@ -33,6 +33,14 @@ import { requestContext } from '../lib/requestContext.js';
 import { buildToolListEntries } from '../lib/tool-list-entry.js';
 import { appendBearerScope } from '../lib/bearer-challenge.js';
 import { deriveAllowedOrigins, isAllowedOrigin, parseAllowedOrigins } from '../lib/origin-allowlist.js';
+
+// #438 / #452: the init-failure classifier now lives in src/lib/init-failure.ts so BOTH
+// transports can reach it (stdio could not, which was the whole of #452). Re-exported here
+// unchanged so existing importers and tests are unaffected.
+import { classifyInitFailure, type InitFailureCause } from '../lib/init-failure.js';
+export { classifyInitFailure };
+export type { InitFailureCause };
+
 export { requestContext };
 
 // Resolve the authenticated principal for the per-principal budget preference
@@ -254,6 +262,36 @@ export async function startHttpServer(
 
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const sessionInitPromises = new Map<string, Promise<void>>();  // Track session init completion
+  // #438: why a session is NOT in `transports`. Closure-scoped like its two
+  // siblings above, so repeated startHttpServer calls (which the unit tests make)
+  // never share state and no reset export is needed. PEEK-ONLY: no reader deletes,
+  // and the TTL is the sole reaper. Consume-on-read was rejected because two
+  // concurrent requests on one session id would race for the single record and the
+  // loser would silently get the generic 404, restoring this bug at random.
+  const INIT_FAILURE_TTL_MS = 60_000;
+  const INIT_FAILURE_MAX = 1000;
+  const sessionInitFailures = new Map<string, { cause: InitFailureCause; sentence: string; at: number }>();
+  const rememberInitFailure = (sid: string, err: unknown): void => {
+    const now = Date.now();
+    for (const [k, v] of sessionInitFailures) {
+      if (now - v.at > INIT_FAILURE_TTL_MS) sessionInitFailures.delete(k);
+    }
+    // FIFO once capped. A failed init creates no pool entry, so onSessionEvicted
+    // never fires for these and nothing else would ever reap them.
+    while (sessionInitFailures.size >= INIT_FAILURE_MAX) {
+      const oldest = sessionInitFailures.keys().next().value;
+      if (oldest === undefined) break;
+      sessionInitFailures.delete(oldest);
+    }
+    sessionInitFailures.set(sid, { ...classifyInitFailure(err), at: now });
+  };
+  /** Peek. Never deletes. Returns undefined once the TTL has elapsed. */
+  const peekInitFailure = (sid: string): { cause: InitFailureCause; sentence: string } | undefined => {
+    const rec = sessionInitFailures.get(sid);
+    if (!rec) return undefined;
+    if (Date.now() - rec.at > INIT_FAILURE_TTL_MS) return undefined;
+    return { cause: rec.cause, sentence: rec.sentence };
+  };
 
   // safe fallback if index didn't provide implementedTools
   const toolsList: string[] = Array.isArray(implementedTools) ? implementedTools : [];
@@ -539,6 +577,12 @@ export async function startHttpServer(
               logger.error(`[SESSION] Failed to initialize Actual for session ${sid}:`, err);
               // Don't add failed sessions to transports map - they won't be usable anyway
               // This prevents accumulation of dead sessions
+              // #438: remember WHY. The transport is still deliberately not registered,
+              // so the dead-session protection above is unchanged; without this the
+              // cause is known here and discarded, and the client's next request gets
+              // a bare "Session not found" that says nothing about a schema mismatch,
+              // a bad password or an unreachable server.
+              rememberInitFailure(sid, err);
               rejectInit?.(err);
             } finally {
               // Clean up the promise after a short delay to allow pending requests to complete
@@ -601,6 +645,44 @@ export async function startHttpServer(
           // Session doesn't exist (expired, server restarted, or invalid)
           // For tools/list, return tools for LobeChat discovery (they cache session IDs)
           // This allows LobeChat's backend to discover available tools even with expired sessions
+          // #438: ONE lookup, at the top of this block and BEFORE the shim, so
+          // there is a single read per request under peek semantics and a fourth
+          // caller cannot reintroduce the mask. Wrapped in its own try/catch: a
+          // throw here would land on the outer catch below, which returns raw
+          // String(err) (that line's sanitisation is #446), and would defeat the
+          // enum-only contract through the very hole left open there.
+          let knownFailure: { cause: InitFailureCause; sentence: string } | undefined;
+          try {
+            knownFailure = peekInitFailure(sessionId);
+          } catch {
+            knownFailure = undefined;
+          }
+
+          if (knownFailure) {
+            // A known init failure BEATS the discovery shim for this session id:
+            // answering 200 plus a full tool list to a session whose connection
+            // never came up is the same masking in a friendlier costume.
+            logger.warn(`[SESSION] Session ${sessionId} failed to initialize (${knownFailure.cause}); reporting the cause (method: ${method})`);
+            res.status(404).json({
+              jsonrpc: '2.0',
+              id: payload?.id ?? null,
+              error: {
+                code: -32001,
+                // The lowercase `re-initialize` token is load bearing, not styling:
+                // tests/manual/mcp-client.js:131 matches `includes('re-initialize')`
+                // to trigger its session reset, and that branch is checked BEFORE its
+                // `timed out` branch. Capitalising it made a failed-init session fall
+                // through to the timeout branch, which retries a permanently dead
+                // session until MCP_TEST_MAX_RETRIES is exhausted.
+                message: `${knownFailure.sentence} Please re-initialize by calling initialize without an mcp-session-id header once the cause is fixed.`,
+                // Closed enum only. Nothing derived from the upstream error reaches
+                // the wire, which is why no scrubber has to be correct here.
+                data: { cause: knownFailure.cause, sessionInitFailed: true },
+              },
+            });
+            return;
+          }
+
           if (method === 'tools/list') {
             logger.debug('[LOBECHAT COMPAT] Handling tools/list with expired/invalid session - returning tools for discovery');
             const tools = buildToolListEntries(toolsList, resolveToolMeta);
@@ -646,13 +728,44 @@ export async function startHttpServer(
       const e2 = err as Error | { stack?: unknown } | undefined;
       if (e2 && typeof e2.stack === 'string') logger.error(e2.stack);
       if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: '2.0', id: payload?.id ?? null, error: { code: -32603, message: String(err) } });
+        // #446: the client gets a STABLE message plus a correlation id, never the
+        // raw error. `String(err)` here could carry a stack, raw SQL from
+        // SyncError.meta.query, an EACCES path with the OS username, or the
+        // configured upstream URL. The detail is already logged above with the
+        // request id stamped by requestContext (#221), so an operator joins the two
+        // by that id instead of reading it off the wire.
+        //
+        // The id is best effort: this catch can fire OUTSIDE requestContext.run
+        // (an error thrown while establishing the context), in which case there is
+        // nothing to correlate and the field is omitted rather than invented.
+        const requestId = requestContext.getStore()?.requestId;
+        logger.error(`[HTTP] Unhandled POST error${requestId ? ` (requestId=${requestId})` : ''}`);
+        res.status(500).json({
+          jsonrpc: '2.0',
+          id: payload?.id ?? null,
+          error: {
+            code: -32603,
+            message: 'Internal error. The server logged the cause; quote the requestId when reporting it.',
+            ...(requestId ? { data: { requestId } } : {}),
+          },
+        });
       }
     }
   });
 
   // GET for SSE connect (reuse transport)
-  app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
+app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
+    // #447: the SAME gate the POST route uses. Until now this route never called
+    // it outside the OIDC branch, so in the default static-bearer posture a GET on
+    // the MCP path was unauthenticated while a POST on the identical path was not.
+    // That inconsistency is what forced #438 to withhold the session-init cause
+    // here: the cause sentences are configuration hints, and putting them on an
+    // unauthenticated route would widen what a caller without a token can learn.
+    // authenticateRequest writes its own 401 and returns false, so this is the
+    // whole change.
+    if (!authenticateRequest(req, res)) {
+      return;
+    }
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId) {
       res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'No session id' }, id: null });
@@ -661,7 +774,38 @@ export async function startHttpServer(
     connectionPool.touch(sessionId); // Refresh the pool's idle clock (#167)
     const transport = transports.get(sessionId);
     if (!transport) {
-      res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Transport not ready' }, id: null });
+      // #438: same cause, this route's own status and code. The classifier owns no
+      // status: each caller maps the classification onto the shape it already
+      // returns. try/catch is load bearing here because this route has NONE and the
+      // file registers no error-handling middleware, so under Express 5 an async
+      // throw reaches the default final handler, which puts err.stack in the body
+      // whenever NODE_ENV is not production (unset for a bare node run, and
+      // `development` in docker-compose).
+      // #438 + #447: the cause IS reported here now. It was withheld while this
+      // route was unauthenticated in the default static-bearer posture, because
+      // the cause sentences are configuration hints. #447 gated the route with the
+      // same authenticateRequest the POST route uses, so the reason for withholding
+      // is gone. Same closed enum, same fixed sentences, this route's own status
+      // and code. try/catch is still load bearing: this route has no error handling
+      // of its own and the file registers no error middleware, so under Express 5 a
+      // throw reaches the default final handler, which emits err.stack whenever
+      // NODE_ENV is not production.
+      let knownFailure: { cause: InitFailureCause; sentence: string } | undefined;
+      try {
+        knownFailure = peekInitFailure(sessionId);
+      } catch {
+        knownFailure = undefined;
+      }
+      if (knownFailure) {
+        logger.warn(`[SESSION] GET on session ${sessionId} whose init failed (${knownFailure.cause}); reporting the cause`);
+      }
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: knownFailure
+          ? { code: -32000, message: knownFailure.sentence, data: { cause: knownFailure.cause, sessionInitFailed: true } }
+          : { code: -32000, message: 'Transport not ready' },
+        id: null,
+      });
       return;
     }
     await transport.handleRequest(req, res);
@@ -770,6 +914,7 @@ export async function startHttpServer(
     }
     transports.clear();
     sessionInitPromises.clear();
+    sessionInitFailures.clear(); // #438
     // Also shut down the shared/pooled connections
     await shutdownActual();
   };
