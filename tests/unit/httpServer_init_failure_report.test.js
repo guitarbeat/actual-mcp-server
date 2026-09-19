@@ -145,6 +145,15 @@ function initFailureBlocks() {
   return blocks;
 }
 
+/** Match either upstream's single `httpPath` registration or this fork's
+ * authenticated `[httpPath, '/mcp']` alias registration. The route body is the
+ * security boundary; requiring one spelling of Express' path argument made the
+ * guard reject the fork even though both aliases share the same handler. */
+function httpRoute(method) {
+  const pathArg = String.raw`(?:httpPath|\[\s*httpPath\s*,\s*['\"]\/mcp['\"]\s*\])`;
+  return new RegExp(String.raw`app\.${method}\(${pathArg}[\s\S]*?\n  \}\);`).exec(source);
+}
+
 check('#438: WIRE CONTRACT: no upstream-derived string can reach the payload', () => {
   // The whole point of the closed enum: if nothing upstream reaches the wire,
   // no scrubber has to be correct. Upstream strings can carry a stack, raw SQL
@@ -181,7 +190,7 @@ check('#447: the GET route is gated by the SAME authenticateRequest as POST', ()
   // The whole basis for reporting the cause here. Before #447 this route never
   // called it outside the OIDC branch, so a GET on the MCP path was unauthenticated
   // while a POST on the identical path was not.
-  const getBranch = /app\.get\(httpPath[\s\S]*?\n  \}\);/.exec(source);
+  const getBranch = httpRoute('get');
   assert.ok(getBranch, 'found the GET route');
   assert.ok(/if \(!authenticateRequest\(req, res\)\) \{/.test(getBranch[0]),
     'GET calls the same gate as POST, and returns on failure');
@@ -197,7 +206,7 @@ check('#438 + #447: the cause is reported on BOTH routes, now that both are gate
   // Authorization header. The cause sentences are configuration hints, so putting
   // them there would have widened what an unauthenticated caller can learn. The GET
   // body stays the constant it has always been; the peek there feeds the LOG only.
-  const getBranch = /app\.get\(httpPath[\s\S]*?\n  \}\);/.exec(source);
+  const getBranch = httpRoute('get');
   assert.ok(getBranch, 'found the GET route');
   assert.ok(/knownFailure\.sentence/.test(getBranch[0]), 'GET reports the sentence');
   assert.ok(/data: \{ cause: knownFailure\.cause/.test(getBranch[0]), 'and the closed enum');
@@ -214,8 +223,8 @@ check('#438: both call sites are CONTAINED by their own try/catch', () => {
   // Asserted PER ROUTE rather than by a global count: both lookups now have the
   // same shape, so a count would pass even if one route lost its guard and the
   // other grew a second one.
-  const postRoute = /app\.post\(httpPath[\s\S]*?\n  \}\);/.exec(source);
-  const getRoute = /app\.get\(httpPath[\s\S]*?\n  \}\);/.exec(source);
+  const postRoute = httpRoute('post');
+  const getRoute = httpRoute('get');
   assert.ok(postRoute && getRoute, 'found both routes');
   for (const [label, route] of [['POST', postRoute[0]], ['GET', getRoute[0]]]) {
     assert.ok(/try \{[\s\S]*?peekInitFailure\(sessionId\)[\s\S]*?\}\s*catch/.test(route),

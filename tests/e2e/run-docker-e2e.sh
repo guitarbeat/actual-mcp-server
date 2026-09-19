@@ -15,6 +15,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="$PROJECT_ROOT/docker-compose.test.yaml"
 
+# Docker Desktop normally provides the `docker compose` plugin, while package
+# managers and some CI images expose the same Compose v2 implementation as the
+# standalone `docker-compose` binary. Support both without changing the test
+# topology or flags.
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+  COMPOSE_DISPLAY="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+  COMPOSE_DISPLAY="docker-compose"
+else
+  echo "Docker Compose is required (docker compose or docker-compose)." >&2
+  exit 1
+fi
+
 # Parse arguments
 NO_CLEANUP=false
 BUILD_ONLY=false
@@ -90,11 +105,11 @@ cleanup() {
   if [ "$NO_CLEANUP" = false ]; then
     log_info "Cleaning up Docker resources..."
     cd "$PROJECT_ROOT"
-    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
     log_success "Cleanup complete"
   else
     log_warn "Skipping cleanup (--no-cleanup flag set)"
-    log_info "To manually cleanup: cd $PROJECT_ROOT && docker compose -f docker-compose.test.yaml down -v"
+    log_info "To manually cleanup: cd $PROJECT_ROOT && $COMPOSE_DISPLAY -f docker-compose.test.yaml down -v"
   fi
 }
 
@@ -130,7 +145,7 @@ wait_for_service() {
   echo ""
   log_error "$service failed to become healthy after $max_attempts attempts"
   log_info "Showing $service logs:"
-  docker compose -f "$COMPOSE_FILE" logs "$service" | tail -50
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" logs "$service" | tail -50
   return 1
 }
 
@@ -145,16 +160,16 @@ echo ""
 
 # Step 0: Clean up any existing containers and volumes
 log_info "Step 0/5: Cleaning up previous test environment..."
-docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
 log_success "Previous environment cleaned"
 echo ""
 
 # Step 1: Build MCP server Docker image
 log_info "Step 1/5: Building MCP server Docker image..."
 if [ "$VERBOSE" = true ]; then
-  docker compose -f "$COMPOSE_FILE" build mcp-server-test
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" build mcp-server-test
 else
-  docker compose -f "$COMPOSE_FILE" build mcp-server-test > /dev/null 2>&1
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" build mcp-server-test > /dev/null 2>&1
 fi
 log_success "Docker image built successfully"
 
@@ -165,7 +180,7 @@ fi
 
 # Step 2: Start Actual Budget server and bootstrap
 log_info "Step 2/5: Starting Actual Budget server..."
-docker compose -f "$COMPOSE_FILE" up -d actual-budget-test
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" up -d actual-budget-test
 
 log_info "Step 3/5: Waiting for Actual Budget to be ready..."
 sleep 3
@@ -174,7 +189,7 @@ COUNT=0
 while ! curl -sf http://localhost:5007/health > /dev/null 2>&1; do
   if [ $COUNT -ge $MAX_WAIT ]; then
     log_error "Actual Budget failed to start after ${MAX_WAIT} seconds"
-    docker compose -f "$COMPOSE_FILE" logs actual-budget-test | tail -50
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" logs actual-budget-test | tail -50
     exit 1
   fi
   echo -n "."
@@ -191,11 +206,11 @@ log_success "Actual Budget is ready"
 # `depends_on: service_completed_successfully` from mcp-server-test (that dependency was the only
 # other thing checking the stdio bootstrap, and it broke every non-stdio level).
 log_info "Step 4/5: Bootstrapping Actual Budget and importing test data..."
-if docker compose -f "$COMPOSE_FILE" up --exit-code-from actual-budget-bootstrap --abort-on-container-exit actual-budget-bootstrap; then
+if "${COMPOSE[@]}" -f "$COMPOSE_FILE" up --exit-code-from actual-budget-bootstrap --abort-on-container-exit actual-budget-bootstrap; then
   log_success "Bootstrap complete"
 else
   log_error "Bootstrap failed!"
-  docker compose -f "$COMPOSE_FILE" logs actual-budget-bootstrap | tail -50
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" logs actual-budget-bootstrap | tail -50
   exit 1
 fi
 
@@ -210,13 +225,13 @@ fi
 # Skipped when the stdio leg is off, so an HTTP-only run does not pay for a second server.
 if [ "$TEST_LEVEL" = "full" ] && [ "${RUN_STDIO_E2E:-true}" = "true" ]; then
   log_info "Step 4b: Starting the dedicated stdio Actual Budget server..."
-  docker compose -f "$COMPOSE_FILE" up -d actual-budget-stdio-test
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" up -d actual-budget-stdio-test
 
   STDIO_WAIT=0
   while ! curl -sf http://localhost:5008/health > /dev/null 2>&1; do
     if [ $STDIO_WAIT -ge 30 ]; then
       log_error "The stdio Actual Budget server failed to start after 30 seconds"
-      docker compose -f "$COMPOSE_FILE" logs actual-budget-stdio-test | tail -50
+      "${COMPOSE[@]}" -f "$COMPOSE_FILE" logs actual-budget-stdio-test | tail -50
       exit 1
     fi
     echo -n "."
@@ -227,11 +242,11 @@ if [ "$TEST_LEVEL" = "full" ] && [ "${RUN_STDIO_E2E:-true}" = "true" ]; then
   log_success "The stdio Actual Budget server is ready"
 
   log_info "Step 4c: Bootstrapping the stdio budget..."
-  if docker compose -f "$COMPOSE_FILE" up --exit-code-from actual-budget-stdio-bootstrap --abort-on-container-exit actual-budget-stdio-bootstrap; then
+  if "${COMPOSE[@]}" -f "$COMPOSE_FILE" up --exit-code-from actual-budget-stdio-bootstrap --abort-on-container-exit actual-budget-stdio-bootstrap; then
     log_success "Stdio bootstrap complete"
   else
     log_error "Stdio bootstrap failed!"
-    docker compose -f "$COMPOSE_FILE" logs actual-budget-stdio-bootstrap | tail -50
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" logs actual-budget-stdio-bootstrap | tail -50
     exit 1
   fi
 fi
@@ -241,7 +256,7 @@ log_info "Starting MCP server..."
 # Use 'create' then 'docker start' (not compose start) to avoid depends_on check.
 # `create` neither starts a dependency nor builds a missing image, which is why every service
 # this stack needs is brought up explicitly above.
-if ! docker compose -f "$COMPOSE_FILE" create mcp-server-test; then
+if ! "${COMPOSE[@]}" -f "$COMPOSE_FILE" create mcp-server-test; then
   log_error "Could not create the MCP server container"
   exit 1
 fi
@@ -289,10 +304,10 @@ export PLAYWRIGHT_PROJECT
 # Run test container with proper environment variable
 # Note: Using 'docker compose run --no-deps' to skip dependency checks (already started manually)
 if [ "$VERBOSE" = true ]; then
-  docker compose -f "$COMPOSE_FILE" run --rm --no-deps e2e-test-runner
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm --no-deps e2e-test-runner
   TEST_EXIT_CODE=$?
 else
-  docker compose -f "$COMPOSE_FILE" run --rm --no-deps e2e-test-runner 2>&1 | tee /tmp/e2e-docker-test-output.log
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm --no-deps e2e-test-runner 2>&1 | tee /tmp/e2e-docker-test-output.log
   TEST_EXIT_CODE=${PIPESTATUS[0]}
 fi
 
@@ -387,8 +402,8 @@ else
   log_info ""
   log_info "Debug tips:"
   echo "  1. Check service logs:"
-  echo "     docker compose -f $COMPOSE_FILE logs mcp-server-test"
-  echo "     docker compose -f $COMPOSE_FILE logs actual-budget-test"
+  echo "     $COMPOSE_DISPLAY -f $COMPOSE_FILE logs mcp-server-test"
+  echo "     $COMPOSE_DISPLAY -f $COMPOSE_FILE logs actual-budget-test"
   echo ""
   echo "  2. Access services directly:"
   echo "     curl http://localhost:3602/health"
