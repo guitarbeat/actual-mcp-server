@@ -22,7 +22,9 @@ tests/e2e/
 │                                         make* factories that provision and tear down test
 │                                         data. Import `test` from HERE, not @playwright/test
 ├── tsconfig.json                      ← typecheck project for this dir (npm run typecheck:e2e)
-└── docker-all-tools.e2e.spec.ts      ← Comprehensive coverage of all 81 tools; the ONLY
+├── compact-surface.e2e.spec.ts        ← the compact leg (#681): the 15-tool surface over stdio,
+│                                         project docker-e2e-compact-stdio, Step 6c
+└── docker-all-tools.e2e.spec.ts      ← Comprehensive coverage of all 85 tools; the ONLY
                                         file that carries E2E assertions (see the #366 note)
 ```
 
@@ -48,6 +50,16 @@ npm run test:e2e:docker:smoke       # ~11 tests, ~20 seconds
 ./tests/e2e/run-docker-e2e.sh full --no-cleanup
 ```
 
+The runner container installs with `npm ci --ignore-scripts` (#593): it never loads
+`@actual-app/api`, so the `better-sqlite3` native build that a plain `npm ci` would run is
+skipped and no compiler is installed in the image. When a run fails, the script prints the
+last 200 lines of the `mcp-server-test`, `actual-budget-test` and `actual-budget-stdio-test`
+containers before tearing the stack down, so a CI job log carries the server side of the
+failure as well as the runner output. In CI the run step also has its own `timeout-minutes`,
+so a stall ends the job as `failure` rather than `cancelled`. In that case nothing from the
+script's trap reaches the job log, so the workflow's cleanup step prints the same container
+logs before tearing the stack down.
+
 > **Do not use `npm run test:e2e` unless the Docker stack is already running.**
 > That command runs Playwright directly from the host and expects Docker-internal
 > hostnames (`mcp-server-test:3600`) to resolve — they won't from the host.
@@ -56,7 +68,7 @@ npm run test:e2e:docker:smoke       # ~11 tests, ~20 seconds
 
 | Context | Config file |
 |---------|------------|
-| Inside Docker network (CI) | `playwright.config.docker.ts` |
+| Inside Docker network (CI) | `tests/e2e/playwright.config.docker.ts` |
 | Host machine (rare, manual) | `playwright.config.ts` |
 
 ---
@@ -66,8 +78,9 @@ npm run test:e2e:docker:smoke       # ~11 tests, ~20 seconds
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_SERVER_URL` | `http://mcp-server-test:3600` | MCP server URL |
-| `EXPECTED_TOOL_COUNT` | `81` | Expected tool count (must match `actualToolsManager.ts`) |
+| `EXPECTED_TOOL_COUNT` | `85` | Expected tool count (must match `actualToolsManager.ts`) |
 | `USE_DOCKER_MCP_SERVER` | `true` | Set to `false` to spawn a local server (mcp-client spec only) |
+| `MCP_E2E_TOOL_SURFACE` | unset | Read by `stdio-client.ts` (#681): when set (the compact leg sets `compact`), it passes `-e MCP_TOOL_SURFACE=<value>` to the `docker exec` that starts the stdio server, so the spec sees that surface. Unset leaves the server default |
 
 ---
 
@@ -91,6 +104,16 @@ nests inside `test-results`) and a rate-limit tail on the write-heavy block (a t
 closes the budget, forcing a re-download + re-login). Run it locally with `RUN_STDIO_E2E=true`
 (ADVISORY unless `STDIO_E2E_GATING=true`); #423 fixes both, enables it in CI, and makes it gating.
 
+The compact leg (#681) is a THIRD run: `run-docker-e2e.sh` Step 6c runs `compact-surface.e2e.spec.ts`
+as the Playwright project `docker-e2e-compact-stdio`, from the HOST over stdio like step 6b, with
+`MCP_E2E_TOOL_SURFACE=compact`. It asserts the published `tools/list` is exactly the 15 compact
+tools, reads the version through `get_context`, round-trips a throwaway account through
+`manage_accounts` and `list_entities`, and checks that a direct legacy call is refused. It runs at
+the full level only and is skipped when `RUN_STDIO_E2E=false` (the script default is on), it does
+not depend on step 6b, and it shares the cool-down that drains Actual's rate-limit window. The
+per-action coverage of the compact tools lives in `docker-all-tools.e2e.spec.ts`, which calls the
+compact names on the all surface the stack runs.
+
 Both workflows invoke `npm run test:e2e:docker:full`,
 which selects the `docker-e2e-full` project, which collects that one file. Every other spec in this
 directory is a MANUAL diagnostic, and that is a decision rather than an oversight.
@@ -106,6 +129,7 @@ table below is enforced, not merely documented.
 | Spec | Runs in CI? | Why |
 |---|---|---|
 | `docker-all-tools.e2e.spec.ts` | **yes, TWICE** | the gate, over HTTP (`docker-e2e-full`) and then stdio (`docker-e2e-full-stdio`, #383) |
+| `compact-surface.e2e.spec.ts` | **yes**, Step 6c | the compact leg (#681): project `docker-e2e-compact-stdio`, stdio, `MCP_E2E_TOOL_SURFACE=compact` |
 | `mcp-client.playwright.spec.ts` | no, manual | round trip duplicated by docker-all-tools, session shim covered by `tests/unit/httpServer_session_not_found.test.js`; only the SSE connect is unique |
 | `docker.e2e.spec.ts` | no, manual | the smoke level, for fast local feedback; its assertions are a subset of docker-all-tools |
 
@@ -126,13 +150,22 @@ streaming, and session lifecycle.
 - Tests: `/health` endpoint, tool count, a handful of CRUD operations
 - Verifies the Docker image works end-to-end with a real Actual Budget connection
 
+### `compact-surface.e2e.spec.ts` (#681)
+
+**Purpose:** the default compact surface end to end: 15 tools over 85 operations.
+
+- Runs as project `docker-e2e-compact-stdio` in Step 6c of `run-docker-e2e.sh`, over stdio from the host
+- `MCP_E2E_TOOL_SURFACE=compact` makes `stdio-client.ts` start the server with `MCP_TOOL_SURFACE=compact`
+- Calls compact names, plus one deliberate legacy call (the refusal row); `tests/unit/e2e_uses_compact_names.test.js` enforces it
+- Rows: the exact 15-name `tools/list`, the `get_context` version, a `manage_accounts` create, `list_entities` read-back and delete, and the refusal
+
 ### `docker-all-tools.e2e.spec.ts`
 
-**Purpose:** Comprehensive named tests for all 81 tools: success paths plus error and negative paths.
+**Purpose:** Comprehensive named tests for all 85 tools: success paths plus error and negative paths.
 
 - Every test is **self-provisioning** (#375): it asks `fixtures.ts` for what it needs, and
   everything it creates is removed in fixture teardown, which runs even when the test fails
-- Any single test can be run alone. `npx playwright test --config playwright.config.docker.ts
+- Any single test can be run alone. `npx playwright test --config tests/e2e/playwright.config.docker.ts
   --grep 'actual_accounts_get_balance'` passes rather than skipping
 - Tests share one MCP session per worker (cached in `fixtures.ts`), but no test depends on
   DATA another test created. The file documents its one exception: the export/import round
@@ -149,7 +182,7 @@ streaming, and session lifecycle.
   templates and two agent definitions all started naming it as the place to add E2E
   coverage, so tests written there were silently inert. The directory was removed and every
   pointer now names this spec. Add E2E coverage here, and confirm it is collected with
-  `npx playwright test --list --config playwright.config.docker.ts`.
+  `npx playwright test --list --config tests/e2e/playwright.config.docker.ts`.
 
 ---
 
@@ -239,7 +272,7 @@ These rules apply to everyone adding or modifying tests in this directory.
 ### Retry behaviour
 
 - Do not add manual retry loops inside tests — Playwright's `retries: 2` (configured in both
-  `playwright.config.ts` and `playwright.config.docker.ts`) handles transient flakiness.
+  `playwright.config.ts` and `tests/e2e/playwright.config.docker.ts`) handles transient flakiness.
 - Use `retryRequest()` only for `fetch`/`request` calls, not for Playwright `test` assertions.
 
 ### Cleanup and read-back
@@ -273,7 +306,7 @@ These rules apply to everyone adding or modifying tests in this directory.
 4. If the tool creates an entity no factory covers, either add a factory to `fixtures.ts` or
    register `cleanup.add(...)` in the test itself.
 5. Confirm the test is collected AND runs alone:
-   `npx playwright test --list --config playwright.config.docker.ts`, then the same command
+   `npx playwright test --list --config tests/e2e/playwright.config.docker.ts`, then the same command
    with `--grep 'your test name'`. A test that skips when run alone has a hidden dependency.
 6. Run `npm run typecheck:e2e`. Playwright transpiles specs without typechecking them.
 

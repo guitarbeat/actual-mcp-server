@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        <!-- template-version: 5 -->
+        <!-- template-version: 6 -->
         ## Bug Report
         Please fill in all required fields so we can reproduce and assess the issue quickly.
 
@@ -110,6 +110,22 @@ body:
       required: false
 
   - type: textarea
+    id: personal_data
+    attributes:
+      label: Personal data handling
+      description: Does this bug expose, leak or mishandle personal data? If so, state all seven facts; otherwise mark N/A with the reason.
+      value: |
+        - **Personal-data fields affected:**
+        - **Storage location and encryption at rest:**
+        - **Erasure, including cascading deletion:**
+        - **Portability (export on request):**
+        - **Minimisation and retention:**
+        - **Legal basis:**
+        - **Cross-border transfer:**
+    validations:
+      required: true
+
+  - type: textarea
     id: security
     attributes:
       label: Security impact
@@ -155,19 +171,20 @@ body:
     attributes:
       label: Test scenarios (Given / When / Then)
       description: |
-        One positive ✅ and one negative ❌ scenario per condition being fixed or reviewed.
+        One positive and one negative scenario per condition being fixed or reviewed.
         For bugs fixing multiple conditions: repeat the block for each condition.
-        For revisiting existing code: scenarios must cover the *current correct* behaviour —
-        do NOT write scenarios for the new fix code itself.
+        For revisiting existing code: scenarios must cover the *current correct* behaviour.
+        Do NOT write scenarios for the new fix code itself.
+        Label each with **Positive:** or **Negative:**, use one When per scenario, and name the exact error a negative expects.
       placeholder: |
         **Condition: [name of the condition]**
 
-        ✅ Positive
+        **Positive:** [name of the case]
         - Given: [valid starting state]
         - When: [action is performed]
         - Then: [expected correct result]
 
-        ❌ Negative
+        **Negative:** [name of the case]
         - Given: [invalid or edge-case state]
         - When: [action is performed]
         - Then: [expected rejection / error message]
@@ -183,10 +200,10 @@ body:
         For revisiting existing code: confirm which existing unit tests cover the correct
         behaviour and identify any gaps to fill.
       placeholder: |
-        - [ ] Positive: `[test file]` — call with [valid input] → [expected output / field value]
-        - [ ] Negative: `[test file]` — call with [bad input] → ZodError / error message contains "[text]"
-        - [ ] Existing coverage check: `[test file]` cases [N–M] already cover [behaviour] ✅
-        - [ ] Gap found: case for [behaviour] missing — add to `[test file]`
+        - [ ] Positive (`[test file]`): call with [valid input] → [expected output / field value]
+        - [ ] Negative (`[test file]`): call with [bad input] → ZodError / error message contains "[text]"
+        - [ ] Existing coverage check: `[test file]` cases [N to M] already cover [behaviour] ✅
+        - [ ] Gap found: case for [behaviour] missing, add to `[test file]`
         - [ ] `npm run build && npm run test:unit-js` passes
     validations:
       required: false
@@ -202,25 +219,31 @@ body:
         For revisiting existing code: confirm existing E2E tests cover the correct behaviour
         and add any missing coverage.
       placeholder: |
-        - [ ] Positive: `[suite file]` — create [entity] with valid input → appears in [list call]
-        - [ ] Negative: `[suite file]` — call with [bad ID / missing field] → response contains error
+        - [ ] Positive (`[suite file]`): create [entity] with valid input → appears in [list call]
+        - [ ] Negative (`[suite file]`): call with [bad ID / missing field] → response contains error
         - [ ] Existing coverage check: `[suite file]` test "[name]" covers [behaviour] ✅
-        - [ ] Gap found: E2E for [behaviour] missing — add to `[suite file]`
+        - [ ] Gap found: E2E for [behaviour] missing, add to `[suite file]`
     validations:
       required: false
+
+  - type: textarea
+    id: docs_impact
+    attributes:
+      label: Documentation impact
+      description: Which documentation does this change affect, in the docs tree and the root README? "None" needs a reason.
+      placeholder: |
+        - **Docs affected:**
+        - **README impact:**
+        - **Why not, if none:**
+    validations:
+      required: true
 
   - type: markdown
     attributes:
       value: |
         ---
-        ## Agent Review Scores
+        ## Readiness gate
 
-        > Run `/review-ticket <issue-number>` after filing to trigger the readiness gate.
-        > All 4 agents must score **10/10** before implementation begins.
-
-        | Agent | Score | Status | Notes |
-        |---|---|---|---|
-        | tool-author | — | — | |
-        | qa | — | — | |
-        | release-manager | — | — | |
-        | actual-api | — | — | |
+        > Run `/gate-ticket <issue-number>` after filing to trigger the readiness gate.
+        > It runs mechanical checks plus one critic, with project lenses joining by label,
+        > and must return **PASS** before implementation begins.

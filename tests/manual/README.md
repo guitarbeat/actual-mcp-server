@@ -19,6 +19,8 @@ tests/manual/
 ├── cleanup.js                 ← standalone cleanup: finds and removes all
 │                                 MCP-Test-* / MCP-Cat-* / MCP-Group-* / MCP-Payee-*
 │                                 / MCP-Rule-* data left by test runs
+├── compact-calls.js           ← the compact tool calls the support code makes (listings,
+│                                 deletes, closes), one place, shapes read from src/compact/
 └── tests/
     ├── sanity.js              ← read-only protocol checks (tool count, server version, SQL, etc.)
     ├── smoke.js               ← sanity + account balances, categories, recent txns
@@ -30,6 +32,7 @@ tests/manual/
     ├── budget.js              ← budget: list/switch budgets, amounts, carryover, hold, transfer, batch
     ├── rules.js               ← rules: create (with/without op), update, delete, verify absence
     ├── schedule.js            ← schedules: get, create (one-off + recurring), update, delete, negative UUID test
+    ├── schedule_dates.js      ← schedule dates (#479): next dates, weekend move, completed, one-off, refusals
     ├── notes.js               ← notes: round-trip set/get, clear, budget-month template, orphan id guard
     ├── batch_uncategorized_rules_upsert.js
     │                          ← uncategorized txns · update_batch · rules_create_or_update (idempotency)
@@ -68,6 +71,8 @@ npm run test:integration:full
 npm run test:integration:cleanup
 ```
 
+The modules call the compact tools, so a direct `npm run test:integration:*` run against a server on the default surface (compact since #680: 15 tools; `all` publishes 100, `legacy` 85) must set `EXPECTED_TOOL_COUNT`.
+
 ### Direct invocation
 
 ```bash
@@ -93,7 +98,7 @@ node tests/manual/index.js [MCP_URL] [TOKEN] [LEVEL] [CLEANUP]
 | `MCP_AUTH_TOKEN` | Bearer token |
 | `MCP_TEST_LEVEL` | Test level |
 | `ACTUAL_SERVER_URL` | Shown in cleanup prompt (default `http://localhost:5006`) |
-| `EXPECTED_TOOL_COUNT` | Expected registered tool count (default `81`) |
+| `EXPECTED_TOOL_COUNT` | Expected registered tool count (default `85`) |
 | `MCP_TEST_BANK_SYNC` | Enable bank sync tests (default `false`, set to `true` to enable) |
 
 Variables are loaded from the project root `.env` automatically.
@@ -101,7 +106,7 @@ Variables are loaded from the project root `.env` automatically.
 ### Bank Sync Testing (Optional)
 
 The `actual_bank_sync` tool tests are **skipped by default** because they:
-- Take 30-90 seconds per bank-linked account (real provider API calls)
+- Make real provider API calls (a GoCardless account has a small daily quota)
 - Require real GoCardless or SimpleFIN credentials configured
 - Will fail immediately for budgets with only local accounts
 
@@ -120,13 +125,14 @@ MCP_TEST_BANK_SYNC=true node tests/manual/index.js http://localhost:3601/http "$
 1. **Negative path** — non-existent account UUID returns actionable error
 2. **Per-account validation** — iterates all accounts:
    - Local accounts: validates immediate error with "local account" message
-   - Bank-linked accounts: attempts sync, allows up to 90s per account
+   - Bank-linked accounts: attempts sync and checks the report (`newTransactions`, `matchedTransactions`, `updatedAccounts` as `{ count, ids }`, plus `truncated`)
+   - Closed accounts: validates the immediate "is closed" refusal
    - Rate limit/auth failures: logged but don't fail the test run
 
 **Pre-checks (always tested, even when MCP_TEST_BANK_SYNC=false):**
 - Global sync (no accountId) immediately rejects when no bank-linked accounts exist
 - Per-account sync immediately rejects local accounts before attempting provider call
-- Both validated in E2E tests ([tests/e2e/docker-all-tools.e2e.spec.ts](../e2e/docker-all-tools.e2e.spec.ts#L1002-L1065))
+- Both validated in E2E tests ([tests/e2e/docker-all-tools.e2e.spec.ts](../e2e/docker-all-tools.e2e.spec.ts#L1578-L1620))
 
 **Tip:** Use `scripts/direct-sync/bank-sync-direct.mjs` to test bank connectivity outside the MCP layer (see [scripts/README.md](../../scripts/README.md)).
 
@@ -180,7 +186,7 @@ The `cleanup` level matches on these prefixes and is safe to run repeatedly.
 const client = createClient({ url: MCP_URL, rl });
 client.setToken('Bearer abc123');
 await client.initialize();
-const accounts = await client.callTool('actual_accounts_list', {});
+const accounts = await client.callTool('list_entities', { type: 'account' });
 ```
 
 The client owns all transport state (`sessionId`, `requestId`) as closure variables.
@@ -243,7 +249,17 @@ These rules apply to everyone adding or modifying tests in this directory.
   the cleanup level can find and delete them.
 - Timestamps are generated **inside** the function that creates the entity —
   never passed in from outside.
-- Tool names follow the `actual_{domain}_{action}` convention of the MCP server.
+- Call the 15 compact tools (`list_entities`, `manage_*`, `search_transactions`, ...), never a
+  legacy `actual_*` name: the default surface refuses them. The one exception is the two session
+  tools (`actual_session_list`, `actual_session_close`), which have no compact tool;
+  `tests/advanced.js` checks `tools/list` first and prints one `skip:` line (not a failure) when
+  they are not published. The support code (`runner.js`, `residue.js`, `cleanup.js`) builds its
+  calls through `compact-calls.js`, and `tests/unit/manual_support_compact.test.js` fails when a
+  legacy name appears there or a call stops reaching its legacy tool.
+- Listings are unpaginated: a bare `list_entities type X` returns every entity, and the sweep and
+  the zero-residue assertion rely on that. Never pass `query` or `limit` to a listing they read.
+- `repro-212.mjs` and `repro-delete-guards.mjs` are hand-run reproductions of the legacy tools
+  and need a server on the `all` or `legacy` surface.
 
 ### Error handling
 - Use `try/catch` around regression tests and known-failing checks; log `✓`, `❌`,

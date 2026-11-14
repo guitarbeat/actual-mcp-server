@@ -172,6 +172,10 @@ const SENSITIVE_KEYS = new Set([
   'authorization', 'proxy-authorization', 'token', 'password', 'encryptionpassword',
   'cookie', 'set-cookie', 'secret', 'apikey', 'api_key', 'x-api-key',
   'access_token', 'refresh_token', 'client_secret',
+  // #462: the Cloudflare Access assertion header is a bearer JWT under another name.
+  // A literal here rather than the enum in oidc-token-source.ts: logger.ts loads
+  // before config.ts and must not import from the tree.
+  'cf-access-jwt-assertion',
 ]);
 
 /** A metadata key is sensitive if its lowercased name is denylisted or ends in a secret suffix. */
@@ -194,7 +198,9 @@ export function collectSecretValues(env: NodeJS.ProcessEnv = process.env): strin
     // length guard avoids masking short/common values that could collide with benign log
     // text (a short secret is still masked by KEY name when under a sensitive field; only
     // the free-text VALUE scrub is skipped for it).
-    if (typeof v === 'string' && v.length >= 8 && /(PASSWORD|SECRET|AUTHORIZATION|_TOKEN)$/.test(k)) {
+    // MCP_TOKEN_* (#572) are the static Bearer tokens MCP_STATIC_TOKENS names; MCP_TOKEN_ALICE
+    // ends in neither suffix, so the family is matched by prefix.
+    if (typeof v === 'string' && v.length >= 8 && (/(PASSWORD|SECRET|AUTHORIZATION|_TOKEN)$/.test(k) || k.startsWith('MCP_TOKEN_'))) {
       out.push(v);
     }
   }

@@ -32,10 +32,13 @@ export function getCanonicalCount() {
 // In-scope files. NOT package.json and NOT the `**Tool Count:**` markers (version-bump.js owns those).
 const FILES = [
   'README.md', 'CLAUDE.md', '.github/copilot-instructions.md',
-  'docs/ARCHITECTURE.md', 'docs/guides/AI_CLIENT_SETUP.md', 'docs/TESTING_AND_RELIABILITY.md', 'docs/audit/FORK_ANALYSIS.md',
-  '.github/CONTRIBUTING.md', 'docker/description/long.md', 'docker/description/short.md', 'src/lib/constants.ts',
+  'docs/explanation/architecture.md', 'docs/guides/clients/README.md', 'docs/guides/clients/librechat.md', 'docs/guides/clients/lobechat.md', 'docs/development/testing-and-reliability.md', 'docs/audit/FORK_ANALYSIS.md',
+  '.github/CONTRIBUTING.md', 'docker/description/short.md', 'src/lib/constants.ts',
   'tests/manual/tests/sanity.js', 'tests/manual/runner.js', 'tests/e2e/README.md', 'tests/manual/README.md',
   'tests/e2e/docker-all-tools.e2e.spec.ts',
+  // #601: the Unraid templates state the whole-server total in plain XML prose and sat at 71
+  // while IMPLEMENTED_TOOLS grew, because this scan could not see them. Both are tracked.
+  'unraid/actual-mcp-server.xml', 'ca_profile.xml',
   // Two more files that state the whole-server total in prose and drifted unseen because
   // the scan could not reach them: a header comment in the shared Zod schemas ("across
   // the N tool definitions") and the semver rationale comment in the train pre-flight
@@ -47,6 +50,31 @@ const FILES = [
   // IMPLEMENTED_TOOLS was 74, because this scan could not see `.claude/skills/**` (#377
   // review, L8).
   '.claude/skills/api-design-principles/SKILL.md',
+  // CLAUDE.md was split on 2026-10-01 to shrink the always-loaded context: topic detail
+  // moved verbatim into non-imported files under .claude/reference/. Two of them carry
+  // total-count prose (the release train's "N-tool contract" and the skills table's
+  // "N-tool MCP surface"), so they stay in scope or those anchors stop being checked.
+  '.claude/reference/release-and-deps.md',
+  '.claude/reference/agents-and-skills.md',
+];
+
+/**
+ * Files in FILES that the leak guard keeps OUT of the repository (see the "leak-guard
+ * baseline" block in .gitignore): assistant instruction files at the root and everything
+ * under .claude/ are untracked by class, not by content, so a fresh checkout (CI) never
+ * has them while a developer's working copy does. They stay in scope so a local run keeps
+ * the working copy in sync, but an ABSENT one is a loud skip rather than a failure, and a
+ * pattern whose only anchor lives in one of them (`localOnly: true` below) cannot be
+ * reported stale when the file is missing. Before this, `Run Tests` went red on every
+ * push after the files were ignored: seven anchors "matched nothing" for the sole reason
+ * that the files holding them were not checked out.
+ */
+export const LOCAL_ONLY_FILES = [
+  'CLAUDE.md',
+  '.github/copilot-instructions.md',
+  '.claude/skills/api-design-principles/SKILL.md',
+  '.claude/reference/release-and-deps.md',
+  '.claude/reference/agents-and-skills.md',
 ];
 
 /**
@@ -60,28 +88,29 @@ export const TOTAL_PATTERNS = [
   { re: /\ball (\d{2,3}) tools\b/gi, label: 'all N tools' },
   // The api-design-principles skill states the total in its frontmatter `description:`,
   // which the phrasings above do not match, so it drifted silently.
-  { re: /(\d{2,3})-tool set\b/g, label: 'N-tool set' },
-  { re: /\*\*(\d{2,3}) tools\*\* across/g, label: '**N tools** across' },
-  { re: /\*\*(\d{2,3}) tools\*\* listed/g, label: '**N tools** listed' },
+  { re: /(\d{2,3})-tool set\b/g, label: 'N-tool set', localOnly: true },
+  // #680: the headline is "15 tools over 85 operations" now. The operation count is the
+  // total this guard pins to IMPLEMENTED_TOOLS; the 15 is the compact registry size, which
+  // compact_default_surface.test.js and the e2e specs pin against COMPACT_TOOLS.
+  // #680 retired six anchors whose phrasings the compact default rewrote ("**N tools** across/listed",
+  // "N tools loaded with", "should list N tools", "Budget: N tools", the ASCII diagram count): a
+  // dead anchor fails tool_count_sync, and the client guides now state the compact registry size.
+  { re: /\btools over (\d{2,3}) operations\b/g, label: 'N tools over M operations (M is the total)' },
   { re: /E2E \((\d{2,3}) tools\)/g, label: 'E2E (N tools)' },
   { re: /\b(\d{2,3})\/\1 tools\b/g, label: 'N/N tools (equal halves only)' },
-  { re: /(\d{2,3}) tools, the most comprehensive/gi, label: 'N tools, most comprehensive' },
-  { re: /\*\*(\d{2,3}) tools, the most comprehensive/gi, label: 'why-project bullet' },
-  { re: /(\d{2,3}) tools tested end-to-end/gi, label: 'N tools tested end-to-end' },
+  // #601: the two Unraid XML phrasings (ca_profile.xml <Profile>, template <Overview> and <Description>).
+  { re: /exposing (\d{2,3}) tools for/gi, label: 'exposing N tools for (Unraid XML)' },
+  { re: /server with (\d{2,3}) tools for/gi, label: 'server with N tools for (Unraid XML)' },
   { re: /(\d{2,3}) tools organized by category/gi, label: 'N tools organized by category' },
   { re: /(\d{2,3}) tools registered/gi, label: 'N tools registered' },
   { re: /Registers (\d{2,3}) tools/g, label: 'Registers N tools' },
-  { re: /(?:exposing|providing|exposes|provides) \*\*(\d{2,3}) tools\*\*/gi, label: 'exposing **N tools**' },
-  { re: /should list (\d{2,3}) tools/gi, label: 'should list N tools' },
-  { re: /\((\d{2,3}) tools in IMPLEMENTED_TOOLS/g, label: '(N tools in IMPLEMENTED_TOOLS' },
-  { re: /\((\d{2,3}) tools, Zod/g, label: '(N tools, Zod' },
+  { re: /(?:exposing|providing|exposes|provides) \*\*(\d{2,3}) tools\*\*/gi, label: 'exposing **N tools**', localOnly: true },
+  { re: /\((\d{2,3}) tools in IMPLEMENTED_TOOLS/g, label: '(N tools in IMPLEMENTED_TOOLS', localOnly: true },
+  { re: /\((\d{2,3}) tools, Zod/g, label: '(N tools, Zod', localOnly: true },
   { re: /\((\d{2,3}) tools \+ index/g, label: '(N tools + index' },
-  { re: /Production-ready, (\d{2,3}) tools/g, label: 'Production-ready, N tools' },
-  { re: /(\d{2,3}) tools implemented/g, label: 'N tools implemented' },
+  { re: /Production-ready, (\d{2,3}) tools/g, label: 'Production-ready, N tools', localOnly: true },
+  { re: /(\d{2,3}) tools implemented/g, label: 'N tools implemented', localOnly: true },
   { re: /tool definitions \((\d{2,3}) tools\)/g, label: 'tool definitions (N tools)' },
-  { re: /│\s*\((\d{2,3}) tools\)/g, label: 'ASCII diagram (N tools)' },
-  { re: /(\d{2,3}) tools loaded with/g, label: 'N tools loaded with' },
-  { re: /Budget: (\d{2,3}) tools/g, label: 'Budget: N tools (short desc)' },
   { re: /(\d{2,3}) tools smoke validation/gi, label: 'N tools smoke validation' },
   { re: /(\d{2,3}) tools execute successfully/gi, label: 'N tools execute successfully' },
   { re: /(\d{2,3}) tools[:)] (?:stub|response-shape| stub|registered correctly)/gi, label: 'N tools: stub (TESTING)' },
@@ -93,12 +122,11 @@ export const TOTAL_PATTERNS = [
   { re: /across (\d{2,3}) tools/g, label: 'across N tools' },
   // TOTAL forms that carry no lowercase " tools" token, so neither the anchors above
   // nor the advisory scan caught them: a comparison-table cell, the hyphenated
-  // "N-tool smoke" phrasing, the Docker Hub description headings, and two TESTING
-  // table cells (a "+ shape checks" count and an "N/N" coverage cell without "tools").
+  // "N-tool smoke" phrasing, and two TESTING table cells (a "+ shape checks" count and
+  // an "N/N" coverage cell without "tools"). #607 removed the Docker Hub heading
+  // anchors with docker/description/long.md, the only file they matched.
   // All are whole-server totals; none can match a single-digit per-domain subset.
   { re: /(\d{2,3})-tool smoke/gi, label: 'N-tool smoke (hyphenated)' },
-  { re: /\*\*(\d{2,3}) Implemented Tools\*\*/g, label: '**N Implemented Tools** (docker)' },
-  { re: /Available Tools \((\d{2,3}) Total\)/g, label: 'Available Tools (N Total) (docker)' },
   { re: /\| (\d{2,3}) \+ shape checks/g, label: 'N + shape checks (TESTING cell)' },
   { re: /\| (\d{2,3})\/\1 \|/g, label: 'N/N table cell (no tools word)' },
   // Hyphenated TOTAL forms describing the SURFACE or the semver CONTRACT, plus the
@@ -107,7 +135,7 @@ export const TOTAL_PATTERNS = [
   // only report them: CLAUDE.md said 71 and copilot-instructions.md said 63 while
   // IMPLEMENTED_TOOLS was 77.
   { re: /(\d{2,3})-tool MCP surface/g, label: 'N-tool MCP surface' },
-  { re: /(\d{2,3})-tool contract/g, label: 'N-tool contract' },
+  { re: /(\d{2,3})-tool contract/g, label: 'N-tool contract', localOnly: true },
   { re: /(\d{2,3}) tool definitions/g, label: 'N tool definitions' },
   // EXPECTED_TOOL_COUNT numeric spots (only where a number is present)
   { re: /EXPECTED_TOOL_COUNT \|\| '(\d{2,3})'/g, label: "EXPECTED_TOOL_COUNT || 'N'" },
@@ -127,10 +155,14 @@ export function analyze() {
   const drift = [];
   const matchedSpans = new Map(); // file -> array of [start,end]
   const patternHits = new Map(); // label -> count
+  const skipped = []; // local-only files absent from this checkout
 
   for (const file of FILES) {
     const p = abs(file);
-    if (!existsSync(p)) continue;
+    if (!existsSync(p)) {
+      if (LOCAL_ONLY_FILES.includes(file)) skipped.push(file);
+      continue;
+    }
     const content = readFileSync(p, 'utf8');
     matchedSpans.set(file, []);
     for (const { re, label } of TOTAL_PATTERNS) {
@@ -151,7 +183,11 @@ export function analyze() {
   }
 
   // Stale-anchor guard: a pattern that matched nothing anywhere is dead and may be hiding drift.
-  const stale = TOTAL_PATTERNS.filter((p) => !patternHits.has(p.label)).map((p) => ({ label: p.label }));
+  // A `localOnly` pattern is exempt while a local-only file is absent: its anchor was not
+  // scanned, so "matched nothing" says nothing about the rule.
+  const stale = TOTAL_PATTERNS
+    .filter((p) => !patternHits.has(p.label) && !(p.localOnly && skipped.length > 0))
+    .map((p) => ({ label: p.label }));
 
   // Advisory: any `N tools` in an in-scope file not covered by a TOTAL anchor (likely a subset, but flag for awareness).
   const unclassified = [];
@@ -171,7 +207,7 @@ export function analyze() {
       }
     }
   }
-  return { canonical, drift, stale, unclassified };
+  return { canonical, drift, stale, unclassified, skipped };
 }
 
 export function applyFix() {
@@ -208,8 +244,12 @@ if (isMain) {
     console.log(`tool-count: canonical=${after.canonical}, applied ${n} fix(es). Drift now: ${after.drift.length}.`);
     process.exit(after.drift.length === 0 ? 0 : 1);
   }
-  const { canonical, drift, stale, unclassified } = analyze();
+  const { canonical, drift, stale, unclassified, skipped } = analyze();
   console.log(`tool-count: canonical=${canonical}`);
+  if (skipped.length) {
+    console.log(`\nSKIPPED (local-only governance files, untracked by the leak guard; scanned only where present):`);
+    for (const f of skipped) console.log(`  ${f}`);
+  }
   if (unclassified.length) {
     console.log(`\nAdvisory (unclassified "N tools", not enforced, likely subsets):`);
     for (const u of unclassified) console.log(`  ${u.file}:${u.line}  ${u.context}`);

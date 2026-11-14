@@ -4,10 +4,15 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { randomUUID } from 'node:crypto';
 import logger from '../logger.js';
+import { attachTransportErrorLogger } from '../lib/transportErrorLogger.js';
+import { SERVER_NAME } from '../lib/mcp-version.js';
 import actualToolsManager from '../actualToolsManager.js';
 import { requestContext } from '../lib/requestContext.js';
 import type { ActualMCPConnection } from '../lib/ActualMCPConnection.js';
 import { buildToolListEntries } from '../lib/tool-list-entry.js';
+import { registerPromptHandlers } from '../lib/promptHandlers.js';
+import type { PromptDefinition } from '../prompts/registry.js';
+import { executeAndFrame } from '../lib/tool-output.js';
 import { classifyInitFailure, isInitFailure } from '../lib/init-failure.js';
 
 /**
@@ -51,12 +56,10 @@ export function createStdioCallToolHandler(mcp: ActualMCPConnection, stdioSessio
     //     still denies. Fail closed: a local pipe must not gain budget access an
     //     HTTP caller would need an ACL for.
     try {
-      const result = await requestContext.run({ sessionId: stdioSessionId, transport: 'stdio' }, () =>
-        (mcp as unknown as { executeTool: (n: string, a?: unknown) => Promise<unknown> }).executeTool(rawName, args ?? {}),
+      // #642: one shared framing (text block, plus structuredContent for a covered tool).
+      return await requestContext.run({ sessionId: stdioSessionId, transport: 'stdio' }, () =>
+        executeAndFrame(mcp, rawName, args ?? {}),
       );
-      return {
-        content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }],
-      };
     } catch (err) {
       // #452: give a FAILED CONNECTION the same named causes an HTTP client gets. Until this,
       // stdio let the raw upstream sentence through, and for the #427 case that sentence
@@ -92,10 +95,14 @@ export async function startStdioServer(
   mcp: ActualMCPConnection,
   capabilities: Record<string, object>,
   implementedTools: string[],
-  serverDescription: string,
-  serverInstructions: string,
+  // #624: no longer the serverInfo name; kept so the positional signature matches HTTP.
+  _serverDescription: string,
+  instructions: string,
   toolSchemas: Record<string, unknown>,
   version: string,
+  outputSchemas: Record<string, unknown> = {},
+  // #660: resolved once in index.ts; LAST and defaulted so existing positional callers still compile.
+  offeredPrompts: readonly PromptDefinition[] = [],
 ): Promise<void> {
   const toolsList = Array.isArray(implementedTools) ? implementedTools : [];
 
@@ -122,9 +129,10 @@ export async function startStdioServer(
   logger.debug(`[STDIO] session id ${stdioSessionId}`);
 
   const server = new Server(
-    { name: serverDescription || 'actual-mcp-server', version: version || '0.1.0' },
-    { capabilities, instructions: serverInstructions }
+    { name: SERVER_NAME, version: version || '0.1.0' },
+    { capabilities, instructions }
   );
+  attachTransportErrorLogger(server, 'stdio');
 
   // List tools handler — mirrors createServerInstance() in httpServer.ts
   server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -136,10 +144,13 @@ export async function startStdioServer(
       schema:
         (toolSchemas && toolSchemas[name]) ||
         (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name),
+      outputSchema: Object.hasOwn(outputSchemas, name) ? outputSchemas[name] : undefined,
     }));
     logger.debug(`[STDIO] tools/list → ${tools.length} tools`);
     return { tools };
   });
+
+  registerPromptHandlers(server, offeredPrompts);
 
   // Call tool handler — delegates to ActualMCPConnection.executeTool()
   server.setRequestHandler(CallToolRequestSchema, createStdioCallToolHandler(mcp, stdioSessionId));

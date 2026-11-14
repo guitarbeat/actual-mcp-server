@@ -58,9 +58,11 @@ const projectRoot = resolve(__dirname, '..', '..');
 try {
   const dotenv = await import('dotenv');
   // Load script-local .env first (test/override credentials), then project root .env.
-  // Later calls do NOT overwrite vars already set by earlier calls (dotenv default).
-  dotenv.config({ path: resolve(__dirname, '.env') });
-  dotenv.config({ path: resolve(projectRoot, '.env') });
+  // Later calls do NOT overwrite vars already set by earlier calls: override is pinned to false
+  // so that holds even when DOTENV_OVERRIDE=true is exported, and every other option is pinned
+  // too so no DOTENV_* variable changes what loads (#505).
+  dotenv.config({ quiet: true, debug: false, override: false, encoding: 'utf8', fast: false, path: resolve(__dirname, '.env') });
+  dotenv.config({ quiet: true, debug: false, override: false, encoding: 'utf8', fast: false, path: resolve(projectRoot, '.env') });
 } catch {
   // dotenv not installed — fine, env vars must be set another way
 }
@@ -217,7 +219,8 @@ async function syncAccount(api, account, timeoutMs, logger) {
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error(`Timeout after ${timeoutMs / 1000}s`)), timeoutMs)
     );
-    await Promise.race([syncPromise, timeoutPromise]);
+    // Since @actual-app/api 26.11 the sync resolves with what it reconciled (#548).
+    const report = await Promise.race([syncPromise, timeoutPromise]);
 
     // Small delay for SDK background operations (pattern from Actual-sync)
     await new Promise(resolve => setTimeout(resolve, 600));
@@ -228,7 +231,16 @@ async function syncAccount(api, account, timeoutMs, logger) {
     }
 
     result.status = 'success';
-    await logger.info(`  ✓ Bank sync completed`, { account: account.name });
+    const count = (k) => (Array.isArray(report?.[k]) ? report[k].length : 0);
+    result.newTransactions = count('newTransactions');
+    result.matchedTransactions = count('matchedTransactions');
+    result.updatedAccounts = count('updatedAccounts');
+    await logger.info(`  ✓ Bank sync completed`, {
+      account: account.name,
+      newTransactions: result.newTransactions,
+      matchedTransactions: result.matchedTransactions,
+      updatedAccounts: result.updatedAccounts,
+    });
   } catch (err) {
     const msg = err?.message || String(err);
     const category = err?.category || '';

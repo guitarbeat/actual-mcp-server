@@ -8,18 +8,25 @@
 // it runs deterministically on any Node and never depends on installed node_modules.
 //
 // Canonical sources:
-//   - TypeScript / MCP / Node badges  -> the DECLARED package.json ranges
-//     (devDependencies.typescript, dependencies["@modelcontextprotocol/sdk"], engines.node)
+//   - TypeScript / Node badges        -> the DECLARED package.json ranges
+//     (devDependencies.typescript, engines.node)
 //   - "up to N concurrent sessions"   -> the .default('N') literal of MAX_CONCURRENT_SESSIONS
 //     in src/config.ts
 //   - "N attempts, exponential backoff" -> DEFAULT_RETRY_ATTEMPTS in src/lib/constants.ts
 //   - coverage claim                  -> de-hardcoded: the README must carry NO "NN% ... Actual
 //     Budget API" literal (a rotting percentage), the gaps are reported by check:coverage.
 //
+//   - (#603) tool-surface numbers       -> the README tools-summary block, generated from
+//     dist/src/lib/toolsets.js by `npm run docs:gen` (scripts/docs/tools.mjs). The three #601
+//     bridge checks (ActualQL bullet, toolset table sum, write-capable count) are retired or
+//     retargeted: the ActualQL number and the domain heading numbers no longer exist, the
+//     table and write count are generated, and handTypedCounts below forbids re-typing them
+//     anywhere else.
+//
 // Run: node tests/unit/readme_stats_sync.test.js
 
 import assert from 'assert';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -46,7 +53,6 @@ const major = (range) => versionSegments(range, 1);
 const pkg = JSON.parse(read('package.json'));
 const CANON = {
   ts: majorMinor(pkg.devDependencies.typescript),                       // "6.0"
-  mcp: majorMinor(pkg.dependencies['@modelcontextprotocol/sdk']),       // "1.29"
   node: major(pkg.engines.node),                                        // "22"
 };
 
@@ -76,10 +82,6 @@ function badgeMismatches(readme, canon) {
   const ts = readme.match(/TypeScript-([0-9.]+)-/);
   if (!ts) out.push('TypeScript badge not found');
   else if (ts[1] !== canon.ts) out.push(`TypeScript badge ${ts[1]} != package.json ${canon.ts}`);
-
-  const mcp = readme.match(/badge\/MCP-([0-9.]+)-/);
-  if (!mcp) out.push('MCP badge not found');
-  else if (mcp[1] !== canon.mcp) out.push(`MCP badge ${mcp[1]} != package.json ${canon.mcp}`);
 
   const node = readme.match(/node-%3E%3D([0-9]+)/);
   if (!node) out.push('Node badge not found');
@@ -119,7 +121,7 @@ function coveragePercentLiteral(readme) {
 
 // #241: the README prose must not hardcode a dependency version that drifts from package.json
 // (the guarded badges already convey them). Returns every unguarded dependency-version literal
-// found. The version-bearing badges use a hyphen ("TypeScript-6.0", "MCP-1.29"), and bare
+// found. The version-bearing badges use a hyphen ("TypeScript-6.0"), and bare
 // package-name mentions carry no version, so neither is matched here.
 function dependencyVersionLiterals(readme) {
   const patterns = [
@@ -132,11 +134,54 @@ function dependencyVersionLiterals(readme) {
   return hits;
 }
 
+// ----- #603: hand-typed tool-surface counts are forbidden outside the generated block -----
+
+// #668: strip only the blocks whose numbers are generated (tools-summary, capabilities-sizes).
+// The other capabilities blocks embed hand-written summary, examplePrompt and prompt description
+// text from src/, so they stay in the hand-typed-count scan.
+const BLOCK_RE = /<!-- BEGIN GENERATED: (tools-summary|capabilities-sizes) -->[\s\S]*?<!-- END GENERATED: \1 -->/g;
+const HAND_TYPED = [
+  /\d+ write-capable/,
+  /\(\d+ of the \d+/,
+  /\d+ tools remain/,
+  /leaving \d+/,
+  /publishes \d+ tools/,
+  /\(\d+ tools, about/,
+  /\d+ exclusive ActualQL-powered/,
+  /ActualQL-powered \(\d+\)/,
+];
+
+// Pure: the findings for one file's text. The README block is stripped first because it is
+// where those numbers legitimately live (generated).
+function handTypedCounts(file, text) {
+  const body = text.replace(BLOCK_RE, '');
+  const out = [];
+  for (const re of HAND_TYPED) {
+    const m = body.match(re);
+    if (m) out.push(`hand-typed tool-surface count in ${file}: "${m[0]}" (the README tools-summary block owns it)`);
+  }
+  return out;
+}
+
+// The configuration reference, the security doc and every client page (#606), listed from the
+// directory so a new client page is scanned without editing this list.
+const COUNT_FILES = [
+  'README.md',
+  '.env.example',
+  'docs/reference/configuration.md',
+  'docs/explanation/security-and-privacy.md',
+  'unraid/actual-mcp-server.xml',
+  ...readdirSync(join(ROOT, 'docs/guides/clients'))
+    .filter((f) => f.endsWith('.md'))
+    .sort()
+    .map((f) => `docs/guides/clients/${f}`),
+];
+
 console.log('\n[readme-stats-sync]');
 
 const README = read('README.md');
 
-check('TypeScript / MCP / Node badges match the declared package.json versions', () => {
+check('TypeScript / Node badges match the declared package.json versions', () => {
   const bad = badgeMismatches(README, CANON);
   assert.strictEqual(bad.length, 0, `badge drift: ${bad.join('; ')}`);
 });
@@ -164,11 +209,21 @@ check('README prose carries no unguarded dependency-version literal (de-hardcode
     `README hardcodes dependency version(s) that can drift from package.json: ${hits.join('; ')}`);
 });
 
+
+check('(#603) no hand-typed tool-surface count outside the generated block', () => {
+  const found = [];
+  for (const file of COUNT_FILES) {
+    let text;
+    try { text = read(file); } catch { assert.fail(`handTypedCounts: ${file} not found`); }
+    found.push(...handTypedCounts(file, text));
+  }
+  assert.deepStrictEqual(found, []);
+});
+
 // ----- NEGATIVE in-test fixtures: prove each comparator flags synthetic drift -----
 
 check('NEGATIVE: a drifted TypeScript badge is detected by badgeMismatches', () => {
   const fixture = '[![TypeScript](https://img.shields.io/badge/TypeScript-4.0-blue)] '
-    + '[![MCP](https://img.shields.io/badge/MCP-1.29-orange)] '
     + '[![Node](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen)]';
   const bad = badgeMismatches(fixture, CANON);
   assert.ok(
@@ -203,9 +258,47 @@ check('NEGATIVE: reintroduced unguarded dependency-version literals are detected
 
 check('POSITIVE: bare package-name mentions and the hyphenated badges are NOT flagged', () => {
   const hits = dependencyVersionLiterals(
-    'The `@actual-app/api` library downloads data. badge/TypeScript-6.0-blue badge/MCP-1.29-orange',
+    'The `@actual-app/api` library downloads data. badge/TypeScript-6.0-blue',
   );
   assert.deepStrictEqual(hits, [], `comparator must not false-positive on bare names/badges, got ${JSON.stringify(hits)}`);
+});
+
+const FIXTURES = [
+  ['the 48 write-capable tools', '48 write-capable'],
+  ['hides (48 of the 84, including x)', '(48 of the 84'],
+  ['and 36 tools remain.', '36 tools remain'],
+  ['hides them, leaving 36.', 'leaving 36'],
+  ['the preset publishes 12 tools', 'publishes 12 tools'],
+  ['# (12 tools, about a quarter', '(12 tools, about'],
+  ['- **8 exclusive ActualQL-powered tools.**', '8 exclusive ActualQL-powered'],
+  ['**Exclusive ActualQL-powered (8)**', 'ActualQL-powered (8)'],
+];
+for (const [fixture, literal] of FIXTURES) {
+  check(`NEGATIVE: handTypedCounts flags "${literal}"`, () => {
+    assert.deepStrictEqual(handTypedCounts('.env.example', fixture), [
+      `hand-typed tool-surface count in .env.example: "${literal}" (the README tools-summary block owns it)`,
+    ]);
+  });
+}
+
+check('POSITIVE: the generated block is stripped before scanning', () => {
+  const text = 'x\n<!-- BEGIN GENERATED: tools-summary -->\nhides 48 write-capable tools and leaves 36\n<!-- END GENERATED: tools-summary -->\ny';
+  assert.deepStrictEqual(handTypedCounts('README.md', text), []);
+  assert.strictEqual(handTypedCounts('README.md', text + ' the 48 write-capable').length, 1);
+});
+
+check('(#668) POSITIVE: a count inside a generated-number block is not reported; hand-written capabilities text is still scanned', () => {
+  const inside = 'x\n<!-- BEGIN GENERATED: capabilities-sizes -->\nthe surface publishes 6 tools\n<!-- END GENERATED: capabilities-sizes -->\ny';
+  assert.deepStrictEqual(handTypedCounts('README.md', inside), []);
+  assert.strictEqual(handTypedCounts('README.md', inside + '\nit publishes 6 tools').length, 1);
+  const spec = '<!-- BEGIN GENERATED: capabilities-tools -->\nthe surface publishes 6 tools\n<!-- END GENERATED: capabilities-tools -->';
+  assert.strictEqual(handTypedCounts('README.md', spec).length, 1);
+  assert.strictEqual(handTypedCounts('README.md', 'it publishes 6 tools').length, 1);
+});
+
+check('(#668) NEGATIVE: a mismatched END id does not hide a count', () => {
+  const text = '<!-- BEGIN GENERATED: capabilities-sizes -->\npublishes 6 tools\n<!-- END GENERATED: tools-summary -->';
+  assert.strictEqual(handTypedCounts('README.md', text).length, 1);
 });
 
 console.log(`\n[readme-stats-sync] Results: ${passed} passed, ${failed} failed`);

@@ -5,6 +5,7 @@ import actualToolsManager from '../actualToolsManager.js';
 import adapter from './actual-adapter.js';
 import { z } from 'zod';
 import { buildToolListEntries } from './tool-list-entry.js';
+import { outputJsonSchema, type CheckedToolResult } from './tool-output.js';
 
 
 /**
@@ -49,20 +50,19 @@ export class ActualMCPConnection extends EventEmitter {
     // If actualToolsManager is not ready, return demo tools
     let tools;
     try {
-      const toolNames = actualToolsManager.getToolNames();
+      const toolNames = actualToolsManager.getPublishedToolNames();
       tools = toolNames.map((name) => {
         const tool = actualToolsManager.getTool(name);
         if (!tool) {
           throw new Error(`Tool not found: ${name}`);
         }
-        // Add examples if present on the tool
-        return {
-          ...buildToolListEntries([tool.name], () => ({
-            description: tool.description,
-            schema: tool.inputSchema ? z.toJSONSchema(tool.inputSchema as any) : undefined,
-          }))[0],
-          title: tool.name,
-        };
+        // The title comes from the shared builder (#641); overriding it here with the
+        // programmatic name would undo that for every client of this path.
+        return buildToolListEntries([tool.name], () => ({
+          description: tool.description,
+          schema: tool.inputSchema ? z.toJSONSchema(tool.inputSchema as any) : undefined,
+          outputSchema: outputJsonSchema(tool),
+        }))[0];
       });
     } catch (e) {
       // fallback to demo tools
@@ -97,10 +97,9 @@ export class ActualMCPConnection extends EventEmitter {
         list: tools,
       },
       resources: false,
-      prompts: false,
+      prompts: { listChanged: false },
       models: false,
       logging: false,
-      serverInstructions: 'This server exposes Actual Finance tools via MCP. You must provide ACTUAL_SERVER_URL, ACTUAL_BUDGET_SYNC_ID, and either ACTUAL_PASSWORD or ACTUAL_SESSION_TOKEN as environment variables.'
     };
   }
 
@@ -132,6 +131,14 @@ export class ActualMCPConnection extends EventEmitter {
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
+  }
+
+  /** executeTool plus the outputSchema verdict (#642); the transports frame the result from it. */
+  async executeToolChecked(toolName: string, params: unknown): Promise<CheckedToolResult> {
+    if (actualToolsManager && typeof actualToolsManager.callToolChecked === 'function') {
+      return await actualToolsManager.callToolChecked(toolName, params);
+    }
+    return { value: await this.executeTool(toolName, params) };
   }
 
   /** Optional shutdown logic */

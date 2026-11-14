@@ -4,42 +4,20 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import actualToolsManager from '../actualToolsManager.js';
-import { INSTALLED_API_VERSION, resolveInstalledVersion } from '../lib/installed-api-version.js';
-
-/** Resolved once at module load, not per call: the walk does blocking file reads
- *  and this tool can be called in a loop. The SDK exports no root path, so the
- *  resolvable subpath is passed explicitly (#445). */
-const MCP_SDK_RESOLVED = resolveInstalledVersion('@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk/server/index.js');
+import { collectVersionAndToolFacts } from '../lib/startupRecord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Read version from environment variable (set during Docker build) or package.json
-let packageInfo: { version: string; name: string; description: string; dependencies?: Record<string, string> };
+// Name, description and declared dependencies come from package.json. The version does
+// NOT: it comes from getMcpServerVersion() at call time (#541), so it matches the MCP
+// initialize version and importing the tool registry never spawns git.
+let packageInfo: { name: string; description: string; dependencies?: Record<string, string> };
 try {
   const packagePath = join(__dirname, '../../../package.json');
-  const packageJson = readFileSync(packagePath, 'utf-8');
-  packageInfo = JSON.parse(packageJson);
-  
-  // Use VERSION environment variable if available (set by Docker build or CI/CD)
-  // This includes development metadata like: 0.2.4-dev-abc1234
-  if (process.env.VERSION && process.env.VERSION !== 'unknown') {
-    packageInfo.version = process.env.VERSION;
-  } else {
-    // Fallback: Try to append git commit hash for local development builds
-    try {
-      const { execSync } = require('child_process');
-      const branch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8', cwd: join(__dirname, '../../..') }).trim();
-      const commitHash = execSync('git rev-parse --short HEAD', { encoding: 'utf8', cwd: join(__dirname, '../../..') }).trim();
-      if (branch === 'develop' || branch === 'development' || branch !== 'main') {
-        packageInfo.version = `${packageInfo.version}-dev-${commitHash}`;
-      }
-    } catch (gitErr) {
-      // Git not available or not in a git repo, use package.json version as-is
-    }
-  }
+  packageInfo = JSON.parse(readFileSync(packagePath, 'utf-8'));
 } catch (error) {
-  packageInfo = { version: 'unknown', name: 'actual-mcp-server', description: 'MCP server for Actual Budget' };
+  packageInfo = { name: 'actual-mcp-server', description: 'MCP server for Actual Budget' };
 }
 
 const InputSchema = z.object({}).strict();
@@ -62,16 +40,23 @@ Use this to check server status, verify version compatibility, or debug issues.`
   call: async (_args: unknown, _meta?: unknown) => {
     const uptime = process.uptime();
     const uptimeFormatted = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`;
-    
+    const policy = actualToolsManager.getToolPolicy();
+    // #623: the same resolved versions and counts the sys_startup record logs.
+    const facts = collectVersionAndToolFacts({
+      published: actualToolsManager.getPublishedToolNames().length,
+      registered: actualToolsManager.getToolNames().length,
+      policy,
+    });
+
     return {
       server: {
         name: packageInfo.name,
-        version: packageInfo.version,
+        version: facts.versions.server,
         description: packageInfo.description,
         transport: process.env.MCP_STDIO_MODE === 'true' ? 'stdio' : 'http',
       },
       runtime: {
-        node: process.version,
+        node: facts.versions.node,
         platform: process.platform,
         arch: process.arch,
       },
@@ -88,8 +73,8 @@ Use this to check server status, verify version compatibility, or debug issues.`
       dependencies: {
         mcpSdk: packageInfo.dependencies?.['@modelcontextprotocol/sdk'] ?? 'unknown',
         actualApi: packageInfo.dependencies?.['@actual-app/api'] ?? 'unknown',
-        ...(MCP_SDK_RESOLVED ? { mcpSdkResolved: MCP_SDK_RESOLVED } : {}),
-        ...(INSTALLED_API_VERSION ? { actualApiResolved: INSTALLED_API_VERSION } : {}),
+        ...(facts.versions.mcpSdk ? { mcpSdkResolved: facts.versions.mcpSdk } : {}),
+        ...(facts.versions.actualApi ? { actualApiResolved: facts.versions.actualApi } : {}),
       },
       status: {
         uptime: uptimeFormatted,
@@ -100,7 +85,11 @@ Use this to check server status, verify version compatibility, or debug issues.`
         },
       },
       tools: {
-        total: actualToolsManager.getToolNames().length,
+        // total is what this process PUBLISHES; registered is what exists. They differ
+        // when MCP_TOOLSETS, MCP_TOOLS or MCP_READ_ONLY narrows the surface (#483).
+        total: facts.tools.total,
+        registered: facts.tools.registered,
+        policy,
       },
     };
   },

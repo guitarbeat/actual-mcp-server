@@ -66,14 +66,47 @@ export function isTestRule(rule) {
   return conditions.some((c) => String(c?.value ?? '').startsWith(RULE_MARKER_PREFIX));
 }
 
+import { LISTING_KEY, listCall, listingLabel, accountTransactionsCall, remove } from './compact-calls.js';
+
 const list = (x) => (Array.isArray(x) ? x : Array.isArray(x?.result) ? x.result : []);
+
+// #584: three listings return their array under their own key (LISTING_KEY in compact-calls.js),
+// and both test clients pass that shape through unchanged (unwrapToolResult strips only
+// `result`). Reading them through `list` alone saw `[]`, so a leaked group, schedule or rule was
+// invisible to the sweep and to the zero-residue assertion. A key is read only from the type
+// that returns it. #680: listings are list_entities calls by `type`; see compact-calls.js.
+
+/**
+ * The array a listing returned, or null when its reply is not a listing.
+ *
+ * #583: null means UNREADABLE (error text, null, another object, a foreign key), never
+ * empty. Decided by shape, not message text, so a new error wording cannot read as clean.
+ */
+function readListing(type, x) {
+  if (Array.isArray(x)) return x;
+  if (Array.isArray(x?.result)) return x.result;
+  const key = LISTING_KEY[type];
+  return key && Array.isArray(x?.[key]) ? x[key] : null;
+}
+/**
+ * #583: a listing could not be read, so the budget was not checked and cannot be certified
+ * clean. Tested with instanceof; the tool names are in `tools`.
+ */
+export class ResidueUnreadableError extends Error {
+  constructor(tools) {
+    super(`Zero-residue assertion could not read ${tools.join(', ')}: the budget was not checked, so it cannot be certified clean.`);
+    this.name = 'ResidueUnreadableError';
+    this.tools = tools;
+  }
+}
+
 const redact = (id) => (typeof id === 'string' && id.length > 8 ? `${id.slice(0, 8)}...` : String(id));
 
 /**
  * Guard: the sweep may only ever touch a budget the caller has explicitly designated
  * as disposable, AND that designation must match the budget the SERVER has loaded.
  *
- * `actual_budgets_get_all` returns the budget-file LIST with no active marker, so list
+ * `list_entities` with type budget_file returns the budget-file LIST with no active marker, so list
  * membership is not evidence: on a multi-budget server it passes while a different
  * budget is loaded. The authoritative id is the server's own ACTUAL_BUDGET_SYNC_ID,
  * which deploy-and-test.sh reads out of the container and passes in as
@@ -104,20 +137,33 @@ export function assertSweepAllowed(env = process.env) {
   return 'allowed';
 }
 
-/** Collect everything that looks like test residue, without deleting anything. */
+/**
+ * Collect everything that looks like test residue, without deleting anything. Never throws:
+ * a listing that could not be read (#583) is named in `unreadable` and contributes nothing,
+ * so the best-effort sweep still removes what it could read and the assertion can refuse.
+ */
 export async function findResidue(callTool) {
+  const unreadable = [];
+  // #680: every listing is `list_entities` with a `type`; the type names it in `unreadable`.
+  const listing = (type) => callTool(...listCall(type))
+    .then((x) => readListing(type, x))
+    .catch(() => null)
+    .then((arr) => {
+      if (arr === null) unreadable.push(listingLabel(type));
+      return arr ?? [];
+    });
   const [accounts, payees, categories, groups, rules, schedules, tags] = await Promise.all([
-    callTool('actual_accounts_list', {}).then(list).catch(() => []),
-    callTool('actual_payees_get', {}).then(list).catch(() => []),
-    callTool('actual_categories_get', {}).then(list).catch(() => []),
-    callTool('actual_category_groups_get', {}).then(list).catch(() => []),
-    callTool('actual_rules_get', {}).then(list).catch(() => []),
-    callTool('actual_schedules_get', {}).then(list).catch(() => []),
+    listing('account'),
+    listing('payee'),
+    listing('category'),
+    listing('category_group'),
+    listing('rule'),
+    listing('schedule'),
     // #451: tags. Added with the tags integration module, because a fixture the sweep cannot
     // see is a fixture the zero-residue assertion silently certifies as absent. tags.js deletes
     // its own tag in a `finally`, but a run killed by the wall-clock guard or by an open circuit
     // breaker never reaches it, and the next run would then inherit an invisible leftover.
-    callTool('actual_tags_list', {}).then(list).catch(() => []),
+    listing('tag'),
   ]);
 
   const named = (arr) => arr.filter((o) => isTestObjectName(o?.name));
@@ -141,6 +187,7 @@ export async function findResidue(callTool) {
     rules: rules.filter(isTestRule),
     // A tag's word is in `tag`, not `name`, so it needs its own filter rather than `named()`.
     tags: tags.filter((t) => isTestObjectName(t?.tag)),
+    unreadable: unreadable.sort(),
   };
 }
 
@@ -161,8 +208,14 @@ export async function sweepResidue(callTool, env = process.env) {
 
   const found = await findResidue(callTool);
   const total = residueCount(found);
+  // #583: best effort. Sweep what could be read, but never call a budget clean when part of
+  // it was not read; the post-run assertion is the check, and it refuses.
+  if (found.unreadable.length > 0) {
+    console.log(`  ⚠ Sweep could not read ${found.unreadable.join(', ')}; anything there is left for this run's assertion to report.`);
+  }
   if (total === 0) {
-    console.log('  ✓ Sweep: budget already clean, nothing to remove.');
+    if (found.unreadable.length === 0) console.log('  ✓ Sweep: budget already clean, nothing to remove.');
+    else console.log('  ℹ Sweep: nothing to remove in the listings it could read.');
     return { swept: 0, failed: 0, skipped: false };
   }
 
@@ -189,8 +242,8 @@ export async function sweepResidue(callTool, env = process.env) {
   }
 
   // Count real outcomes. The old code swallowed each per-op failure and then printed an
-  // unconditional success, so a balance-bearing account (which actual_accounts_close
-  // cannot close without a transferAccountId) silently survived while the sweep claimed
+  // unconditional success, so a balance-bearing account (which manage_accounts close
+  // cannot close without a transfer_account_id) silently survived while the sweep claimed
   // to have removed it, and the next run failed the zero-residue assertion (#287). Count
   // only what is actually gone, and report anything that could not be removed.
   let swept = 0, failed = 0;
@@ -201,32 +254,32 @@ export async function sweepResidue(callTool, env = process.env) {
 
   // Order matters: rules and schedules reference payees/categories, so remove them first.
   // Tags reference nothing and nothing references them, so the order is free here.
-  for (const t of found.tags) await tryRemove('tag delete', t.tag, () => callTool('actual_tags_delete', { id: t.id }));
-  for (const r of found.rules) await tryRemove('rule delete', r.id, () => callTool('actual_rules_delete', { id: r.id }));
-  for (const s of found.schedules) await tryRemove('schedule delete', s.name, () => callTool('actual_schedules_delete', { id: s.id }));
-  for (const p of found.payees) await tryRemove('payee delete', p.name, () => callTool('actual_payees_delete', { id: p.id }));
-  for (const c of found.categories) await tryRemove('category delete', c.name, () => callTool('actual_categories_delete', { id: c.id }));
-  for (const g of found.groups) await tryRemove('group delete', g.name, () => callTool('actual_category_groups_delete', { id: g.id }));
+  for (const t of found.tags) await tryRemove('tag delete', t.tag, () => remove(callTool, 'tag', t.id));
+  for (const r of found.rules) await tryRemove('rule delete', r.id, () => remove(callTool, 'rule', r.id));
+  for (const s of found.schedules) await tryRemove('schedule delete', s.name, () => remove(callTool, 'schedule', s.id));
+  for (const p of found.payees) await tryRemove('payee delete', p.name, () => remove(callTool, 'payee', p.id));
+  for (const c of found.categories) await tryRemove('category delete', c.name, () => remove(callTool, 'category', c.id));
+  for (const g of found.groups) await tryRemove('group delete', g.name, () => remove(callTool, 'group', g.id));
   // Accounts (#287): an OPEN account with a non-zero balance cannot be closed without a
   // transferAccountId, so the old close-only path silently failed. Zero the balance by
   // deleting the account's transactions, then delete the account; fall back to closing it
   // (with a zero balance, close succeeds) so it lands in the accepted terminal state
-  // rather than as open residue. The legacy "NEVER actual_accounts_delete" caution was a
+  // rather than as open residue. The legacy "NEVER delete an account" caution was a
   // pre-#134 per-op-init timeout; since #134 the session is pooled and the delete is
   // bounded by the #270 op-timeout, so it no longer loops (verified live during the
   // v0.8.13 release cleanup).
   for (const a of found.openAccounts) {
     await tryRemove('account remove', a.name, async () => {
-      const txns = list(await callTool('actual_transactions_get', { accountId: a.id }).catch(() => []));
+      const txns = list(await callTool(...accountTransactionsCall(a.id)).catch(() => []));
       for (const t of txns) {
-        if (t?.id) await callTool('actual_transactions_delete', { id: t.id }).catch(() => {});
+        if (t?.id) await remove(callTool, 'transaction', t.id).catch(() => {});
       }
       try {
-        await callTool('actual_accounts_delete', { id: a.id });
+        await remove(callTool, 'account', a.id);
       } catch {
         // Balance is zero now, so close is the fallback. If this ALSO throws, it propagates
         // to tryRemove, which records the account as failed (not swept): the summary stays honest.
-        await callTool('actual_accounts_close', { id: a.id });
+        await remove(callTool, 'accountClose', a.id);
       }
     });
   }
@@ -249,10 +302,15 @@ export async function sweepResidue(callTool, env = process.env) {
  * maintainer reading the contract would conclude a stray tag does not fail the run, and the
  * first live tags run proves it does.
  *
+ * #583: an unreadable listing throws ResidueUnreadableError BEFORE anything is counted, so a
+ * partly read budget is neither certified clean nor reported as a residue count.
+ *
  * @returns {number} the residue count (0 = clean)
+ * @throws {ResidueUnreadableError} when any listing could not be read
  */
 export async function assertNoResidue(callTool) {
   const found = await findResidue(callTool);
+  if (found.unreadable.length > 0) throw new ResidueUnreadableError(found.unreadable);
   const total = residueCount(found);
 
   if (found.closedAccounts.length > 0) {

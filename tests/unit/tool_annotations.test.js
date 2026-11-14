@@ -22,10 +22,9 @@
 
 import assert from 'assert';
 import { readFileSync, existsSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+import { join } from 'path';
+import { ROOT, classifyAdapterMethods, adapterCallsOf, toolFileOf } from './helpers/adapter-call-graph.js';
+import { stripTsComments } from './helpers/source-text.js';
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
 
 let passed = 0;
@@ -36,55 +35,11 @@ function check(label, fn) {
 }
 
 /**
- * Strip comments before any analysis. A docblock that MENTIONS `queueWriteOperation` in
- * prose would otherwise be read as a call: that exact false positive classified
- * `adapter.getNote` as a write while building this table, because `updateNote`'s docblock
- * sits between the two declarations.
- */
-function stripComments(s) {
-  return s
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/^\s*\/\/.*$/gm, '');
-}
-
-/** Which adapter methods reach the write queue? */
-function classifyAdapterMethods() {
-  let src = stripComments(read('src/lib/actual-adapter.ts'));
-  // Cut the default-export object: it lists every method name, and without this the LAST
-  // function's slice swallows it and is misread as writing.
-  // The default-export object lists EVERY method name, so without cutting it off the last
-  // function's slice swallows it and is misread as writing. The first version of this looked
-  // for `const adapter = {`, which does not exist (the file ends `export default {`), so the
-  // cut silently never ran. Asserted, not assumed: a guard whose safety step is a no-op is
-  // the kind of thing this file exists to catch.
-  const cut = src.indexOf('\nexport default {');
-  if (cut === -1) throw new Error('could not find the default-export block to cut; the classifier would misread the last function');
-  src = src.slice(0, cut);
-
-  const fns = [...src.matchAll(/^export (?:async )?function (\w+)\s*\(/gm)];
-  const writes = new Set();
-  const reads = new Set();
-  fns.forEach((m, i) => {
-    const end = i + 1 < fns.length ? fns[i + 1].index : src.length;
-    const body = src.slice(m.index, end);
-    (/\b(queueWriteOperation|batchBudgetUpdates)\s*\(/.test(body) ? writes : reads).add(m[1]);
-  });
-  return { writes, reads };
-}
-
-/** The adapter methods a tool file calls. */
-function adapterCallsOf(toolName) {
-  const file = `src/tools/${toolName.replace(/^actual_/, '')}.ts`;
-  if (!existsSync(join(ROOT, file))) return null;
-  return [...new Set([...stripComments(read(file)).matchAll(/adapter\.(\w+)\s*\(/g)].map((m) => m[1]))];
-}
-
-/**
  * Tools that mutate WITHOUT the write queue. Each is excluded from READ_ONLY in the table;
  * this list is what stops the guard from demanding they be marked read-only.
  */
 const NON_QUEUE_MUTATORS = {
-  actual_bank_sync: 'runs through withActualApi (the read path) but IMPORTS transactions',
+  actual_bank_sync: 'runs through withActualApiWrite (one upstream call, not the queue) and IMPORTS transactions',
   actual_budgets_export: 'writes a zip into the server data directory',
   actual_budgets_switch: "changes the session's active budget and persists a preference",
   actual_session_close: 'closes a pooled connection: server state, not budget data',
@@ -99,11 +54,14 @@ const names = [...toolsSrc.matchAll(/'(actual_[A-Za-z0-9_]+)'/g)]
   .filter((n, i, a) => a.indexOf(n) === i);
 
 const { annotationsFor, _ANNOTATION_SETS } = await import('../../dist/src/lib/tool-annotations.js');
+const { COMPACT_TOOLS } = await import('../../dist/src/compact/registry.js');
+const { compactLegacyNames } = await import('../../dist/src/compact/dispatch.js');
+const { WRITE_CAPABLE } = await import('../../dist/src/lib/toolsets.js');
 
 check('the derivation is real (guards against every check below passing over nothing)', () => {
   assert.ok(writes.size >= 20, `expected many write adapter methods, found ${writes.size}`);
   assert.ok(reads.size >= 10, `expected many read adapter methods, found ${reads.size}`);
-  assert.ok(names.length >= 77, `expected ~77 tools, found ${names.length}`);
+  assert.ok(names.length >= 70, `expected ~74 tools, found ${names.length}`);
 });
 
 check('every tool declares all four annotation fields as booleans', () => {
@@ -119,7 +77,7 @@ check('THE ANTI-LYING CHECK: no readOnlyHint:true tool reaches the write queue',
   const liars = names.filter((n) => {
     if (!annotationsFor(n).readOnlyHint) return false;
     const calls = adapterCallsOf(n);
-    return calls !== null && calls.some((c) => writes.has(c));
+    return calls.some((c) => writes.has(c));
   });
   assert.strictEqual(
     liars.length,
@@ -133,7 +91,7 @@ check('the reverse: every readOnlyHint:false tool really does mutate', () => {
     if (annotationsFor(n).readOnlyHint) return false;
     if (n in NON_QUEUE_MUTATORS) return false;
     const calls = adapterCallsOf(n);
-    return calls !== null && !calls.some((c) => writes.has(c));
+    return !calls.some((c) => writes.has(c));
   });
   assert.strictEqual(
     suspects.length,
@@ -199,11 +157,32 @@ check('an unclassified tool publishes NO safety claim', () => {
 });
 
 check('the classification sets name only real tools', () => {
-  const known = new Set(names);
+  // Compact tools (#672) are not in IMPLEMENTED_TOOLS by design; their names are real too.
+  const known = new Set([...names, ...COMPACT_TOOLS.map((t) => t.name)]);
   const unknown = Object.values(_ANNOTATION_SETS)
     .flatMap((s) => [...s])
     .filter((n) => !known.has(n));
   assert.strictEqual(unknown.length, 0, `sets reference non-existent tools: ${unknown.join(', ')}`);
+});
+
+check('every compact tool is annotated read-only, idempotent and closed-world exactly when all its targets are readers (#672)', () => {
+  for (const t of COMPACT_TOOLS) {
+    const writes = compactLegacyNames(t).filter((n) => WRITE_CAPABLE.has(n));
+    const a = annotationsFor(t.name);
+    assert.strictEqual(a.readOnlyHint, writes.length === 0, `${t.name}: readOnlyHint vs write-capable targets [${writes.join(', ')}]`);
+    if (a.readOnlyHint) assert.strictEqual(a.idempotentHint, true, `${t.name}: a read-only tool is idempotent`);
+    const open = compactLegacyNames(t).some((n) => annotationsFor(n).openWorldHint);
+    assert.strictEqual(a.openWorldHint, open, `${t.name}: openWorldHint is true exactly when a target is open-world (#676)`);
+  }
+});
+
+check('manage_accounts is open-world (bank_sync) and the other compact writers are not (#676)', () => {
+  assert.strictEqual(annotationsFor('manage_accounts').openWorldHint, true);
+  for (const n of ['manage_categories', 'manage_payees', 'manage_rules', 'manage_schedules', 'manage_tags', 'manage_transactions', 'manage_budget_months', 'manage_budget_files']) assert.strictEqual(annotationsFor(n).openWorldHint, false, n);
+});
+
+check('NEGATIVE: a compact name nobody classified publishes no safety claim', () => {
+  assert.strictEqual(annotationsFor('not_a_compact_tool').readOnlyHint, false);
 });
 
 check('a tool whose OWN description claims upsert semantics is marked idempotent', () => {
@@ -213,9 +192,9 @@ check('a tool whose OWN description claims upsert semantics is marked idempotent
   // from the call graph, so this reads the tool's own published claim instead: if a tool
   // TELLS clients it upserts, the annotation must agree with it.
   const liars = names.filter((n) => {
-    const file = `src/tools/${n.replace(/^actual_/, '')}.ts`;
-    if (!existsSync(join(ROOT, file))) return false;
-    const desc = stripComments(read(file));
+    const file = toolFileOf(n);
+    if (!existsSync(join(ROOT, file))) throw new Error(`${n}: tool file ${file} is missing (fails closed)`);
+    const desc = stripTsComments(read(file));
     const claimsUpsert = /\bupsert\b/i.test(desc);
     return claimsUpsert && !annotationsFor(n).idempotentHint;
   });

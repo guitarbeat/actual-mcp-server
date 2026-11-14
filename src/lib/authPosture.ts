@@ -1,4 +1,5 @@
 import { createModuleLogger, type ModuleLogger } from './loggerFactory.js';
+import { MIN_TOKEN_LENGTH, parseStaticTokensConfig } from '../auth/static-tokens.js';
 
 /**
  * Auth posture gate (#242): make HTTP authentication required-by-default.
@@ -39,15 +40,125 @@ export function isLoopbackHost(host: string | undefined): boolean {
   return false;
 }
 
+/**
+ * #611: example values shipped in our docs and .env.example. A token equal to one
+ * of these (trimmed, case-insensitive) is weak whatever its length:
+ * `replace-with-openssl-rand-hex-32` is exactly 32 characters.
+ */
+const PLACEHOLDER_TOKENS = new Set(['your-secure-token-here', 'replace-with-openssl-rand-hex-32', 'changeme']);
+
+function isPlaceholder(value: string): boolean {
+  return PLACEHOLDER_TOKENS.has(value.trim().toLowerCase());
+}
+
+/**
+ * #611: the names (never the values) of the configured bearer-token variables that
+ * are weak. Pure: reads only the `env` it is given.
+ *
+ * - Under OIDC nothing is checked: httpServer.ts builds no bearer entries there, so
+ *   a stale MCP_SSE_AUTHORIZATION is not a credential.
+ * - MCP_SSE_AUTHORIZATION: weak when set, non-empty and shorter than
+ *   MIN_TOKEN_LENGTH after trimming (whitespace-only included), or a placeholder.
+ *   EMPTY stays the no-auth path (tests/e2e/compose.yaml runs open on it).
+ * - MCP_TOKEN_*: resolveStaticTokens already refuses a short value on any bind, so
+ *   only placeholders are added here. An unparsable MCP_STATIC_TOKENS is left to
+ *   resolveStaticTokens, which refuses it with its own message.
+ */
+export function findWeakTokenVars(
+  env: Record<string, string | undefined>,
+  { oidcEnabled }: { oidcEnabled: boolean },
+): string[] {
+  if (oidcEnabled) return [];
+  const weak: string[] = [];
+
+  const legacy = env.MCP_SSE_AUTHORIZATION;
+  if (legacy && (legacy.trim().length < MIN_TOKEN_LENGTH || isPlaceholder(legacy))) {
+    weak.push('MCP_SSE_AUTHORIZATION');
+  }
+
+  let principals: ReturnType<typeof parseStaticTokensConfig> = {};
+  try {
+    principals = parseStaticTokensConfig(env.MCP_STATIC_TOKENS);
+  } catch {
+    // Refused later by resolveStaticTokens, before bind.
+  }
+  for (const { tokenEnv } of Object.values(principals)) {
+    const value = env[tokenEnv];
+    if (value && isPlaceholder(value) && !weak.includes(tokenEnv)) weak.push(tokenEnv);
+  }
+  return weak;
+}
+
+/** #612: the hostnames every open-mode server accepts, in the SDK's bracketed form. */
+const LOOPBACK_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]'];
+
+/**
+ * The hostname the SDK compares for `host` (a bind address or advertised name):
+ * lowercased, IPv6 bracketed and canonical. `undefined` for an empty or wildcard
+ * value, which names no single host.
+ */
+function canonicalHostname(host: string | undefined): string | undefined {
+  const h = host?.trim().toLowerCase();
+  if (!h || h === '0.0.0.0' || h === '::' || h === '[::]') return undefined;
+  const bracketed = h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+  // The SDK compares the URL-parsed Host, which is the canonical form
+  // ([2001:db8:0:0::5] arrives as [2001:db8::5]), so store the same form.
+  try { return new URL(`http://${bracketed}`).hostname; } catch { return bracketed; }
+}
+
+/**
+ * #612: the Host (and, in open mode, Origin) hostnames the HTTP server accepts, or
+ * `null` to skip the check. DNS rebinding protection: a hostile page can rebind its
+ * own name to 127.0.0.1, but cannot make the browser send a Host it does not own.
+ *
+ * - Open mode (no bearer token, no OIDC): the loopback names, `allowedHosts`, the
+ *   bind address itself when it is a concrete, non-wildcard address (an IP-literal
+ *   Host cannot come out of rebinding), and (#615) the advertised host, the address
+ *   the server prints as its own URL (MCP_BRIDGE_PUBLIC_HOST or the detected LAN
+ *   IP): an operator-controlled name or an IP literal, never one a hostile page can
+ *   make the browser send. Not on a loopback bind, which the LAN cannot reach.
+ *   IPv6 values are added bracketed and canonical.
+ * - Authenticated: `null` when `allowedHosts` is empty (unchanged behaviour), else
+ *   `allowedHosts` plus the loopback names. The bind and advertised hosts are not
+ *   added: an operator list stays exact.
+ *
+ * Pure: `allowedHosts` is the already-validated MCP_ALLOWED_HOSTS list.
+ */
+export function resolveAllowedHosts({
+  openMode,
+  allowedHosts,
+  bindHost,
+  advertisedHost,
+}: {
+  openMode: boolean;
+  allowedHosts: readonly string[];
+  bindHost: string | undefined;
+  advertisedHost?: string;
+}): string[] | null {
+  if (!openMode && allowedHosts.length === 0) return null;
+  const hosts = new Set([...LOOPBACK_HOSTNAMES, ...allowedHosts]);
+  if (openMode) {
+    // A loopback bind is unreachable from the LAN, so the advertised (LAN) host is
+    // left out there: adding it would only widen which Origins may call localhost.
+    const advertised = isLoopbackHost(bindHost) ? undefined : advertisedHost;
+    for (const h of [canonicalHostname(bindHost), canonicalHostname(advertised)]) {
+      if (h) hosts.add(h);
+    }
+  }
+  return [...hosts];
+}
+
 export interface HttpAuthPostureInput {
   /** The interface the server will bind (e.g. process.env.MCP_BRIDGE_BIND_HOST || '0.0.0.0'). */
   bindHost: string | undefined;
-  /** Whether a non-empty static Bearer token (MCP_SSE_AUTHORIZATION) is set. */
+  /** Whether a static Bearer token is configured: MCP_SSE_AUTHORIZATION or MCP_STATIC_TOKENS (#572). */
   hasStaticToken: boolean;
   /** Whether OIDC is enabled (AUTH_PROVIDER === 'oidc'). */
   oidcEnabled: boolean;
   /** The explicit open opt-out (MCP_ALLOW_UNAUTHENTICATED === true). */
   allowUnauthenticated: boolean;
+  /** #611: names from findWeakTokenVars. Omitted means none. */
+  weakTokenVars?: readonly string[];
 }
 
 export type HttpAuthPostureDecision = 'serve' | 'serve-open-warn' | 'refuse';
@@ -55,16 +166,31 @@ export type HttpAuthPostureDecision = 'serve' | 'serve-open-warn' | 'refuse';
 export interface HttpAuthPostureResult {
   decision: HttpAuthPostureDecision;
   reason: string;
+  /** #611: set when the decision is driven by weak token variables (their names). */
+  weakTokenVars?: readonly string[];
 }
 
 /**
  * Pure decision function (no side effects) so it is exhaustively unit-testable
- * without booting a server. Precedence: configured auth serves; otherwise a
- * loopback bind serves; otherwise the explicit opt-out serves (with a warning);
- * otherwise refuse.
+ * without booting a server. Precedence: a weak token refuses a non-loopback bind
+ * (#611, before and regardless of the opt-out, which cannot make a weak token
+ * safe) and serves with a warning on loopback; then configured auth serves;
+ * otherwise a loopback bind serves; otherwise the explicit opt-out serves (with a
+ * warning); otherwise refuse.
  */
 export function evaluateHttpAuthPosture(input: HttpAuthPostureInput): HttpAuthPostureResult {
-  const { bindHost, hasStaticToken, oidcEnabled, allowUnauthenticated } = input;
+  const { bindHost, hasStaticToken, oidcEnabled, allowUnauthenticated, weakTokenVars = [] } = input;
+
+  if (weakTokenVars.length > 0) {
+    if (isLoopbackHost(bindHost)) {
+      return { decision: 'serve', reason: `loopback bind (${bindHost}) with a weak token`, weakTokenVars };
+    }
+    return {
+      decision: 'refuse',
+      reason: `weak token on a non-loopback bind (${bindHost ?? '0.0.0.0'})`,
+      weakTokenVars,
+    };
+  }
 
   if (hasStaticToken || oidcEnabled) {
     return { decision: 'serve', reason: 'authentication is configured' };
@@ -96,12 +222,34 @@ export function enforceHttpAuthPosture(
   log: Pick<ModuleLogger, 'error' | 'warn'> = logger,
   exit: (code: number) => never = process.exit,
 ): HttpAuthPostureDecision {
-  const { decision, reason } = evaluateHttpAuthPosture(input);
+  const { decision, reason, weakTokenVars } = evaluateHttpAuthPosture(input);
+
+  if (weakTokenVars) {
+    // #611: names only, never values. A separate message from the no-auth refusal:
+    // MCP_ALLOW_UNAUTHENTICATED cannot rescue a weak token, so it is not offered.
+    if (decision === 'refuse') {
+      log.error(
+        `Refusing to start: ${reason}. ${weakTokenVars.join(', ')} is shorter than ${MIN_TOKEN_LENGTH} ` +
+          'characters or an example placeholder. Generate a token with openssl rand -hex 32.',
+      );
+      exit(1);
+    } else {
+      for (const name of weakTokenVars) {
+        log.warn(
+          `${name} is shorter than ${MIN_TOKEN_LENGTH} characters or an example placeholder. ` +
+            'Allowed only on a loopback bind; a non-loopback bind refuses to start. ' +
+            'Generate a token with openssl rand -hex 32.',
+        );
+      }
+    }
+    return decision;
+  }
 
   if (decision === 'refuse') {
     log.error(
       `Refusing to start: ${reason}. HTTP auth is required-by-default. ` +
-        'Set MCP_SSE_AUTHORIZATION to a strong token (openssl rand -hex 32), or ' +
+        'Set MCP_SSE_AUTHORIZATION to a strong token (openssl rand -hex 32), or set ' +
+        'MCP_STATIC_TOKENS (one token per client, #572), or ' +
         'set AUTH_PROVIDER=oidc, or bind a loopback host. To deliberately run open ' +
         '(for example behind your own authenticating proxy), set MCP_ALLOW_UNAUTHENTICATED=true.',
     );
@@ -111,9 +259,31 @@ export function enforceHttpAuthPosture(
       `Serving HTTP WITHOUT authentication: ${reason}. Anyone who can reach this ` +
         'port can read and modify your financial data. This is allowed only because ' +
         'MCP_ALLOW_UNAUTHENTICATED=true. Put an authenticating reverse proxy in front, ' +
-        'or set MCP_SSE_AUTHORIZATION / AUTH_PROVIDER=oidc.',
+        'or set MCP_SSE_AUTHORIZATION / MCP_STATIC_TOKENS / AUTH_PROVIDER=oidc.',
     );
   }
 
   return decision;
+}
+
+/** Inputs for describeAuthMode, each computed with the server's own blank-means-off rule. */
+export interface AuthModeInput {
+  oidcEnabled: boolean;
+  hasStaticTokens: boolean;
+  hasSseAuthorization: boolean;
+}
+
+/**
+ * One word naming the HTTP auth mode for the startup banner (#626). Precedence
+ * mirrors the listen callback's posture lines in httpServer.ts: OIDC, then the
+ * static token map, then the single shared bearer token, then none. With both
+ * token variables set this reports `static`, as the ticket specifies; the
+ * listen callback still names the extra unrestricted token, and #623 replaces
+ * the banner. Never prints an issuer, token or principal.
+ */
+export function describeAuthMode(input: AuthModeInput): 'oidc' | 'static' | 'bearer' | 'none' {
+  if (input.oidcEnabled) return 'oidc';
+  if (input.hasStaticTokens) return 'static';
+  if (input.hasSseAuthorization) return 'bearer';
+  return 'none';
 }

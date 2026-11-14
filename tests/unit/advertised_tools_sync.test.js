@@ -8,17 +8,20 @@
 // #339 ADDS THE REVERSE DIRECTION, and deliberately reverses an earlier decision.
 // This file used to say the reverse was "intentionally NOT asserted: the README tool
 // table is curated, not exhaustive". That rationale stopped being true: the README
-// organises tools into `### Domain (N)` sections whose counts are presented as a
+// organised tools into `### Domain (N)` sections whose counts were presented as a
 // complete accounting of the surface. A curated subset cannot claim a total.
 //
 // Leaving only the forward check cost exactly what you would expect. By v0.10.0 the
 // README was missing SIX tools, including the entire Schedules domain (4 tools), and
-// the section counts summed to 68 against a canonical 77. Both drifted together and
+// the section counts summed to 68 against a canonical 74. Both drifted together and
 // silently, because nothing looked in that direction. So this file now asserts:
 //
-//   1. forward:  every README-advertised name is registered  (the #234 guard)
-//   2. reverse:  every registered tool is advertised          (#339)
-//   3. counts:   the `### Domain (N)` headings sum to the registry size (#339)
+//   1. forward:  every name advertised in README.md or docs/reference/tools.md is
+//                registered (the #234 guard)
+//   2. reverse:  every registered tool is documented in docs/reference/tools.md
+//                (#339; the catalogue moved there from README.md in #607)
+//   3. (retired by #603) the `### Domain (N)` heading sum: the headings carry no number
+//      any more, and the toolset sizes are generated from the registry (scripts/docs/tools.mjs)
 //
 // Each has a NEGATIVE fixture, because an assertion of the form "this set is empty"
 // passes just as happily when the extractor is broken and the set is empty for the
@@ -42,10 +45,14 @@ function check(label, fn) {
 }
 
 // Backtick-delimited tool-name tokens: at least two underscores so an env-var-style
-// token like `actual_password` (one underscore) cannot match. Case-insensitive segments
-// because some tool names are camelCase (e.g. actual_budgets_setAmount, _getMonth).
+// token like `actual_password` (one underscore) cannot match. Case-insensitive segments so
+// a camelCase name (only the #652 deprecated aliases now) is still extracted and judged.
 const ADVERTISED_RE = /`(actual_[a-zA-Z0-9]+_[a-zA-Z0-9]+(?:_[a-zA-Z0-9]+)*)`/g;
 const advertisedNames = (text) => [...text.matchAll(ADVERTISED_RE)].map((m) => m[1]);
+
+// #652: the "### Deprecated names" section of tools.md lists the old camelCase aliases on
+// purpose; they are not registered tools. Only that section is exempt, up to the next `## `.
+const withoutDeprecatedSection = (text) => text.replace(/\n### Deprecated names\n[\s\S]*?(?=\n## )/, '\n');
 
 // IMPLEMENTED_TOOLS is a non-exported const; read the registry by extracting the
 // quoted actual_* literals inside the IMPLEMENTED_TOOLS array in the source. Anchor on
@@ -63,16 +70,28 @@ console.log('\n[advertised-tools-sync]');
 const registry = registryNames();
 
 check('registry parsed completely (case-insensitive, no under-count)', () => {
-  // The repo ships 77 tools; the extractor must capture them all (including the
+  // The repo ships 74 tools; the extractor must capture them all (including the
   // camelCase budgets tools), so a loose floor cannot mask a partial parse.
-  assert.ok(registry.size >= 77, `expected >= 77 registered tools, got ${registry.size}`);
+  assert.ok(registry.size >= 74, `expected >= 74 registered tools, got ${registry.size}`);
 });
 
-check('every actual_<domain>_<action> name advertised in README is in IMPLEMENTED_TOOLS', () => {
-  const advertised = [...new Set(advertisedNames(read('README.md')))];
-  assert.ok(advertised.length > 0, 'no advertised tool names found in README (extractor broke?)');
-  const missing = advertised.filter((n) => !registry.has(n)).sort();
-  assert.strictEqual(missing.length, 0, `README advertises tool(s) not in IMPLEMENTED_TOOLS: ${missing.join(', ')}`);
+// #607: the per-domain catalogue moved from README.md to docs/reference/tools.md. The
+// forward check scans BOTH, because the README still names tools in prose (the chat
+// preset list, the read-only examples) and a renamed tool there is the same defect.
+const ADVERTISING_FILES = ['README.md', 'docs/reference/tools.md'];
+for (const file of ADVERTISING_FILES) {
+  check(`every actual_<domain>_<action> name advertised in ${file} is in IMPLEMENTED_TOOLS`, () => {
+    const advertised = [...new Set(advertisedNames(withoutDeprecatedSection(read(file))))];
+    assert.ok(advertised.length > 0, `no advertised tool names found in ${file} (extractor broke?)`);
+    const missing = advertised.filter((n) => !registry.has(n)).sort();
+    assert.strictEqual(missing.length, 0, `${file} advertises tool(s) not in IMPLEMENTED_TOOLS: ${missing.join(', ')}`);
+  });
+}
+
+check('NEGATIVE (#652): an old camelCase name OUTSIDE the Deprecated names section is still flagged', () => {
+  const doc = '## Budgets\n`actual_budgets_getMonths`\n### Deprecated names\n`actual_budgets_setAmount`\n## Rules\n';
+  const missing = advertisedNames(withoutDeprecatedSection(doc)).filter((n) => !registry.has(n));
+  assert.deepStrictEqual(missing, ['actual_budgets_getMonths']);
 });
 
 // NEGATIVE: prove the guard catches a documented-but-missing / renamed tool.
@@ -92,14 +111,22 @@ check('NEGATIVE: an advertised phantom tool is detected by the same extractor + 
 // Requiring a backtick here would produce false failures and get the guard weakened.
 const undocumented = (readmeText, names) => [...names].filter((n) => !readmeText.includes(n)).sort();
 
-check('every tool in IMPLEMENTED_TOOLS appears in README (#339)', () => {
-  const missing = undocumented(read('README.md'), registry);
+// #607: the reverse check reads the tools reference page, which now owns the catalogue.
+check('every tool in IMPLEMENTED_TOOLS appears in docs/reference/tools.md (#339, #607)', () => {
+  const missing = undocumented(read('docs/reference/tools.md'), registry);
   assert.strictEqual(
     missing.length,
     0,
-    `README does not document ${missing.length} registered tool(s): ${missing.join(', ')}. ` +
-      'Add them to the tool list and update the affected `### Domain (N)` heading.',
+    `docs/reference/tools.md does not document ${missing.length} registered tool(s): ${missing.join(', ')}. ` +
+      'Add them to the tables in docs/reference/tools.md.',
   );
+});
+
+// #607 NEGATIVE on the REAL page: removing one tool from the actual reference text must
+// flag exactly that tool, which proves the reverse check reads the page it claims to.
+check('NEGATIVE: docs/reference/tools.md with actual_accounts_list removed flags exactly that tool (#607)', () => {
+  const text = read('docs/reference/tools.md').split('actual_accounts_list').join('');
+  assert.deepStrictEqual(undocumented(text, registry), ['actual_accounts_list']);
 });
 
 check('NEGATIVE: a registered-but-undocumented tool is detected', () => {
@@ -108,33 +135,6 @@ check('NEGATIVE: a registered-but-undocumented tool is detected', () => {
   assert.ok(missing.length > 0, 'guard must flag undocumented tools');
   assert.ok(!missing.includes('actual_accounts_list'), 'the one documented tool must NOT be flagged');
   assert.ok(missing.includes('actual_schedules_get'), 'a genuinely absent tool must be flagged');
-});
-
-// ---------------------------------------------------------------------------
-// #339: the `### Domain (N)` headings must account for the whole surface.
-// ---------------------------------------------------------------------------
-
-// Only the tool-list headings carry a bare parenthesised integer. Sub-headings like
-// "**Standard (6)**" are bold, not `###`, so they are not double counted.
-const SECTION_RE = /^### .*?\((\d+)\)\s*$/gm;
-const sectionCounts = (text) => [...text.matchAll(SECTION_RE)].map((m) => Number(m[1]));
-
-check('the tool-section counts sum to the number of registered tools (#339)', () => {
-  const counts = sectionCounts(read('README.md'));
-  assert.ok(counts.length > 5, `expected several tool sections, found ${counts.length} (extractor broke?)`);
-  const sum = counts.reduce((a, b) => a + b, 0);
-  assert.strictEqual(
-    sum,
-    registry.size,
-    `README section counts sum to ${sum} but ${registry.size} tools are registered. ` +
-      'A section heading is stale, or a whole domain is missing.',
-  );
-});
-
-check('NEGATIVE: a drifting section count is detected', () => {
-  const counts = sectionCounts('### Accounts (7)\n\n### Transactions (14)\n\n### Rules (5)\n');
-  assert.deepStrictEqual(counts, [7, 14, 5], 'extractor must read the heading counts');
-  assert.notStrictEqual(counts.reduce((a, b) => a + b, 0), registry.size, 'a short list must not match the registry size');
 });
 
 console.log(`\n[advertised-tools-sync] Results: ${passed} passed, ${failed} failed`);

@@ -1,4 +1,4 @@
-export async function testMcpClient(advertisedUrl: string, _port: number, httpPath: string) {
+export async function testMcpClient(serverUrl: string, httpPath: string) {
   // Try builtin fetch or fallback to node-fetch if necessary
   const globalFetch = (globalThis as unknown as { fetch?: unknown }).fetch;
   // Minimal response-like interface used by this test harness
@@ -12,7 +12,7 @@ export async function testMcpClient(advertisedUrl: string, _port: number, httpPa
   const fetchAny = (globalFetch as unknown) ?? (await import('node-fetch')).default;
   const fetchFn: (input: string | URL, init?: RequestInit) => Promise<ResponseLike> = fetchAny as unknown as (input: string | URL, init?: RequestInit) => Promise<ResponseLike>;
 
-  const base = new URL(advertisedUrl);
+  const base = new URL(serverUrl);
   // quick probe endpoint (#286: the server-info probe moved off the reserved
   // /.well-known/oauth-protected-resource OAuth path to the non-reserved /mcp-info,
   // now a bare object; the `result ?? raw` unwrap below tolerates both shapes).
@@ -32,11 +32,9 @@ export async function testMcpClient(advertisedUrl: string, _port: number, httpPa
   const resultObj = resultRaw && typeof resultRaw === 'object' ? (resultRaw as Record<string, unknown>) : undefined;
   if (!resultObj) throw new Error('Probe result is not an object');
 
-  const serverInstructions = resultObj['serverInstructions'];
-  if (serverInstructions && typeof serverInstructions === 'object') {
-    if (typeof (serverInstructions as Record<string, unknown>)['instructions'] !== 'string') {
-      throw new Error('serverInstructions missing or wrong type');
-    }
+  // #560: instructions is the spec's plain string, on /mcp-info as on initialize.
+  if (typeof resultObj['instructions'] !== 'string') {
+    throw new Error('Probe instructions missing or not a string');
   }
 
   const capabilitiesVal = resultObj['capabilities'];
@@ -49,7 +47,7 @@ export async function testMcpClient(advertisedUrl: string, _port: number, httpPa
     throw new Error('tools missing or not array');
   }
 
-  console.info('Probe OK: capabilities/tools/serverInstructions present');
+  console.info('Probe OK: capabilities/tools/instructions present');
 
   // Now do JSON-RPC initialize + tools/list using the HTTP endpoint
   const rpcUrl = `${base.origin}${httpPath}`;
@@ -96,7 +94,7 @@ export async function testMcpClient(advertisedUrl: string, _port: number, httpPa
   }
   if (sessionId) console.info(`Received session id header: ${sessionId}`);
 
-  // Validate initialize result fields (capabilities/tools/serverInstructions)
+  // Validate initialize result fields (capabilities/tools/instructions)
   const initResultRaw = (initJson as Record<string, unknown>)['result'];
   const initResult = initResultRaw && typeof initResultRaw === 'object' ? (initResultRaw as Record<string, unknown>) : undefined;
 
@@ -112,19 +110,13 @@ export async function testMcpClient(advertisedUrl: string, _port: number, httpPa
     throw new Error('initialize result.tools missing or not array and capabilities.tools not present');
   }
 
-  // serverInstructions may be a string, an object { instructions }, or absent.
-  const si = initResult['serverInstructions'];
-  if (!si) {
-    console.warn('Warning: serverInstructions missing from initialize result — continuing tests');
-  } else if (typeof si === 'string') {
-    // ok
-  } else if (typeof si === 'object' && typeof (si as Record<string, unknown>)['instructions'] === 'string') {
-    // ok
-  } else {
-    console.warn('Warning: serverInstructions present but in unexpected shape — continuing tests');
+  // #560: the spec's InitializeResult.instructions, a string. The harness never read the spec
+  // field before (it accepted a non-spec key in any shape), so this is now a hard check.
+  if (typeof initResult['instructions'] !== 'string') {
+    throw new Error('initialize result.instructions missing or not a string');
   }
 
-  console.info('Initialize OK: capabilities/tools/serverInstructions present');
+  console.info('Initialize OK: capabilities/tools/instructions present');
 
   // call tools/list (JSON-RPC) to verify RPC path works
   const listPayload = { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} };
@@ -136,7 +128,12 @@ export async function testMcpClient(advertisedUrl: string, _port: number, httpPa
     headers: listHeaders,
     body: JSON.stringify(listPayload),
   });
-  if (!listRes.ok) throw new Error(`tools/list failed: ${listRes.status}`);
+  if (!listRes.ok) {
+    // #565: a 404 here is usually the session's Actual connection failing (bad credentials or no
+    // reachable server); the body names the cause (#438), so carry it rather than a bare status.
+    const body = await listRes.json().catch(() => undefined);
+    throw new Error(`tools/list failed: ${listRes.status}${body === undefined ? '' : ` ${JSON.stringify(body).slice(0, 300)}`}`);
+  }
   const listJsonRaw = await listRes.json() as unknown;
   const listJsonObj = listJsonRaw && typeof listJsonRaw === 'object' ? (listJsonRaw as Record<string, unknown>) : undefined;
   if (!listJsonObj || !('result' in listJsonObj)) throw new Error('tools/list returned invalid result');

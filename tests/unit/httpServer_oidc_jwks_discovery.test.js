@@ -14,8 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import express from 'express';
 import { generateKeyPair, SignJWT, jwtVerify, exportJWK, createLocalJWKSet } from 'jose';
-import { MCPAuthTokenVerificationError } from 'mcp-auth';
-import { handleBearerAuth } from 'mcp-auth/handlers/handle-bearer-auth.js';
+import { TokenVerificationError, bearerAuthMiddleware } from '../../dist/src/auth/bearer.js';
 
 const { resolveJwksUri, assertSecureIssuer, isLoopbackHost, buildTrustedJwksHosts } = await import('../../dist/src/lib/oidc-discovery.js');
 const { configSchema } = await import('../../dist/src/config.js');
@@ -142,16 +141,16 @@ const jwk = await exportJWK(publicKey); jwk.alg = 'RS256'; jwk.kid = 'k1';
 const jwks = createLocalJWKSet({ keys: [jwk] });
 const ISS = 'https://idp.example.com', AUD = 'client-1', RESOURCE = 'https://mcp.example.com';
 
-// Mirror httpServer.ts customJwtVerify: wrap jose failures in MCPAuthTokenVerificationError.
+// Mirror httpServer.ts customJwtVerify: wrap jose failures in TokenVerificationError.
 const customJwtVerify = async (token) => {
   let payload;
   try {
     ({ payload } = await jwtVerify(token, jwks, { issuer: ISS, audience: AUD }));
   } catch (err) {
-    throw new MCPAuthTokenVerificationError('invalid_token', err instanceof Error ? err : undefined);
+    throw new TokenVerificationError('invalid_token', err instanceof Error ? err : undefined);
   }
   if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
-    throw new MCPAuthTokenVerificationError('invalid_token');
+    throw new TokenVerificationError('invalid_token');
   }
   const rawAud = payload.aud; const audience = Array.isArray(rawAud) ? rawAud : (rawAud ? [rawAud] : []);
   return { token, subject: payload.sub, issuer: payload.iss ?? ISS, clientId: audience[0] ?? '', audience, scopes: [], expiresAt: payload.exp, claims: payload };
@@ -159,7 +158,7 @@ const customJwtVerify = async (token) => {
 
 const app = express();
 let lastAuthSubject = null;
-app.use('/http', handleBearerAuth({ verifyAccessToken: customJwtVerify, issuer: ISS, audience: AUD, requiredScopes: [], resource: RESOURCE, showErrorDetails: true }));
+app.use('/http', bearerAuthMiddleware(customJwtVerify, { issuers: [ISS], audience: AUD, requiredScopes: [], resource: RESOURCE, showErrorDetails: true }));
 app.post('/http', (req, res) => { lastAuthSubject = req.auth?.subject ?? null; res.status(200).json({ ok: true }); });
 
 let sawUnhandled = false;
@@ -195,17 +194,17 @@ server.close();
 console.log('\n[oidc-jwks-discovery] real code wiring (source assertions)');
 const here = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(resolve(here, '../../src/server/httpServer.ts'), 'utf8');
-check('httpServer uses discoverOidcMetadata + jwksUri (not the hardcoded URL construction)', () => {
+check('httpServer resolves jwksUri through resolveJwksSource from config.OIDC_ISSUER (not the hardcoded URL construction; #462 wraps discovery)', () => {
   // #285: the OIDC block now resolves BOTH the jwks_uri and the raw discovery doc
   // from a single startup fetch via discoverOidcMetadata.
-  assert.ok(/discoverOidcMetadata\(\s*config\.OIDC_ISSUER\b/.test(src), 'expected discoverOidcMetadata(config.OIDC_ISSUER, ...) call');
+  assert.ok(/resolveJwksSource\(\{[\s\S]{0,200}issuer:\s*config\.OIDC_ISSUER\b/.test(src), 'expected resolveJwksSource({ issuer: config.OIDC_ISSUER, ... }) call');
   assert.ok(src.includes('createRemoteJWKSet(new URL(jwksUri))'), 'expected createRemoteJWKSet(new URL(jwksUri))');
   // The OLD hardcoded code construction must be gone (a comment mentioning the path is fine).
   assert.ok(!/new URL\(\s*`\$\{config\.OIDC_ISSUER\}\/\.well-known\/jwks`/.test(src), 'the hardcoded JWKS URL construction must be gone');
 });
-check('httpServer threads buildTrustedJwksHosts(config.OIDC_JWKS_TRUSTED_HOSTS) into discoverOidcMetadata (#254)', () => {
+check('httpServer threads buildTrustedJwksHosts(config.OIDC_JWKS_TRUSTED_HOSTS) into resolveJwksSource (#254)', () => {
   assert.ok(/buildTrustedJwksHosts\(config\.OIDC_JWKS_TRUSTED_HOSTS\)/.test(src), 'expected the parsed allowlist threaded at the composition root');
-  assert.ok(/discoverOidcMetadata\(\s*config\.OIDC_ISSUER[\s\S]{0,260}buildTrustedJwksHosts/.test(src), 'expected discoverOidcMetadata to receive the trusted-hosts array');
+  assert.ok(/resolveJwksSource\(\{[\s\S]{0,300}trustedHosts:\s*buildTrustedJwksHosts\(config\.OIDC_JWKS_TRUSTED_HOSTS\)/.test(src), 'expected resolveJwksSource to receive the trusted-hosts array');
 });
 // #285: RFC 8414 authorization-server metadata route.
 check('httpServer serves /.well-known/oauth-authorization-server as a BARE object (scenario 1)', () => {
@@ -234,12 +233,23 @@ check('the oauth-authorization-server route is registered ONLY inside the AUTH_P
   // Exactly one registration, so no accidental un-gated duplicate exists.
   assert.strictEqual(src.split("app.get('/.well-known/oauth-authorization-server'").length - 1, 1, 'expected exactly one oauth-authorization-server registration');
 });
-check('httpServer maps verify failures to MCPAuthTokenVerificationError', () => {
-  assert.ok(/catch\s*\(err\)[\s\S]{0,160}MCPAuthTokenVerificationError\('invalid_token'/.test(src), 'expected 401 mapping in customJwtVerify');
+check('httpServer maps verify failures to TokenVerificationError', () => {
+  assert.ok(/catch\s*\(err\)[\s\S]{0,160}TokenVerificationError\('invalid_token'/.test(src), 'expected 401 mapping in customJwtVerify');
 });
 check('httpServer rejects a token with no usable sub (invalid_token)', () => {
-  assert.ok(/payload\.sub[\s\S]{0,120}MCPAuthTokenVerificationError\('invalid_token'\)/.test(src), 'expected a missing-sub rejection');
+  assert.ok(/payload\.sub[\s\S]{0,120}TokenVerificationError\('invalid_token'\)/.test(src), 'expected a missing-sub rejection');
   assert.ok(src.includes('subject: payload.sub,'), 'expected subject populated from payload.sub');
+});
+
+check('#461: the OIDC block of startHttpServer carries no literal /http (the advertised path is derived, never hardcoded)', () => {
+  // Scoped between the two anchors above so the legitimate /mcp-info/http route outside
+  // the block is not a false positive.
+  const start = src.indexOf('mcpAuth = createMcpAuth()');
+  const end = src.indexOf('mcpAuth.bearerAuth(');
+  assert.ok(start > 0 && end > start, 'anchors not found');
+  assert.ok(!/['"`]\/http['"`]/.test(src.slice(start, end)), 'a hardcoded /http inside the OIDC block');
+  assert.ok(src.slice(start, end).includes('oidcResourceStartupWarnings({ resource: config.OIDC_RESOURCE, advertisedUrl, httpPath })'),
+    'the #461 startup warning call is missing or no longer takes the advertised URL');
 });
 
 console.log(`\n[oidc-jwks-discovery] Results: ${failed === 0 ? 'all passed' : failed + ' failed'}`);

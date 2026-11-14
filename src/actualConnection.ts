@@ -4,12 +4,11 @@ import os from 'os';
 import api from '@actual-app/api';
 import { loadBudgetTracked } from './lib/budgetLoader.js';
 import { withApiLock } from './lib/apiLock.js';
-import { withOpTimeout } from './lib/opTimeout.js';
+import { initApiLoggedIn } from './lib/apiLogin.js';
 import logger from './logger.js';
 import config from './config.js';
-import { connectionPool } from './lib/ActualConnectionPool.js';
+import { connectionPool, type AdmissionResult } from './lib/ActualConnectionPool.js';
 import { createModuleLogger } from './lib/loggerFactory.js';
-import { initializeActualApi } from './lib/actual-init-config.js';
 
 const log = createModuleLogger('CONNECTION');
 
@@ -20,6 +19,15 @@ let initializing = false;
 let initializationError: Error | null = null;
 // Feature flag to enable connection pooling - can be disabled via environment variable
 let useConnectionPool = process.env.USE_CONNECTION_POOL !== 'false';
+// #577: the per-principal cap is a pool feature; with pooling off nothing is capped at all.
+if (!useConnectionPool && config.MAX_SESSIONS_PER_PRINCIPAL !== undefined) {
+  log.warn('MAX_SESSIONS_PER_PRINCIPAL is set but USE_CONNECTION_POOL=false, so it has no effect');
+}
+
+/** #530: httpServer registers sessions with the pool only when the pool is in use. */
+export function isConnectionPoolEnabled(): boolean {
+  return useConnectionPool;
+}
 
 export async function connectToActual() {
   if (initialized) return;
@@ -72,10 +80,7 @@ export async function connectToActual() {
       // settle, `.finally(release)` would never run, and the process-global api mutex would be
       // wedged permanently for every session: the exact #270 class. Both pool sites already bound
       // their `api.init` this way, and this was the only `api.init` in the repo that did not.
-      await withOpTimeout(
-        () => initializeActualApi(DATA_DIR, SERVER_URL, PASSWORD),
-        'connectToActual init',
-      );
+      await initApiLoggedIn(DATA_DIR, { serverUrl: SERVER_URL, password: PASSWORD || '' }, 'connectToActual init');
 
       log.info(`Downloading budget with sync ID: ${BUDGET_SYNC_ID}`);
 
@@ -140,8 +145,15 @@ export async function shutdownActual() {
 /**
  * Initialize connection for a specific MCP session
  * Uses connection pooling to give each session its own Actual Budget connection
+ *
+ * #571: `budget` is the budget the session opens on (httpServer resolves it with
+ * initialBudgetForSession). Without it the pool logs in to the default server and downloads the
+ * default budget, which is wrong whenever the session's restored budget lives on another server.
  */
-export async function connectToActualForSession(sessionId: string) {
+export async function connectToActualForSession(
+  sessionId: string,
+  budget?: { serverUrl: string; password: string; syncId: string; encryptionPassword?: string },
+) {
   if (!useConnectionPool) {
     // Fallback to shared connection
     return connectToActual();
@@ -150,7 +162,7 @@ export async function connectToActualForSession(sessionId: string) {
   try {
     // Ensure connection pool initialization is complete before accepting connections
     await connectionPool.waitForInitialization();
-    await connectionPool.getConnection(sessionId);
+    await connectionPool.getConnection(sessionId, budget);
     logger.info(`Actual API connection ready for session: ${sessionId}`);
   } catch (err) {
     logger.error(`Failed to connect to Actual for session ${sessionId}:`, err);
@@ -179,6 +191,11 @@ export async function shutdownActualForSession(sessionId: string) {
   }
 }
 
+function poolSummary() {
+  const { sessions: _sessions, ...summary } = connectionPool.getStats();
+  return summary;
+}
+
 export function getConnectionState() {
   // When using connection pooling, consider server initialized if pool is ready
   // (even with 0 active connections, pool being initialized means server is ready to accept sessions)
@@ -188,14 +205,24 @@ export function getConnectionState() {
   return {
     initialized: effectivelyInitialized,
     initializationError,
-    connectionPool: useConnectionPool ? connectionPool.getStats() : null,
+    // Aggregate figures only. This feeds the unauthenticated /health route, so the
+    // per-session list (full session ids) is left out on purpose.
+    connectionPool: useConnectionPool ? poolSummary() : null,
     idleTimeoutMinutes: useConnectionPool ? connectionPool.getIdleTimeoutMinutes() : null,
   };
 }
 
-export function canAcceptNewSession(): boolean {
-  if (!useConnectionPool) {
-    return true; // Shared connection mode - always accept
-  }
-  return connectionPool.canAcceptNewSession();
+/**
+ * #581/#577: take a session slot at admission, synchronously, under the global cap and the
+ * per-principal cap (see `connectionPool.admitSession`). Pass a principal only for a request that
+ * is capped. Shared connection mode has no cap, so it always admits and records nothing.
+ */
+export function admitSession(sessionId: string, principal?: string): AdmissionResult {
+  if (!useConnectionPool) return { admitted: true };
+  return connectionPool.admitSession(sessionId, principal);
+}
+
+/** #577: release the slot and the admission of an initialize that never registered. Idempotent. */
+export function releaseAdmission(sessionId: string): void {
+  if (useConnectionPool) connectionPool.releaseAdmission(sessionId);
 }

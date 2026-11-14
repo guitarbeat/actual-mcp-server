@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from '../../types/tool.d.js';
 import adapter from '../lib/actual-adapter.js';
 import { validateQueryShape } from '../lib/query-validator.js';
+import { errorLogFields, withLogMessage } from '../lib/errors.js';
 
 const InputSchema = z.object({
   query: z.string().min(1).describe('ActualQL query string to execute'),
@@ -10,57 +11,22 @@ const InputSchema = z.object({
 
 const tool: ToolDefinition = {
   name: 'actual_query_run',
-  description: `Execute SQL queries for advanced financial data analysis.
+  description: `Run a read-only SQL query against the budget data. Prefer SQL; a bare table name (e.g. "transactions") returns all its records.
 
-**RECOMMENDED: Use SQL syntax** - Most reliable and well-tested format.
+Form: SELECT [fields] FROM [table] WHERE [conditions] ORDER BY [field] DESC LIMIT [n]
+Example: "SELECT id, date, amount, payee.name FROM transactions WHERE amount < 0 ORDER BY date DESC LIMIT 10"
 
-SQL SYNTAX (Preferred):
-  SELECT [fields] FROM [table] WHERE [conditions] ORDER BY [field] DESC LIMIT [n]
-  
-  Examples:
-  • "SELECT * FROM transactions ORDER BY date DESC LIMIT 5"
-  • "SELECT id, date, amount, payee.name FROM transactions WHERE amount < 0 LIMIT 10"
-  • "SELECT id, date, amount, category.name FROM transactions WHERE date >= '2025-01-01'"
+WHERE supports: =, !=, >, >=, <, <=; IN (v1, v2); LIKE / NOT LIKE (case and accent-insensitive, % wildcard, e.g. imported_payee LIKE '%amazon%'); IS NULL / IS NOT NULL; boolean columns as true / false (cleared = false, category.hidden = true); conditions joined with AND. OR, REGEXP, NOT IN and parenthesised groups are not supported and return an error (a query is never silently run unfiltered). Transactions come back in split-INLINE mode: "is_parent = true" returns nothing, use "is_parent = false" to exclude split children.
 
-Supported WHERE operators:
-  • Comparison: =, !=, >, >=, <, <=
-  • IN (v1, v2, ...)
-  • LIKE / NOT LIKE for pattern search (case-insensitive, accent-insensitive; use % as wildcard)
-    e.g. "WHERE imported_payee LIKE '%amazon%'" to find raw bank-sync payee strings
-  • IS NULL / IS NOT NULL e.g. "WHERE imported_payee IS NULL" to find unmerged rows
-  • Boolean columns take true / false (case-insensitive; 1 / 0 also accepted)
-    e.g. "WHERE cleared = false" for uncleared, "WHERE reconciled = true",
-    "WHERE category.hidden = true", "WHERE account.closed = true"
-    Note: transactions are returned in split-INLINE mode, so "WHERE is_parent = true" returns
-    nothing (parent rows are hidden); use "is_parent = false" to exclude split children.
-  • Combine conditions with AND. OR, REGEXP, NOT IN, and parenthesised groups are not yet
-    supported and will return an error (the query is never silently run unfiltered).
+Joins use dot notation: payee.name, category.name, account.name (NOT payee_name). Amounts are in cents: $100.00 = 10000. Dates are quoted YYYY-MM-DD strings: date >= '2025-01-01'.
+An empty result may carry a "hint" naming a category.name, payee.name or account.name value that matches no entity, with the query that lists the exact names.
 
-IMPORTANT - Field Names:
-  • Use payee.name (NOT payee_name) for payee names
-  • Use category.name (NOT category_name) for category names
-  • Use account.name (NOT account_name) for account names
-  • Amounts are in cents: $100.00 = 10000
-
-Available Tables:
-  • transactions: id, date, amount, notes, cleared, account, payee, category
-    - Join with: payee.name, category.name, account.name
-  • accounts: id, name, type, closed, offbudget
-  • categories: id, name, group, is_income
-  • payees: id, name
-  • category_groups: id, name, is_income
-
-Common Queries:
-  • Last 5 transactions: "SELECT * FROM transactions ORDER BY date DESC LIMIT 5"
-  • By category: "SELECT id, date, amount, payee.name FROM transactions WHERE category.name = 'Food' LIMIT 10"
-  • Expenses: "SELECT id, date, amount, payee.name FROM transactions WHERE amount < 0 ORDER BY date DESC LIMIT 10"
-  • Date range: "SELECT * FROM transactions WHERE date >= '2025-01-01' AND date <= '2025-12-31'"
-
-Alternative Formats:
-  • Simple table name: "transactions" (returns all records)
-  • ActualQL objects: Not recommended, use SQL instead
-
-For details: https://actualbudget.org/docs/api/actual-ql/`,
+Tables:
+- transactions: id, date, amount, notes, cleared, account, payee, category
+- accounts: id, name, type, closed, offbudget
+- categories: id, name, group, is_income
+- payees: id, name
+- category_groups: id, name, is_income`,
   inputSchema: InputSchema,
   call: async (args: unknown, _meta?: unknown) => {
     try {
@@ -68,7 +34,11 @@ For details: https://actualbudget.org/docs/api/actual-ql/`,
       
       // Detect and reject GraphQL-like syntax with nested objects
       if (input.query.trim().startsWith('query ') && input.query.includes('{') && input.query.includes('}')) {
-        throw new Error(`GraphQL syntax is not fully supported. Please use SQL instead.\n\nExample: SELECT id, date, amount, payee.name, category.name FROM transactions ORDER BY date DESC LIMIT 5\n\nYour query attempted: ${input.query.substring(0, 100)}...`);
+        // The client sees its own query echoed; the log gets content-free text (#559).
+        throw withLogMessage(
+          new Error(`GraphQL syntax is not fully supported. Please use SQL instead.\n\nExample: SELECT id, date, amount, payee.name, category.name FROM transactions ORDER BY date DESC LIMIT 5\n\nYour query attempted: ${input.query.substring(0, 100)}...`),
+          'GraphQL-style query rejected',
+        );
       }
 
       // Read-only shape gate (#162): reject writes / schema changes / stacked
@@ -80,20 +50,23 @@ For details: https://actualbudget.org/docs/api/actual-ql/`,
     } catch (error: any) {
       // Provide helpful error messages
       const errorMessage = error?.message || String(error);
+      // Each rewrap keeps the original's log-safe text (#559), e.g. the GraphQL rejection above.
+      const logSafe = errorLogFields(error).logMessage;
+      const carry = (e: Error) => (logSafe ? withLogMessage(e, logSafe) : e);
       
       // Check if error is about payee_name, category_name, account_name
       if (errorMessage.includes('payee_name') || errorMessage.includes('category_name') || errorMessage.includes('account_name')) {
-        throw new Error(`Field name error: Use dot notation for joins.\n• Use payee.name (NOT payee_name)\n• Use category.name (NOT category_name)\n• Use account.name (NOT account_name)\n\nExample: SELECT id, date, amount, payee.name FROM transactions LIMIT 5\n\nOriginal error: ${errorMessage}`);
+        throw carry(new Error(`Field name error: Use dot notation for joins.\n• Use payee.name (NOT payee_name)\n• Use category.name (NOT category_name)\n• Use account.name (NOT account_name)\n\nExample: SELECT id, date, amount, payee.name FROM transactions LIMIT 5\n\nOriginal error: ${errorMessage}`));
       }
       
       if (errorMessage.includes('does not exist in the schema')) {
-        throw new Error(`Invalid table or field name. Available tables: transactions, accounts, categories, payees, category_groups, schedules, rules. Use dot notation for joins (e.g., category.name). Original error: ${errorMessage}`);
+        throw carry(new Error(`Invalid table or field name. Available tables: transactions, accounts, categories, payees, category_groups, schedules, rules. Use dot notation for joins (e.g., category.name). Original error: ${errorMessage}`));
       } else if (errorMessage.includes('ActualQL query builder not available')) {
-        throw new Error('ActualQL query builder is not available. The Actual Budget API may not be properly initialized.');
+        throw carry(new Error('ActualQL query builder is not available. The Actual Budget API may not be properly initialized.'));
       } else if (errorMessage.includes('parse') || errorMessage.includes('syntax')) {
-        throw new Error(`Query syntax error: ${errorMessage}\n\nRecommended: Use SQL syntax\nExample: SELECT * FROM transactions ORDER BY date DESC LIMIT 5\n\nSee tool description for more examples.`);
+        throw carry(new Error(`Query syntax error: ${errorMessage}\n\nRecommended: Use SQL syntax\nExample: SELECT * FROM transactions ORDER BY date DESC LIMIT 5\n\nSee the tool description for the supported WHERE operators and join syntax.`));
       } else {
-        throw new Error(`Query execution failed: ${errorMessage}`);
+        throw carry(new Error(`Query execution failed: ${errorMessage}`));
       }
     }
   },

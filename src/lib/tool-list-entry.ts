@@ -14,12 +14,17 @@
  */
 
 import { annotationsFor } from './tool-annotations.js';
+import { titleFor } from './tool-titles.js';
 
 /** A tool as published to clients. Deliberately minimal: what the MCP spec defines. */
 export interface ToolListEntry {
   name: string;
+  /** Human-readable display name (#641). Omitted, never undefined, when a tool has none. */
+  title?: string;
   description: string;
   inputSchema: unknown;
+  /** Published only for a tool that declares one (#642); the key is absent otherwise. */
+  outputSchema?: unknown;
   annotations: ReturnType<typeof annotationsFor>;
 }
 
@@ -36,16 +41,20 @@ const EMPTY_SCHEMA = { type: 'object', properties: {}, additionalProperties: fal
  */
 export function buildToolListEntries(
   toolNames: string[],
-  resolve: (name: string) => { description?: string; schema?: unknown },
+  resolve: (name: string) => { description?: string; schema?: unknown; outputSchema?: unknown },
 ): ToolListEntry[] {
   return toolNames.map((name) => {
-    const { description, schema } = resolve(name);
+    const { description, schema, outputSchema } = resolve(name);
     const inputSchema =
       schema && typeof schema === 'object' && Object.keys(schema).length > 0 ? schema : EMPTY_SCHEMA;
+    const title = titleFor(name);
     return {
       name,
+      // Display metadata only (#641); omitted rather than set to undefined when absent.
+      ...(title !== undefined ? { title } : {}),
       description: description || `Tool ${name}`,
       inputSchema,
+      ...(outputSchema !== undefined ? { outputSchema } : {}),
       // Advisory metadata for clients, never a guard: the MCP spec says clients must treat
       // annotations as untrusted, and nothing in src/ may branch on one.
       annotations: annotationsFor(name),

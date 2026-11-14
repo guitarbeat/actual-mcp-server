@@ -14,9 +14,10 @@
  */
 
 import { z } from 'zod';
-import type { ToolDefinition } from '../../types/tool.d.js';
+import type { ToolDefinitionWithOutput } from './tool-output.js';
 import { createModuleLogger } from './loggerFactory.js';
 import observability from '../observability.js';
+import { errorLogFields } from './errors.js';
 
 const log = createModuleLogger('TOOLS');
 
@@ -51,6 +52,12 @@ export interface ToolConfig<TInput = any, TOutput = any> {
    * @returns Tool result (any serializable value)
    */
   handler: (input: TInput, meta?: unknown) => Promise<TOutput>;
+
+  /**
+   * Optional output schema (#642). The result is `{ result }`, so the schema describes that
+   * object. Must be a top-level `z.object(...).loose()`; see src/lib/tool-output.ts.
+   */
+  outputSchema?: z.ZodTypeAny;
 
   /**
    * Optional examples for documentation
@@ -93,8 +100,8 @@ export interface ToolConfig<TInput = any, TOutput = any> {
  */
 export function createTool<TInput = any, TOutput = any>(
   config: ToolConfig<TInput, TOutput>
-): ToolDefinition {
-  const { name, description, schema, handler, examples } = config;
+): ToolDefinitionWithOutput {
+  const { name, description, schema, handler, examples, outputSchema } = config;
 
   return {
     name,
@@ -104,30 +111,32 @@ export function createTool<TInput = any, TOutput = any>(
         ).join('\n')}`
       : description,
     inputSchema: schema,
+    ...(outputSchema ? { outputSchema } : {}),
     call: async (args: unknown, meta?: unknown) => {
       const startTime = Date.now();
       
       try {
+        // No args, input or result in these records (#556): they are budget data.
         // Validate input against schema
-        log.debug(`Validating input for ${name}`, { args });
+        log.debug(`Validating input for ${name}`);
         const input = schema.parse(args || {});
         
         // Execute handler
-        log.debug(`Executing ${name}`, { input });
+        log.debug(`Executing ${name}`);
         const result = await handler(input, meta);
         
         // Log success
         const duration = Date.now() - startTime;
-        log.debug(`${name} completed in ${duration}ms`, { result });
+        log.debug(`${name} completed in ${duration}ms`);
         
         // Track observability
         await observability.incrementToolCall(name);
         
         return { result };
       } catch (error) {
-        // Log error with details
+        // Class and log-safe text only (#559): the message and stack can quote input.
         const duration = Date.now() - startTime;
-        log.error(`${name} failed after ${duration}ms`, error as Error, { args });
+        log.error(`${name} failed after ${duration}ms`, undefined, { tool: name, durationMs: duration, outcome: 'error', ...errorLogFields(error) });
         
         // Track observability (still increment even on failure)
         await observability.incrementToolCall(name);

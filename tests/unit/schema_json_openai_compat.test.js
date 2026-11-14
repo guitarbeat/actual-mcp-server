@@ -63,8 +63,16 @@ console.log('Running published-schema OpenAI/ECMA-262 compatibility guard (#293)
 
   const toolNames = Object.keys(toolsIndex).filter((n) => n !== 'default');
 
-  for (const name of toolNames) {
-    const tool = toolsIndex[name];
+  // #676: the compact tools publish their own input schemas, so they are a second source.
+  const { COMPACT_TOOLS } = await import('../../dist/src/compact/registry.js');
+  const { buildCompactTool } = await import('../../dist/src/compact/dispatch.js');
+  const compactBuilt = COMPACT_TOOLS.map((spec) => buildCompactTool(spec, { callOperation: async () => undefined }));
+  const sources = [
+    ...toolNames.map((name) => [name, toolsIndex[name]]),
+    ...compactBuilt.map((tool) => [tool.name, tool]),
+  ];
+
+  for (const [name, tool] of sources) {
     if (!tool || !tool.inputSchema) continue;
     toolsChecked++;
 
@@ -107,6 +115,39 @@ console.log('Running published-schema OpenAI/ECMA-262 compatibility guard (#293)
     }
   }
 
+  // #642: the published OUTPUT schemas go to clients in the same tools/list, so the same rules
+  // apply. Walk them the same way, with a fixture proving the walk can fail on one.
+  let outputsChecked = 0;
+  const outputProblems = (schema, label) => {
+    const found = [];
+    const pats = [];
+    collectPatterns(schema, label, pats);
+    for (const { path, pattern } of pats) {
+      if (/\\[pP]\{|\\u\{/.test(pattern)) found.push(`${path} uses a u-flag-only escape`);
+      else { try { new RegExp(pattern); } catch { found.push(`${path} is not a valid non-u regex`); } }
+    }
+    return found;
+  };
+  for (const name of toolNames) {
+    const tool = toolsIndex[name];
+    if (!tool || !tool.outputSchema) continue;
+    outputsChecked++;
+    for (const p of outputProblems(z.toJSONSchema(tool.outputSchema, { io: 'output' }), `${name}.outputSchema`)) {
+      console.error(`  FAIL [${p}]`);
+      failures++;
+    }
+  }
+  if (outputsChecked === 0) {
+    console.error('  FAIL: no tool outputSchemas were checked. The output walk would pass vacuously.');
+    failures++;
+  }
+  const badOutput = z.toJSONSchema(z.object({ n: z.string().regex(/^[\p{L}]+$/u) }).loose(), { io: 'output' });
+  if (outputProblems(badOutput, 'fixture').length !== 1) {
+    console.error('  FAIL: the output-schema walk did not flag a u-flag-only pattern fixture.');
+    failures++;
+  }
+  console.log(`Checked ${outputsChecked} output schema(s).`);
+
   console.log(`\nChecked ${toolsChecked} tool schema(s), ${patternsChecked} pattern(s).`);
 
   // Self-check: the guard must actually be exercising tools. If the index
@@ -116,6 +157,11 @@ console.log('Running published-schema OpenAI/ECMA-262 compatibility guard (#293)
     console.error('  FAIL: no tool inputSchemas were checked (index empty?). Guard would pass vacuously.');
     failures++;
   }
+  if (compactBuilt.length === 0) {
+    console.error('  FAIL: no compact tool inputSchemas were checked (#676). The compact half would pass vacuously.');
+    failures++;
+  }
+  console.log(`Checked ${compactBuilt.length} compact tool schema(s).`);
 
   if (failures > 0) {
     console.error(`\n❌ ${failures} published-schema compatibility failure(s).`);

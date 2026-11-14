@@ -1,0 +1,1374 @@
+# Security & Privacy
+
+**Project:** Actual MCP Server  
+**Purpose:** Define security policies, privacy practices, and incident response  
+**Last Updated:** 2026-06-07
+
+---
+
+## 🎯 Purpose
+
+This document establishes **security policies and privacy practices** for the Actual MCP Server. It defines how we protect user data, secure the system, and handle security incidents.
+
+---
+
+## 🔐 Authentication & Authorization
+
+### Authentication Methods
+
+#### 1. **Bearer Token Authentication**
+
+**Status**: ✅ Implemented and recommended
+
+**Both methods on the MCP path are gated (#447).** POST and GET (the SSE stream)
+now run the same `authenticateRequest` check. Before #447 only POST called it in
+the default static-bearer posture, so a GET on the identical path was
+unauthenticated. The practical exposure was small, because that route returned
+constants and a stream keyed by a 122-bit server-generated session id, but the
+inconsistency blocked reporting a session's init failure there (#438) and is the
+kind of gap that becomes a hole the moment a more informative response is added.
+**This is a behaviour change**: an SSE client that connected without a token
+previously received a 400 and now receives a 401.
+
+**How it works**:
+```yaml
+# LibreChat configuration
+mcpServers:
+  actual-mcp:
+    headers:
+      Authorization: "Bearer your_secure_token_here"
+```
+
+**Token Generation**:
+```bash
+# Generate secure random token
+openssl rand -hex 32
+
+# Or use Node.js
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+**Environment Configuration**:
+```bash
+MCP_SSE_AUTHORIZATION=your_generated_token
+```
+
+**Security Properties**:
+- ✅ Stateless - no session management needed
+- ✅ Works with HTTP transport
+- Rotating the token means changing the value and restarting the server: configuration is read once at startup
+
+#### 1b. **One static token per client (`MCP_STATIC_TOKENS`, #572)**
+
+**Status**: ✅ Implemented (`AUTH_PROVIDER=none`). Proposed and first implemented by
+@jospaquim in PR #569.
+
+With `MCP_SSE_AUTHORIZATION` alone every caller is the one principal `static-bearer`: all
+clients share one budget preference and can see every budget. `MCP_STATIC_TOKENS` gives
+each client its own token, and each token its own principal and budget allow-list, without
+running an identity provider:
+
+```bash
+MCP_STATIC_TOKENS={"alice":{"tokenEnv":"MCP_TOKEN_ALICE","budgets":["Home"]},"bob":{"tokenEnv":"MCP_TOKEN_BOB","budgets":["Home","Business"]}}
+MCP_TOKEN_ALICE=<openssl rand -hex 32>
+MCP_TOKEN_BOB=<openssl rand -hex 32>
+```
+
+- **The principal** is the JSON key. It keys the #189 budget preference and session
+  ownership, so alice cannot use, close or list bob's sessions.
+- **The allow-list** is `budgets`, written as registry names (`BUDGET_DEFAULT_NAME`,
+  `BUDGET_n_NAME`) and resolved to sync ids at startup. It is enforced by the same checks
+  as the OIDC `AUTH_BUDGET_ACL`: every operation on a budget outside the list is refused,
+  a switch to one returns the same "not found" as a name that does not exist, and the
+  budget listings show only the permitted budgets (#570). A static principal is always
+  restricted; `"*"` is not accepted.
+- **Token requirements**, checked before the server binds: the variable a `tokenEnv`
+  names must start with `MCP_TOKEN_` (so it cannot point at `ACTUAL_PASSWORD`), be set,
+  be at least 32 characters, use only RFC 6750 token characters, and be unique across
+  all principals and `MCP_SSE_AUTHORIZATION`. Any violation, and any unknown budget name,
+  refuses startup with a message that names the variable but never prints a token.
+- **Matching** hashes the presented token and compares it, in constant time, against
+  every configured token with no early exit, so response timing reveals neither which
+  principal matched nor how many exist. Only the SHA-256 digests are kept in memory.
+- **Logs** never print a token: every `MCP_TOKEN_*` value is scrubbed from log output,
+  and the startup line lists principals with their budget counts only.
+- **Coexistence**: `MCP_SSE_AUTHORIZATION` may stay set beside it (the startup log flags
+  it as unrestricted), so clients can move one at a time. `MCP_STATIC_TOKENS` is refused
+  with `AUTH_PROVIDER=oidc`, where the verified JWT decides the principal.
+
+Known limitations:
+
+- **No in-process rate limiter.** Brute force is bounded by the 32-character minimum (at
+  least 128 bits for a hex token); if the server is reachable from an untrusted network,
+  throttle at your reverse proxy.
+- **The session pool is shared.** `MAX_CONCURRENT_SESSIONS` (default 15) counts every
+  principal's sessions together, and it is a hard bound: a slot is reserved
+  synchronously at initialize, so parallel initializes cannot exceed it (#581). Set
+  `MAX_SESSIONS_PER_PRINCIPAL` so one client cannot starve the others (#577): a principal
+  at its cap gets a 503 naming its own count, and other principals still connect. The
+  cap is per principal, not per person: two named tokens held by one person are two
+  principals. Requests on the legacy `MCP_SSE_AUTHORIZATION` token and unauthenticated
+  requests are not capped (they have no principal to count against), so they remain
+  bounded only by the global cap. Unset by default.
+- **One budget is open per process.** Two clients working on different budgets at the
+  same time force a budget reload on every alternation, which serialises all sessions
+  for the reload. Give each client one budget where you can, and for heavy concurrent use
+  of different budgets run one server per budget.
+- **A removed principal's preference entry stays in the store, inert.** The stored budget
+  preference is re-checked against the live allow-list on every restore, so it grants
+  nothing; it is not deleted from the preference file.
+
+**Behaviour change for OIDC (#572).** A session that has not switched and has no stored
+preference now starts on the first budget its allow-list permits, in registry order
+(default budget, then `BUDGET_1`, `BUDGET_2`, ...). Before, an OIDC principal whose list
+excluded the default budget got `Budget ACL:` on every call until it switched. Static and
+OIDC principals share this fallback; a wildcard principal still starts on the default
+budget.
+
+#### 2. **OIDC / JWT Authentication**
+
+**Status**: ✅ Implemented (`AUTH_PROVIDER=oidc`)
+
+**How it works**: The server validates JWTs using JWKS from the OIDC issuer.
+No PKCE flow runs on the server. The MCP client (e.g., LibreChat) handles the OAuth code exchange.
+
+**JWKS discovery and transport security (#244)**: the JWKS URI is resolved from the issuer's
+OpenID discovery document (`/.well-known/openid-configuration`), not a hardcoded path, so standard
+IdPs work. The issuer must be https (a plaintext issuer lets a network attacker swap the JWKS and
+forge tokens); a loopback issuer is allowed for local dev, and `OIDC_ALLOW_INSECURE_ISSUER=true`
+is an explicit opt-out for a trusted-network http issuer (for example a LAN Casdoor). The resolved
+`jwks_uri` must be https and same-origin with the issuer, the discovery fetch does not follow
+redirects, and a failed or expired token now returns a clean 401 (the jose error is wrapped, never
+the raw token); outside production the body's `cause` names the failing claim (for example
+`claim: aud`) but never the token's decoded payload, and in production the body carries no `cause`
+at all (#463).
+
+**Audience allowlist (#245)**: the `aud` claim is validated against a strict, closed set: the
+required `OIDC_RESOURCE` plus any explicitly configured `OIDC_ACCEPTED_AUDIENCES` (comma-separated,
+for IdPs like Authentik that put the client-id in `aud`). The membership check stays inside jose,
+empties are filtered, and there is no wildcard or accept-any path, so a token whose `aud` is outside
+the configured set is still rejected (the cross-relying-party replay protection from #160 holds).
+With no extras configured the set is exactly `[OIDC_RESOURCE]`, unchanged from before.
+
+**Cloudflare Access assertion mode (#462)**: `OIDC_TOKEN_SOURCE=cf-access-jwt-assertion` with
+`OIDC_JWKS_URI=https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` is Cloudflare's documented
+pattern for an MCP server behind Access with Managed OAuth: the client's bearer is an opaque Cloudflare
+token, the edge forwards the signed Access JWT in the `Cf-Access-Jwt-Assertion` header, and this server
+verifies THAT exactly like any bearer JWT (signature, `iss` pinned, `aud` in the closed allowlist, non-empty
+`sub`). One token source per mode, one verification per request, no fallback: `Authorization` is never
+consulted in this mode, so a valid JWT arriving as a bearer with no assertion is refused (the
+captured-assertion-direct-to-origin case). The mode widens nothing: with it off the header is ignored, and
+`OIDC_JWKS_URI` is validated by the same body as a discovered `jwks_uri` (https, no credentials, same origin or
+`OIDC_JWKS_TRUSTED_HOSTS`) plus no query or fragment. Three startup refusals close the silent-misconfiguration
+cases: both variables require `AUTH_PROVIDER=oidc`, `OIDC_SCOPES` must be empty (the assertion carries no
+scope claim, so a required scope would 403 every request), and `AUTH_BUDGET_ACL_IDENTITY_SOURCE=userinfo` is
+refused (no discovery document, and Cloudflare's UserInfo does not accept the assertion). The header name is
+in the log redaction denylist. **This mode is NOT a substitute for network restriction**: a captured
+assertion is accepted at a directly reachable origin until its `exp` (the Access application's Session
+Duration, default 24 hours, configurable up to one month; set it short), the AUD tag is not a secret (it
+is in every assertion), and a client-supplied `Cf-Access-Jwt-Assertion` is overwritten by Cloudflare only
+when the request traverses Cloudflare. Reaching the origin only through a Cloudflare Tunnel or a Cloudflare
+IP allowlist is REQUIRED for this mode.
+
+**Cross-origin JWKS allowlist (#254)**: by default the resolved `jwks_uri` must be same-origin
+with the issuer. `OIDC_JWKS_TRUSTED_HOSTS` (comma-separated `host` or `host:port`, exact match,
+lowercased, no wildcards) is an opt-in relaxation of ONLY that same-origin check, for IdPs that
+legitimately serve keys from another host (Google: issuer `accounts.google.com`, JWKS on
+`www.googleapis.com`). An allowlisted cross-origin `jwks_uri` must be https with NO exemption:
+neither `OIDC_ALLOW_INSECURE_ISSUER` (the #244 opt-out covers a same-origin LAN issuer only)
+nor a loopback host relaxes the cross-origin path, so the allowlist can never produce a
+plaintext third-party key fetch. Also still enforced: no embedded credentials, no discovery
+redirects, the discovery timeout, and the audience allowlist. Matching is port-strict
+(`URL.host`), a bare-host entry does not trust odd ports on that host, entries are validated by
+a canonical URL round-trip at startup (a `:443` suffix, raw-unicode IDN, or unbracketed IPv6
+throws instead of sitting inert), and every allowlist acceptance is logged with issuer origin
+and JWKS host for an audit trail. Empty (default) means the same-origin-only behaviour is
+byte-identical to before.
+
+**OAuth discovery metadata endpoints (#285)**: in OIDC mode the server publishes unauthenticated
+discovery documents so OAuth clients (mcp-remote, Claude.ai, Google Gemini) can bootstrap a login.
+`/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource<path>` (RFC 9728, #473)
+identify this resource server (when `OIDC_RESOURCE` has an endpoint path like `/http`, the canonical document is served
+at the path-specific URL and a root copy is served at `/.well-known/oauth-protected-resource` for clients that look only at the root),
+and `/.well-known/oauth-authorization-server` (RFC 8414) is the authorization server metadata, re-served from the IdP's own
+OpenID discovery document because several clients resolve that path against the resource-server origin and some IdPs (Authentik)
+do not expose it there. Security
+posture: the document is fetched ONCE at startup (the same hardened fetch used for JWKS discovery: https-only issuer,
+no redirects, timeout), so no client request ever triggers an outbound fetch and there is no request-path SSRF
+surface. It is served verbatim and exposes only the endpoints the IdP already publishes publicly (no tokens,
+secrets, or internal hosts), and it is intentionally unauthenticated because a client must read it before it holds
+a token. If the startup fetch fails, the server does not start in OIDC mode (fail closed), so the route is never
+registered with a partial document, and it is absent entirely when `AUTH_PROVIDER` is not `oidc`.
+
+**Configuration**:
+```bash
+AUTH_PROVIDER=oidc
+OIDC_ISSUER=https://sso.yourdomain.com
+OIDC_RESOURCE=https://actual-mcp.yourdomain.com/http   # this server's public MCP URL: the expected 'aud' (#461)
+OIDC_ACCEPTED_AUDIENCES=your-client-id                  # only if your IdP puts the client id in 'aud' (#245)
+OIDC_SCOPES=                          # leave empty when the tokens carry no scope claim
+AUTH_BUDGET_ACL={"alice@example.com":["budget-sync-id-1"]}
+```
+
+`OIDC_RESOURCE` must be an absolute http(s) URL: it is the RFC 9728 resource identifier from which the
+protected-resource metadata route is derived, and the audience a standards client requests. A bare client id
+is refused at startup with a message naming the variable (#461); the accepted-audience set stays exactly
+`OIDC_RESOURCE` plus `OIDC_ACCEPTED_AUDIENCES`, closed, so this change adds no way to accept a token minted
+for another resource.
+
+**Casdoor & Cloudflare Access compatibility**: Cloudflare Access for SaaS auth-code flow JWTs omit the `scope` claim; Casdoor JWTs carry the scopes the client requested and omit the claim only when the client requests none.
+When the tokens carry no `scope` claim (Cloudflare Access for SaaS, or Casdoor when the client requests no scope), set `OIDC_SCOPES=` (empty string) so the server enforces no scope requirements and logs `Scopes required: (none)`. With Casdoor, list the scopes your clients request in `OIDC_SCOPES` instead, so they are enforced; this limits what the client requested, not which user it is, so per-user access still comes from the budget ACL (see the Casdoor note in [OIDC multi-user setup](../guides/authentication.md#oidc-multi-user-setup)). If a client requires scopes (like `offline_access`) advertised in discovery, set `OIDC_SCOPES_SUPPORTED`. Advertised scopes are not enforced on incoming tokens; access control comes from the signature, issuer, closed audience allowlist, non-empty `sub`, required scopes, and the budget ACL. Advertising `offline_access` exists to make the IdP issue the client a long-lived refresh token; this server cannot revoke it, so a compromised client keeps obtaining access tokens until the refresh token is revoked at the IdP. Advertise it only for clients that need it.
+
+#### Limiting a leaked refresh token (#488)
+
+Scope: this applies to `AUTH_PROVIDER=oidc` over HTTP only. Static bearer auth (`MCP_SSE_AUTHORIZATION` and `MCP_STATIC_TOKENS`, revoked by rotating the value and restarting) and stdio involve no refresh tokens. If you advertise `offline_access` in `OIDC_SCOPES_SUPPORTED`, the refresh token the client obtains lives at the IdP and outlives anything this server controls. Three facts shape the response:
+
+- This server verifies access tokens locally against the IdP's JWKS (`src/server/httpServer.ts`) and does no token introspection, so an access token that has already been issued stays valid here until its `exp`, even after its refresh token is revoked. A short access-token lifetime matters as much as a short refresh-token lifetime.
+- With the static source (`AUTH_BUDGET_ACL`), the map is parsed once and cached in `src/auth/budget-acl.ts`, so an edit takes effect only after a restart. With `AUTH_BUDGET_ACL_SOURCE=actual`, allowed budgets are cached per principal for 60 seconds, so a change in Actual applies within about a minute.
+- With the static source, a principal is matched by email, by `sub` and by each `group:<name>`, so removing one key does not cut a user who still matches another key. The dynamic source matches one resolved identity against each budget file's access list and consults none of those keys.
+
+What to set up at the IdP, in general terms (no vendor setting is named here; check your IdP's documentation):
+
+- Give the MCP client's application a short refresh-token lifetime and, where supported, an idle timeout, so a leaked token expires on its own.
+- Give it a short access-token lifetime, because of the local-verification point above.
+- Enable refresh-token rotation with reuse detection where the IdP implements it (RFC 9700 section 4.14.2). Rotation alone is not sufficient: reuse detection catches a replayed copy only while the legitimate client is still refreshing. Sender-constrained tokens (DPoP, RFC 9449, or mutual TLS, RFC 8705) are the stronger option where the client supports them. Revocation remains the remedy (RFC 6749 section 10.4).
+- Know where to revoke: the grant or the refresh tokens of that client in the IdP's admin console, or the IdP's RFC 7009 revocation endpoint.
+- Advertise `offline_access` only for the clients that need it.
+
+If a client is compromised, in this order:
+
+1. Cut the principal at this server. With the static source, map it to an empty list (`{"alice@example.com":[]}`), make sure no other key (email, `sub`, `group:<name>`) still matches it, and restart. With the dynamic source, remove it from the budget file's access list in Actual, which applies within 60 seconds.
+2. Revoke the client's grant or refresh tokens at the IdP.
+3. Wait out the last access token's `exp` before calling the incident contained.
+
+Fail-open warning for step 1: with the static source, an unset variable or `{}` means every authenticated user may reach every budget, so the cut-off exists only if an ACL was configured before the incident. Never delete the last key. To cut one principal off, map it to `[]`, never remove the variable. Since #551 an invalid value refuses startup instead of silently opening every budget, so a restart that fails with `AUTH_BUDGET_ACL is malformed` means the edit did not apply: fix the JSON and restart again. A startup that gets past config validation means the JSON parsed. The map itself is loaded lazily, so the line `[ACL] Budget ACL loaded: N principal(s)` (at the `info` level) appears on the first authenticated request after the restart, not at boot.
+
+References: RFC 9700 (OAuth 2.0 Security Best Current Practice) section 4.14 on refresh tokens, RFC 6749 section 10.4, RFC 7009 (token revocation), RFC 9449 (DPoP), RFC 8705 (mutual TLS). RFC 9728 covers only the `scopes_supported` advertisement itself.
+
+**Per-user Budget ACL** (`AUTH_BUDGET_ACL`):
+```
+# Format: a JSON object mapping each principal to an array of budget sync IDs.
+# Use "*" as the sync ID to grant wildcard (all-budget) access.
+AUTH_BUDGET_ACL={"alice@example.com":["aaa-bbb-ccc"],"group:admin":["*"]}
+```
+Principals are matched against the JWT `sub` claim, the `email` claim, and each entry of the `groups` claim, where group entries match as `group:<name>`. The `roles` claim is used only when the token has no `groups` claim (or a `null` one), and either counts only when it is a JSON array.
+If `AUTH_BUDGET_ACL` is unset, empty or `{}` (and `AUTH_BUDGET_ACL_SOURCE` is the default `static`), every authenticated user can reach every configured budget.
+
+**An invalid `AUTH_BUDGET_ACL` refuses startup** (#551). A set value must be a JSON object whose every value is an array of non-empty strings; invalid JSON (a trailing comma, for example), an array, a scalar, `null`, or an entry that is not such an array makes the server exit at startup with a message naming the variable and the problem class, on HTTP and on stdio alike. The check runs whatever `AUTH_PROVIDER` and `AUTH_BUDGET_ACL_SOURCE` are set to. Unset, an empty string, and `{}` keep the documented open behaviour. The error text never includes a principal or a sync id. Should the runtime parser ever see an invalid value anyway (it cannot from the environment once startup validation has passed), every principal is denied with a 403 and an `[ACL] Invalid AUTH_BUDGET_ACL: access denied` error line, never granted every budget.
+
+Upgrade note: before #551 an invalid value was logged once and then treated as "no ACL", so every authenticated user could reach every budget. A deployment whose value was silently invalid will refuse its first restart after upgrading, including one with `AUTH_PROVIDER=none` or `AUTH_BUDGET_ACL_SOURCE=actual`, where the variable was previously ignored. The fix is to correct the JSON or unset the variable.
+
+**Security Properties**:
+- ✅ JWKS-validated JWT (cryptographically verified)
+- ✅ Per-user budget isolation via `AUTH_BUDGET_ACL`
+- ✅ Compatible with Casdoor v2.13, Keycloak, Auth0
+- ✅ Group-based access control
+- ⚠️ Requires OIDC issuer reachable from MCP server
+
+#### 3. **Password-Based (Actual Budget)**
+
+**Purpose**: Authenticate with Actual Budget server
+
+**Configuration**:
+```bash
+ACTUAL_PASSWORD=your_actual_budget_password
+```
+
+**Security**:
+- ✅ Stored in environment variables
+- ✅ Never logged or exposed
+- ✅ Supports Docker secrets
+- ❌ Cannot use OAuth/JWT (Actual Budget limitation)
+
+### Authorization Model
+
+**Default** (`AUTH_PROVIDER=none`): Single-user, full access
+
+**OIDC mode** (`AUTH_PROVIDER=oidc`): Per-user budget ACL via `AUTH_BUDGET_ACL`
+
+**All authenticated users can**:
+- Read all financial data
+- Modify all transactions
+- Delete accounts and budgets
+- Access all tools
+
+**With `AUTH_BUDGET_ACL` configured**:
+- Each user is mapped to a specific budget sync ID
+- Users can only access their own budget
+- Group principals (`group:admins`) give shared access
+- Suitable for household or small-team deployments
+
+**Without `AUTH_BUDGET_ACL`**:
+- With the default `AUTH_BUDGET_ACL_SOURCE=static`, all authenticated users can reach every configured budget (with `actual`, each user gets only what Actual grants)
+- Suitable for personal use
+
+#### Identity matching for the dynamic ACL, and what it inherits (#343)
+
+When `AUTH_BUDGET_ACL_SOURCE=actual`, the principal is matched against Actual's
+`userName`, resolved with Actual's own claim precedence: `preferred_username`,
+`login`, `email`, `id`, `sub`.
+
+**This is not the identifier OIDC would recommend, and the reason is worth stating.**
+OIDC Core guarantees only that `sub` is "locally unique and never reassigned";
+`preferred_username` carries no such guarantee and is editable by the user at many
+IdPs. v0.11.0 keyed on `sub` for exactly that reason and the feature did not work at
+all: Actual stores no `sub`. It resolves the precedence above, saves the result as
+`user_name`, and generates an unrelated UUID as `userId`. There is no field a `sub`
+can be compared against, so every principal resolved to zero budgets.
+
+**The exposure is inherited, not introduced.** An IdP that lets a user set
+`preferred_username` (or an unverified `email`) to another user's value allows
+impersonation HERE exactly as it does in Actual's own login, because Actual keys its
+accounts the same way. This server does not widen the surface; it matches it.
+
+**Mitigation for operators who need better.** Pin `AUTH_BUDGET_ACL_CLAIM` to a claim
+your IdP does not let users edit, and ensure that same claim is what populates
+Actual's `user_name`. Note this must be true on BOTH sides: pinning a claim here that
+Actual did not use produces no matches and denies everyone.
+
+**Stronger mitigation: bind the principal explicitly (#345).**
+`AUTH_BUDGET_ACL_IDENTITY_MAP` takes `<sub>=<actual userName>` pairs and is consulted
+before the precedence:
+
+```bash
+AUTH_BUDGET_ACL_IDENTITY_MAP=a1b2c3d4e5f6opaque=jdoe,f7e8d9c0b1a2opaque=asmith
+```
+
+This removes the mutable-claim exposure entirely for the principals it covers, because
+the lookup key is the verified `sub` and nothing a user can edit at the IdP changes it.
+It also answers two failure modes no claim heuristic can:
+
+- **A claim absent from the access token.** Actual derives `user_name` from the
+  UserInfo RESPONSE, while this server reads the verified ACCESS TOKEN. An IdP that
+  returns `preferred_username` from one and not the other denies every principal.
+- **An IdP-side rename.** Actual writes `user_name` once at first login and never
+  updates it, so renaming a user at the IdP breaks the join permanently.
+
+**The map is authoritative.** If a `sub` is bound and its target matches no budget
+file, the principal is DENIED; there is no fallback to the claim precedence. That is
+deliberate: a fallback would let an operator typo be masked by an accidental claim
+match, granting access through a path nobody configured while the mistake stays
+invisible. A blank target is rejected at startup, because it would match the
+service-account row that owns every file.
+
+**Finding the values to bind.** With `AUTH_BUDGET_ACL_SOURCE=actual`, the server logs
+one `dynamic ACL preflight` line at startup naming every `userName` on offer. If that
+line reports none, the Actual server is almost certainly in password mode, where
+`userName` is blank for every row and no principal can ever resolve.
+
+#### Reading identity from the UserInfo endpoint (#346)
+
+`AUTH_BUDGET_ACL_IDENTITY_SOURCE=userinfo` resolves the principal by calling the
+IdP's UserInfo endpoint with the caller's own access token, then applying Actual's
+precedence to that RESPONSE. It is the same document Actual read
+(`client.userinfo(tokenSet.access_token)` in `openid.ts`), so it removes the entire
+class of mismatch where an IdP returns a claim from UserInfo but omits it from the
+access token.
+
+**It is opt-in, and the default remains `token`, because it is a real trade.**
+Enabling it makes the IdP a hard dependency of authorization: while UserInfo is
+unreachable, every principal is denied. It also requires the access token to have been
+issued with the `openid` scope, which this server does not require (`OIDC_SCOPES` is
+optional), so a client that never requested it gets a 401 from UserInfo and is denied.
+
+**Controls on that request:**
+
+- **Same origin only.** The `userinfo_endpoint` must share an origin with
+  `OIDC_ISSUER`. Unlike `jwks_uri` there is deliberately no allowlist: this request
+  carries a bearer token rather than fetching public keys, so a wrongly-trusted host
+  is a token exfiltration primitive. An operator who allowlisted a key host under
+  #254 never agreed to have access tokens posted there.
+- **Subject binding (OIDC Core 5.3.2).** The `sub` in the response must equal the
+  `sub` in the verified access token. Without this check, anything able to answer as
+  that endpoint could return another user's `preferred_username` and be handed that
+  user's budgets. A mismatch is denied outright and is never retried against the
+  token claims, so a detected substitution cannot become a silent downgrade.
+- **Bounded and fail closed.** The request is bounded by
+  `AUTH_BUDGET_ACL_USERINFO_TIMEOUT_MS` (default 5s, no disable value). A timeout, a
+  transport error, a non-JSON body, a signed `application/jwt` body (refused rather
+  than trusted unverified), a 401/403, or a response with no usable claim all deny.
+  None of them fall back to the token claims: a fallback would change which identity
+  resolves at the moment the system is least healthy.
+- **Untrusted values are not coerced.** A `preferred_username` that is an object, or
+  an `email` that is a number, is treated as absent rather than stringified into an
+  identity.
+- **The response body is never logged.** It is user PII by definition.
+- **Caching.** Successful resolutions are cached for 60 seconds keyed on `sub`, so a
+  principal costs at most one UserInfo request per minute. Failures are not cached.
+  This does not widen the revocation window beyond the ACL cache that already exists.
+
+`AUTH_BUDGET_ACL_IDENTITY_MAP` is consulted BEFORE this and short-circuits it, so an
+explicit binding costs no network call and keeps working while the IdP is down.
+
+**Guards that hold regardless of the claim chosen:**
+- A missing, non-string or blank claim yields a null principal, never `''`.
+- The matcher skips blank `userName` values. This matters because the MCP server's own
+  password/service account appears in every file's access list with `owner: true` and a
+  blank `userName`; without the guard, a principal resolving to empty would inherit
+  owner access to every budget on the server.
+- Every failure path denies. An unreachable server, an unparseable response, or an
+  unmatched principal all return no budgets, never a wildcard.
+
+#### Known limitation: the dynamic ACL resolves via a budget download (#338)
+
+When `AUTH_BUDGET_ACL_SOURCE=actual`, the ACL is resolved with `adapter.getBudgets()`.
+Every adapter session init calls `downloadBudget(ACTUAL_BUDGET_SYNC_ID)`, so resolving
+the ACL also downloads the configured DEFAULT budget, even though the ACL only needs
+the file list.
+
+This is not a correctness problem: a working, downloadable default budget is already
+required for the server to serve any tool at all, so it introduces no failure mode that
+did not already exist. It is an efficiency cost, bounded by the resolver's 60 second
+per-principal cache, so it is one download per principal per minute at worst.
+
+The clean fix is a narrow adapter entry point that lists budget files without
+downloading one. It was deliberately not built, because it means touching
+`src/lib/actual-adapter.ts` (the modify-with-caution tier, and the owner of the
+non-reentrant session lock) for a performance gain rather than a correctness one.
+
+#### Listings, import and error text under a restricted ACL (#570)
+
+The budget ACL checks the session's ACTIVE budget on every operation. Since #570 it
+also covers the paths that do not touch the active budget. For a session whose
+`allowedBudgets` is a list (not `["*"]`):
+
+- `actual_budgets_list_available` and `actual_budgets_get_all` return only the
+  permitted budgets. A server budget file that was never uploaded (no group id) is
+  hidden.
+- `actual_budgets_import` is refused with a `Budget ACL:` error, because the budget it
+  creates would belong to no principal's list.
+- Refusals and the switch's "not found" error no longer name budgets or sync ids
+  outside the list. A switch to a budget outside the list returns the same "not
+  found" error as a name that does not exist, so guessing names cannot confirm that
+  a budget exists. The `acl_denied` log line keeps the attempted sync id.
+
+Under OIDC a request that reaches these paths with no `allowedBudgets` is refused, as
+every other operation is. A `MCP_STATIC_TOKENS` principal (#572) is restricted to its
+`budgets` the same way. Wildcard sessions, `MCP_SSE_AUTHORIZATION`,
+`MCP_ALLOW_UNAUTHENTICATED` and stdio are unrestricted and see every budget.
+
+#### Known limitation: `actual_budgets_import` creates an un-ACL'd budget (#334)
+
+`actual_budgets_import` wraps `@actual-app/api`'s `importBudget()`, which does not
+merely read a file. Read from `importActual` and `cloud-storage` in the installed
+package: it closes the current budget, restores the archive into the local directory
+named by **the budget id the archive itself carries**, clears its cloud file and group
+ids, loads it, and uploads it as a new budget file. Three consequences follow, all
+accepted behaviour rather than defects:
+
+1. **It can OVERWRITE an existing budget's LOCAL copy.** Re-importing an export of
+   budget X replaces X's local data, which this process serves until X is next
+   downloaded. On the server it never overwrites another budget: the upload always
+   creates a new file (best effort; a failed upload leaves the budget local only).
+2. **A budget the import creates is outside the ACL.** `AUTH_BUDGET_ACL` maps
+   principals to budget sync IDs that exist when the ACL is evaluated, so a budget
+   that first appears mid-session has no ACL entry covering it. A session with a
+   restricted list is therefore refused the import (#570). A wildcard or
+   unrestricted caller can still import, and the new budget is then visible to every
+   unrestricted caller.
+3. **The `path` input reads the server's filesystem.** The tool accepts a path so an
+   operator can restore an `actual_budgets_export` output. That path is not
+   restricted to the export directory, so any file the runtime user can read may be
+   handed to the importer. The importer rejects anything that is not a valid budget
+   archive, so this is a validity oracle rather than a file-disclosure primitive: it
+   does not return file contents.
+
+**Operational guidance.** In a shared or multi-user HTTP deployment, treat
+`actual_budgets_import` as an administrative operation. If your threat model does not
+allow it, remove it from the advertised surface rather than relying on the ACL to
+contain it: publish an `MCP_TOOLSETS` list without `admin`, or set `MCP_READ_ONLY=true`. In single-user stdio deployments (Claude Desktop), the caller already has
+the user's own filesystem privileges and this adds no new capability.
+
+`actual_budgets_export` carries none of this: it writes a file, but only inside
+`ACTUAL_EXPORT_DIR`, and its filename input is restricted to a flat alphanumeric
+charset so it cannot traverse out of that directory. Because it writes a file it is
+withheld under `MCP_READ_ONLY=true`.
+
+#### Tool surface: MCP_TOOLSETS and MCP_READ_ONLY
+
+`MCP_TOOLSETS`, `MCP_TOOLS` and `MCP_READ_ONLY` choose which tools the server publishes.
+A tool that is not published is both left out of `tools/list` and refused if called by
+name; the refusal names the setting responsible. The names below are the legacy `actual_*`
+operations. Under the default compact surface (`MCP_TOOL_SURFACE=compact`, #680) these
+settings still decide per operation: a compact tool is listed when any operation behind it
+is selected, an action whose operation is hidden is refused naming the setting, and a
+compact tool with a write-capable action is hidden whole under `MCP_READ_ONLY=true`. When both settings hide a tool, the refusal names `MCP_READ_ONLY`, because no toolset change can publish it while read-only is on.
+
+- `MCP_READ_ONLY=true` hides and refuses every write-capable tool: every tool that
+  reaches the adapter write queue, plus `actual_bank_sync`, `actual_budgets_export`,
+  `actual_budgets_switch` and `actual_session_close`. The rest stay published.
+  `actual_query_run` (SELECT only) and `actual_session_list` stay available.
+- The setting is per process, not per principal. Every caller of the process sees the
+  same surface.
+- It is not a substitute for a read-only Actual user or for `AUTH_BUDGET_ACL`. It narrows
+  what this server offers; it does not change what the underlying Actual account may do.
+- An HTTP session still downloads and loads its budget under read-only.
+- The write-capable set is a hard-coded list guarded by a call-graph test, not derived
+  from the MCP tool annotations, which are advisory hints.
+- Invalid values (an unknown toolset or tool name, a `MCP_READ_ONLY` other than `true`
+  or `false`, a configuration that publishes zero tools) stop the server at startup.
+
+---
+
+## 🔒 Production Branch Protection (#267)
+
+Two repository rulesets protect `main` server-side (configured 2026-07-05; they live in repo
+settings, so this section is the versioned record of their intended shape):
+
+1. **`main: append-only (no force pushes, no deletion)`**: blocks force pushes and branch
+   deletion for EVERYONE, no bypass actors. Even an allowlisted or stolen credential cannot
+   rewrite or erase history; main is append-only.
+2. **`main: restrict pushes to release paths`**: the `update` rule restricts direct pushes to
+   exactly two bypass principals: the repository admin role (the maintainer's `/release`
+   fast-forward) and the `actual-mcp-dependency-updater` GitHub App, App ID 2603676 (the
+   auto-release lane in `dependency-update.yml`, which pushes main and release tags with an
+   App-token-authenticated checkout since #261).
+
+Rationale and the full options analysis live in issue #267. Client-side guards (the
+release-gate hook and the version-bump freshness abort) remain as defense in depth, but the
+rulesets make the develop-first policy hold for every machine and credential, and they also
+prevent Dependabot security-update PRs (which always target the default branch) from being
+merged outside the release path. If these rulesets are changed, update this section; drift
+between this record and `gh api repos/agigante80/actual-mcp-server/rulesets` output is a
+red flag.
+
+---
+
+## 🛡️ Data Protection
+
+### Data at Rest
+
+#### Budget Data Cache
+
+**Location**: `MCP_BRIDGE_DATA_DIR` (default: `./actual-data`)
+
+**Contents**: SQLite database with all budget data
+
+**Protection**:
+- ✅ Local filesystem permissions (0600 recommended)
+- ✅ Not exposed via API
+- ✅ Can be encrypted at filesystem level (LUKS, FileVault)
+- ❌ No application-level encryption (relies on OS)
+
+**Recommendation**:
+```bash
+# Set restrictive permissions
+chmod 700 ./actual-data
+chown $USER:$USER ./actual-data
+
+# Or use encrypted volume
+# Linux: LUKS
+# macOS: FileVault
+# Windows: BitLocker
+```
+
+#### Budget Preference Store
+
+**Location**: `MCP_BRIDGE_DATA_DIR/budget-preferences.json`
+
+**Contents**: a map from `sha256(principal)` to a budget sync id. It lets a re-initialized session (after a server restart) restore the user's last active budget.
+
+**Protection**:
+- ✅ Keys are SHA-256 hashes of the principal: the raw OIDC subject, email, or bearer token is never written to disk
+- ✅ Written with `0600` permissions, atomically (temp file + rename)
+- ✅ Never trusted as authorization: the live access list is re-checked before a stored budget is applied, so a stale entry cannot widen access
+- ✅ Safe to delete at any time (the feature simply falls back to the default budget)
+- Authentication itself is validated per request from the live token; nothing in this file grants access
+
+#### Log Files
+
+**Location**: `MCP_BRIDGE_LOG_DIR` (default: `./logs`)
+
+**Risk**: May contain sensitive data in error messages
+
+**Protection**:
+- ✅ File permissions (0600)
+- ✅ Log rotation with retention limits
+- ✅ Tool arguments and results are never written to the logs (#556), at any level
+- ✅ Tool error messages are never written to the logs (#559); the failure record carries the error class
+- ✅ The startup budget registry line carries counts and schemes only (#621); the adapter's login, operation and budget-switch lines print a server URL as its origin (no userinfo, path or query) but still name the budget involved. Login error messages still keep the URL path and query (userinfo is stripped). Logs written by earlier versions keep the old line until rotated
+- ✅ `actual_budgets_list_available` and `actual_budgets_switch` show a budget's server as its origin only (#628), so a reverse-proxy credential written into `BUDGET_n_SERVER_URL` or `ACTUAL_SERVER_URL` never reaches the client or its model provider. A server under a subpath shows as its host
+
+**Tool content is never logged (#556).** Tool arguments and results are the user's budget data:
+amounts, payee names, notes, balances. The server logs a content-free record per call instead,
+`[TOOL RESULT]` with `tool`, `durationMs`, `outcome: "ok"` and `bytes`, and a failed call logs
+`[TOOL ERROR]` with `tool`, `durationMs`, `outcome: "error"` and the error class, never its
+arguments or its message. The rule update path logs the rule id, not its conditions and actions. `callTool` in `src/actualToolsManager.ts` is the
+single place content could be logged, so any future opt-in for debugging (#557) belongs there.
+The #220 redaction does not cover this: it masks secret key names and configured secret values,
+not budget content. `tests/unit/tool_content_logging.test.js` guards the rule at `debug` level.
+
+**Upstream verbose output is off by default (#620).** `@actual-app/api` has its own verbose
+logging, on unless told otherwise, and on every import and bank sync it prints each reconciled
+transaction (date, amount, notes, account row). The server starts it with `verbose: false`, so
+none of that reaches the log. Upstream warnings and errors still do, but some upstream failure
+diagnostics are verbose-only (a failed budget download such as a wrong sync id, file list and
+file info errors, `API call failed` lines). `ACTUAL_API_VERBOSE=true` turns it all back on for a
+debugging window, and then the log holds transaction contents for EVERY
+principal (the mode is process-global), and upstream's failed-request logging can write the
+runtime Actual session token, which the #220 scrub does not mask (upstream output is
+pre-stringified, so only configured secret values are scrubbed, not key names). `--debug`,
+`npm run dev` and `MCP_BRIDGE_LOG_LEVEL=debug` do not turn it on.
+
+**Process-level crash records carry gated fields only (#622).** The `unhandledRejection` and
+`uncaughtException` handlers (`src/lib/processHandlers.ts`, installed second in `src/index.ts`
+right after the Node version guard) never log the rejection reason, its message, its stack or an
+upstream `.type`. A reason can carry a request object with an `Authorization` header, and upstream
+text can quote account or payee names. Each record holds `{ type, code?, httpStatus?, category,
+safeMessage }`: the class name, a gated system error code, an integer HTTP status, a category
+from a closed table, and either the throw site's log-safe text or a fixed sentence. A fatal event
+is one `sys_crash` JSON line written synchronously to stderr before `exit(1)`, never also through
+winston. A survivable one (an allow-listed rejection, a bank sync failure) is one `warn` record.
+Residual: `main().catch` in `src/index.ts`, and the `.catch` on the startup prelude that runs before
+`main()`, still log a STARTUP failure's `err.message`, because
+that text is usually the operator's only clue to a config or connection error. It is interpolated
+into the message string with no meta, so only the configured secret VALUE scrub applies, not
+#220 key name masking, and the line can be lost because `process.exit(1)` follows an
+asynchronous winston write. **Operator note:** logs stored before this fix
+(`MCP_BRIDGE_STORE_LOGS=true`, the `mcp-logs` volume in `docker-compose.yaml`) may hold dumped
+rejection reasons with request headers. Review or purge them, and rotate the Actual server
+password if a token may have been captured.
+
+**Tool error messages are never logged (#559).** An error's message is for the client and can
+quote what the caller sent (a category name, a query, a rule value) or upstream text we do not
+control, so the `[TOOL ERROR]` record and the `createTool` failure log carry `errorClass`, a
+typed refusal's `refusalKind`, and a `logMessage` only when the throw site attached one with
+`withLogMessage(error, text)` (`src/lib/errors.ts`). That text must be content-free. An error
+without one is logged by class alone, so a new throw site cannot leak by default. The Zod
+validation path logs `errorClass: 'ZodError'` and the Zod issue codes, never the #206
+formatted message, because a schema's custom refine text can quote input. The
+adapter's operation error lines (the write queue, `retry`, category create and the query
+runner) log the same `errorLogFields`, plus a Node system error `code` such as `ECONNRESET`.
+The init and shutdown failure lines still log the upstream message: they carry connection
+errors, not tool input.
+
+**Upgrade note (v0.22.38).** Logs written by earlier versions can contain budget data (tool
+results at `info`, failed-call arguments at `error`). Purge them or let rotation remove them,
+including copies held by a log shipper or in Claude Desktop's MCP log files.
+
+**Best Practices**:
+```bash
+# Restrict log file permissions
+chmod 600 ./logs/*.log
+
+# Regular cleanup
+find ./logs -type f -mtime +30 -delete
+```
+
+### Data in Transit
+
+#### Encryption password over the upstream (#161)
+
+When an E2E budget encryption password is set (`ACTUAL_BUDGET_PASSWORD`, or a
+`BUDGET_N_ENCRYPTION_PASSWORD`), the server refuses to start if the matching
+upstream `ACTUAL_SERVER_URL` (or `BUDGET_N_SERVER_URL`) is `http://`, because the
+password would be sent in cleartext (CWE-319). Use `https://` for the upstream,
+or set `ALLOW_INSECURE_UPSTREAM=true` only when the hop is genuinely trusted
+(e.g. an isolated Docker network).
+
+#### HTTPS/TLS
+
+**Status**: ✅ Fully supported
+
+**Configuration**:
+```bash
+MCP_ENABLE_HTTPS=true
+MCP_HTTPS_CERT=/app/certs/cert.pem
+MCP_HTTPS_KEY=/app/certs/key.pem
+```
+
+**Certificate Options**:
+1. **Self-signed** (development)
+   ```bash
+   openssl req -x509 -newkey rsa:4096 -nodes \
+     -keyout key.pem -out cert.pem -days 365 \
+     -subj "/CN=your-server-ip"
+   ```
+
+2. **Let's Encrypt** (production)
+   ```bash
+   certbot certonly --standalone -d your-domain.com
+   ```
+
+3. **CA-signed certificate** (enterprise)
+
+**Security Properties**:
+- ✅ Encrypts all traffic between client and server
+- ✅ Protects Bearer tokens in transit
+- ✅ Prevents man-in-the-middle attacks
+- ✅ Required for production deployments
+
+#### Connection to Actual Budget
+
+**Protocol**: HTTP or HTTPS (configurable)
+
+**Security**:
+- ⚠️ Often unencrypted (local deployment)
+- ✅ Password transmitted securely via `@actual-app/api`
+- ✅ With more than one configured login (#574), the server POSTs the password to the configured server's `/account/login` itself, so a stalled login can be aborted; it refuses redirects, so the password never follows one to another host
+- ✅ Can use HTTPS if Actual Budget server supports it
+
+**Recommendation**: Deploy Actual Budget and MCP server on same network/host
+
+#### Network exposure and bind host (#239)
+
+The HTTP server defaults to binding `0.0.0.0` (all interfaces). The `/health` and
+`/metrics` endpoints are intentionally UNAUTHENTICATED (they are liveness and Prometheus
+scrape targets), so on an exposed interface anyone who can reach the port can read them.
+
+**Recommendation**: limit the listening interface with `MCP_BRIDGE_BIND_HOST`. Set it to
+`127.0.0.1` to restrict the server (including `/health` and `/metrics`) to loopback, or to a
+specific private address to keep it off untrusted networks. As of #239 this value is honored:
+it is passed to `app.listen()`, so the server binds only to the configured interface. Leave it
+at `0.0.0.0` only when remote clients must reach the MCP endpoint directly, and pair that with
+authentication (`MCP_SSE_AUTHORIZATION`, `MCP_STATIC_TOKENS` or OIDC) and ideally a reverse proxy.
+
+#### Session ownership
+
+An MCP session id is bearer material for the Streamable HTTP transport, so each session
+belongs to the principal that initialized it (the OIDC subject, the `MCP_STATIC_TOKENS`
+principal, or the single static-bearer identity). A POST, GET or DELETE on the MCP path that carries another principal's session id is
+answered exactly as an unknown session would be. `actual_session_list` lists only the
+caller's own sessions (its totals stay pool-wide), and `actual_session_close` only matches
+and closes the caller's own sessions. The unauthenticated `/health` endpoint reports pool
+counts only and never returns a session id. The same rule covers a session whose
+initialization failed (#550): the cause of the failure is reported for 60 seconds only to the
+principal that initialized it, and any other principal presenting that id gets the unknown-id
+reply. With authentication disabled every caller is the same anonymous principal, so nothing
+changes there.
+
+#### HTTP auth is required by default (#242)
+
+A blank `MCP_SSE_AUTHORIZATION` with `AUTH_PROVIDER` unset used to disable all HTTP
+authentication silently, and the server binds `0.0.0.0` by default, so a forgotten token
+published the server open on the LAN. As of #242 the server fails closed instead: in HTTP mode,
+if the bind host is non-loopback (anything other than `127.0.0.1`, `::1`, `localhost`,
+`::ffff:127.0.0.1`, so the `0.0.0.0` default counts) AND none of `MCP_SSE_AUTHORIZATION`, `MCP_STATIC_TOKENS` (#572) or
+`AUTH_PROVIDER=oidc` is configured, the server logs a clear error and exits non-zero before
+binding. The decision is made once at startup against the configured bind host (not per request
+on `req.ip`, which a reverse proxy and a spoofed `X-Forwarded-For` could otherwise bypass).
+
+Unaffected: loopback binds (local dev), stdio mode, and any deployment with a token or OIDC
+configured. The per-request Bearer/OIDC checks are unchanged.
+
+**Opt-out**: set `MCP_ALLOW_UNAUTHENTICATED=true` (the exact string `true`) to run open
+deliberately, for example behind your own authenticating proxy. The server then starts with a
+loud warning on every boot.
+
+**Upgrade note (behavior change)**: an existing HTTP deployment on a non-loopback bind with no
+token and no OIDC that previously started open will now refuse to start. The startup error names
+the fix: set `MCP_SSE_AUTHORIZATION` (generate with `openssl rand -hex 32`), or
+`AUTH_PROVIDER=oidc`, or `MCP_ALLOW_UNAUTHENTICATED=true` to keep the old open behavior.
+
+#### Weak tokens refuse an exposed bind (#611)
+
+A token that is set but weak is treated like no token on a non-loopback bind. Weak means
+`MCP_SSE_AUTHORIZATION` shorter than 32 characters after trimming (whitespace-only included), or
+equal to one of the example values in our docs (`your-secure-token-here`,
+`replace-with-openssl-rand-hex-32`, `changeme`; compared trimmed and case-insensitive). A
+`MCP_TOKEN_*` value is checked the same way for the placeholders; its 32-character minimum was
+already enforced on every bind by #572.
+
+On a non-loopback bind the server exits non-zero before binding and names the variable, never
+its value. `MCP_ALLOW_UNAUTHENTICATED=true` does not rescue a weak token, so the message does
+not offer it. On a loopback bind the server starts and logs one warning per weak variable. An
+empty `MCP_SSE_AUTHORIZATION` is not weak: it is the no-token path above. Under
+`AUTH_PROVIDER=oidc` no bearer token is in use and nothing is checked.
+
+**Upgrade note (behavior change)**: an HTTP deployment on `0.0.0.0` with a short or example
+token now refuses to start. A Docker publish to `127.0.0.1` on the host does not help, because
+the container itself still binds `0.0.0.0`. Generate a real token with `openssl rand -hex 32`.
+
+#### DNS rebinding protection (#612)
+
+A server running without authentication (no bearer token, no `AUTH_PROVIDER=oidc`) trusts
+whoever reaches its port. A web page the user opens cannot reach it directly, but it can
+rebind its own domain name to `127.0.0.1` and then talk to the server as "itself". The
+browser still sends that domain as `Host`, so the server checks it.
+
+In open mode every HTTP route (the MCP path, `/health`, `/metrics`, `/mcp-info`) accepts only
+these `Host` names: `localhost`, `127.0.0.1`, `[::1]`, the bind address when it is a concrete
+address rather than `0.0.0.0` or `::`, the advertised host (#615: the host of the URL the
+server prints at startup, `MCP_BRIDGE_PUBLIC_HOST` or the detected LAN IP), and any name
+listed in `MCP_ALLOWED_HOSTS`. Anything
+else gets 403 with `Invalid Host: <hostname>` before a route runs. Only the `Host` header is
+read: `X-Forwarded-Host` cannot bypass it. A browser `Origin`, when present, must be one of the
+same names; `Origin: null` or a foreign origin gets 403 `Invalid Origin: ...`. A request with no
+`Origin` (every non-browser MCP client) passes. `/.well-known/*` is exempt from the Origin check.
+
+The advertised host is safe to accept: an IP literal cannot come out of DNS rebinding, and
+`MCP_BRIDGE_PUBLIC_HOST` is a name you control. For a page aimed at that host the Origin
+check is the cross-site defence, and it compares hostnames only (not scheme or port), so any
+other web app served under the same name counts as a trusted Origin. Set
+`MCP_BRIDGE_PUBLIC_HOST` only to a name whose DNS you own.
+
+With a token or OIDC configured nothing changes unless `MCP_ALLOWED_HOSTS` is set; then the
+listed names plus the loopback names are enforced as `Host` (no Origin check). stdio is
+unaffected.
+
+**Upgrade note (behavior change)**: an open-mode HTTP server reached by any other name, for
+example a container calling `http://actual-mcp-server-backend:3600` without a token, now gets
+403. Set `MCP_ALLOWED_HOSTS=actual-mcp-server-backend` (the name the client uses), or better,
+configure a token.
+
+---
+
+## 🔒 Secure Coding Practices
+
+### Secrets Management
+
+#### ✅ DO
+
+**Use environment variables**:
+```typescript
+const password = process.env.ACTUAL_PASSWORD;
+```
+
+**Validate with Zod**:
+```typescript
+const configSchema = z.object({
+  ACTUAL_PASSWORD: z.string().min(1)
+});
+```
+
+#### ❌ DON'T
+
+**Hardcode secrets**:
+```typescript
+// NEVER DO THIS
+const password = "my-secret-password";
+```
+
+**Log secrets**:
+```typescript
+// NEVER DO THIS
+logger.info(`Password: ${password}`);
+```
+
+**Commit secrets**:
+```bash
+# NEVER DO THIS
+git add .env
+git commit -m "Added config"
+```
+
+### Input Validation
+
+#### Request bodies (#168, #633)
+
+A JSON request body larger than `MCP_HTTP_BODY_LIMIT` (default `512kb`) is refused with
+HTTP 413 rather than buffered. A body sent with a `Content-Encoding` other than `identity`
+(gzip, deflate, br) is refused with HTTP 415 before any decompression starts. No MCP client
+compresses request bodies, and refusing them removes the decompression path that
+GHSA-27r3-jxmh-p828 (body-parser below 2.4.0) can crash on. Responses are unaffected.
+
+#### All User Inputs Must Be Validated
+
+**Using Zod schemas**:
+```typescript
+const schema = z.object({
+  accountId: z.string().uuid(),
+  amount: z.number().int(),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
+});
+
+// Validation happens automatically in tools
+```
+
+**SQL Injection Prevention**:
+- ✅ Use parameterized queries (Actual Budget API handles this)
+- ❌ Never concatenate user input into SQL
+
+**Path Traversal Prevention**:
+- ✅ Validate file paths
+- ✅ Use `path.resolve()` and check prefix
+- ❌ Never directly use user input in file operations
+
+### Error Handling
+
+#### ✅ DO
+
+**Provide helpful but not revealing errors**:
+```typescript
+throw new Error('Account not found');  // Good
+```
+
+**Log detailed errors securely**:
+```typescript
+logger.error('Account access failed', { 
+  accountId, 
+  userId,
+  // Don't log passwords or tokens
+});
+```
+
+#### ❌ DON'T
+
+**Leak system information**:
+```typescript
+// NEVER DO THIS
+throw new Error(`Database connection failed: ${dbConnectionString}`);
+```
+
+**Expose stack traces to users**:
+```typescript
+// NEVER DO THIS
+return { error: error.stack };
+```
+
+---
+
+## 🤖 AI Agent Security Rules
+
+### Mandatory Rules for AI Agents
+
+1. **Never expose secrets**
+   - ❌ Don't log passwords, tokens, API keys
+   - ❌ Don't include secrets in error messages
+   - ❌ Don't commit secrets to git
+
+2. **Never send private data externally**
+   - ❌ Don't call external APIs with user data
+   - ❌ Don't include financial data in AI prompts
+   - ❌ Don't share credentials outside secure environment
+
+3. **Use principle of least privilege**
+   - ✅ Only access files necessary for the task
+   - ✅ Don't modify files outside project scope
+   - ✅ Request permission for sensitive operations
+
+4. **Validate before executing**
+   - ✅ Check input types and ranges
+   - ✅ Sanitize user-provided data
+   - ✅ Use prepared statements, never string concatenation
+
+5. **Follow secure coding practices**
+   - ✅ Use environment variables for secrets
+   - ✅ Validate all inputs with Zod
+   - ✅ Handle errors without leaking information
+
+### Security Review Checklist
+
+Before committing code that touches:
+
+**Authentication**:
+- [ ] No hardcoded tokens or passwords
+- [ ] Secrets from environment variables only
+- [ ] Error messages don't leak credentials
+
+**Database/API Access**:
+- [ ] All inputs validated
+- [ ] No SQL injection vectors
+- [ ] Error messages don't leak schema
+
+**File Operations**:
+- [ ] Path traversal prevented
+- [ ] File permissions checked
+- [ ] No arbitrary file access
+
+**Logging**:
+- [ ] No secrets in logs
+- [ ] PII properly redacted
+- [ ] Debug logs disabled in production
+
+---
+
+## 🔍 Security Testing
+
+### Automated Security Checks
+
+#### 1. **Dependency Auditing**
+
+**Command**:
+```bash
+npm audit
+```
+
+**CI/CD Integration**: Runs on every push
+
+**Policy**:
+- **Critical**: Block merge, fix immediately
+- **High**: Block merge, fix before next release
+- **Moderate**: Track, fix in next patch
+- **Low**: Track, fix opportunistically
+
+#### 2. **TypeScript Type Checking**
+
+**Command**:
+```bash
+npm run build
+```
+
+**Purpose**: Catch type errors that could lead to security issues
+
+**CI/CD Integration**: Runs on every push
+
+#### 3. **Secret Scanning**
+
+**Manual check**:
+```bash
+git grep -i "password\|token\|secret\|api.?key" -- "*.ts" "*.js" "*.json" | grep -v "PASSWORD"
+```
+
+**Recommended**: Add `git-secrets` or `truffleHog`
+
+### Manual Security Reviews
+
+**Before major releases**:
+1. Review authentication logic
+2. Check for exposed secrets
+3. Verify input validation
+4. Test error handling
+5. Review Docker security
+
+**Checklist**: See [Security Review Checklist](#security-review-checklist)
+
+---
+
+## 🚨 Incident Response
+
+### Vulnerability Reporting
+
+**If you discover a security vulnerability:**
+
+1. **DO NOT** open a public GitHub issue
+2. **DO** email: [Insert security contact email]
+3. **DO** include:
+   - Description of vulnerability
+   - Steps to reproduce
+   - Potential impact
+   - Suggested fix (if any)
+
+**Response Time**:
+- **Critical**: 24 hours
+- **High**: 72 hours
+- **Medium**: 1 week
+- **Low**: Best effort
+
+### Responsible Disclosure
+
+**Our commitment**:
+- Acknowledge receipt within 24 hours
+- Provide status updates every 72 hours
+- Credit reporter in release notes (if desired)
+- Fix critical issues immediately
+
+**Your responsibilities**:
+- Allow reasonable time for fix (90 days)
+- Don't exploit vulnerability
+- Don't disclose publicly before fix
+
+### Incident Response Procedure
+
+**If security incident occurs:**
+
+1. **Identify** (0-1 hour)
+   - Confirm incident is real
+   - Assess scope and impact
+   - Notify security team
+
+2. **Contain** (1-4 hours)
+   - Isolate affected systems
+   - Stop data exfiltration
+   - Preserve evidence
+
+3. **Remediate** (4-24 hours)
+   - Fix vulnerability
+   - Deploy patch
+   - Verify fix
+
+4. **Recover** (24-72 hours)
+   - Restore normal operations
+   - Monitor for recurrence
+   - Validate security
+
+5. **Learn** (1 week)
+   - Post-mortem analysis
+   - Update security policies
+   - Prevent future incidents
+
+---
+
+## 🔄 Dependency Security Management
+
+### Vulnerability Monitoring
+
+**Automated Scanning:**
+- **Tool:** GitHub Dependabot + Renovate Bot
+- **Frequency:** Weekly (Mondays at 9 AM UTC)
+- **Scope:** All npm dependencies (production + dev)
+- **Alert Threshold:** Moderate severity and above
+
+**Manual Audits:**
+```bash
+# Run security audit
+npm audit
+
+# Check for outdated packages with vulnerabilities
+npm audit --audit-level=moderate
+
+# Fix vulnerabilities automatically (use with caution)
+npm audit fix
+```
+
+**The automated `@actual-app/api` update lane is independent of dependency security state (#298, maintainer decision):** the unattended release train (`.github/workflows/dependency-update.yml`) deliberately does NOT gate the API upgrade on `npm audit`. A pre-existing or unrelated CVE elsewhere in the tree must never hold back an `@actual-app/api` update. Dependency vulnerabilities are handled out of band by Dependabot and `/dep-auditor`, not by this release train. Human-driven CI (`ci-cd.yml`) still runs an advisory `npm audit --audit-level=high` (log-only, `|| echo`) and Trivy scans the built image, so vulnerability visibility is preserved without coupling it to the API update.
+
+### Vulnerability Response SLA
+
+| Severity | CVSS Score | Response Time | Action |
+|----------|-----------|---------------|--------|
+| **Critical** | 9.0-10.0 | 24 hours | Immediate patch, emergency deploy |
+| **High** | 7.0-8.9 | 48 hours | Priority patch, next scheduled deploy |
+| **Moderate** | 4.0-6.9 | 1 week | Scheduled patch, next sprint |
+| **Low** | 0.1-3.9 | 1 month | Routine maintenance update |
+
+### CVE Tracking
+
+**Process:**
+1. **Detection:** Dependabot/Renovate alerts on new CVE
+2. **Assessment:** Review CVE details, CVSS score, exploitability
+3. **Impact Analysis:** Determine if vulnerability affects our usage
+4. **Remediation:** Apply patch or workaround
+5. **Verification:** Test fix, deploy, monitor
+6. **Documentation:** Automated via dependency update workflow
+
+**Recent CVE Resolutions:**
+- See CI/CD audit results and GitHub Dependabot alerts for current vulnerability status.
+- Run `npm audit` locally at any time for an up-to-date report.
+
+### Dependency Update Policy
+
+**Patch Updates (x.x.X):**
+- **Frequency:** Weekly automatic updates
+- **Auto-merge:** Yes, after CI passes
+- **Review:** Post-merge monitoring
+- **Risk:** LOW - bug fixes and security patches only
+
+**Minor Updates (x.X.x):**
+- **Frequency:** Bi-weekly
+- **Auto-merge:** Dev dependencies only
+- **Review:** Required for production dependencies
+- **Risk:** MEDIUM - new features, possible deprecations
+
+**Major Updates (X.x.x):**
+- **Frequency:** Quarterly or as needed
+- **Auto-merge:** Never
+- **Review:** Required + breaking change analysis
+- **Risk:** HIGH - API changes, behavior changes, migration required
+
+### Dependency Audit Reports
+
+**Automated Audits:**
+- Weekly dependency audits (automated via GitHub Actions)
+- Continuous security vulnerability scanning (Dependabot)
+- Automated dependency updates and PRs
+- See `.github/workflows/dependency-update.yml` for automation details
+- Breaking change assessments
+- Update recommendations and roadmap
+
+**Update Frequency:** Monthly (automated generation via CI/CD)
+
+**Last Audit:** See CI/CD pipeline for current status (automatically audited on every push).
+- Run `npm audit` locally to get an up-to-date report at any time.
+
+### Dependency Pinning Strategy
+
+**Production Dependencies:**
+- Use caret ranges (`^1.2.3`) for automatic patch updates
+- Pin specific versions for problematic packages
+- Lock file (`package-lock.json`) committed to git
+
+**Git Dependencies:**
+- None currently. All dependencies are pinned npm packages resolved through `package-lock.json`.
+- If a git dependency is ever added, pin it to a specific commit SHA rather than a branch name.
+
+**Version Overrides:**
+```json
+{
+  "overrides": {
+    "vulnerable-package": "1.2.3"  // Force specific version tree-wide
+  }
+}
+```
+
+### Supply Chain Security
+
+**Measures:**
+1. ✅ Lock file committed (`package-lock.json`)
+2. ✅ Automated dependency scanning (Dependabot, Renovate)
+3. ✅ CI/CD validation (npm audit in pipeline)
+4. ⚠️ Package signatures: Not verified (npm limitation)
+5. ⚠️ Subresource Integrity: Not applicable (server-side)
+
+**Best Practices:**
+- Review dependency changes in PRs
+- Verify package maintainer reputation (npm downloads, GitHub stars)
+- Avoid dependencies with excessive transitive deps
+- Monitor for typosquatting attempts
+- Use npm audit before every release
+
+**Dependency Review Checklist:**
+- [ ] Package has > 1M weekly downloads OR established reputation
+- [ ] Last update within 6 months (actively maintained)
+- [ ] Permissive license (MIT, Apache, ISC, BSD)
+- [ ] No open critical security issues
+- [ ] Reasonable dependency tree (< 50 transitive deps)
+- [ ] TypeScript types available (@types/* or built-in)
+
+---
+
+## 📜 Privacy Policy
+
+### Data Collection
+
+**We collect**:
+- Actual Budget server URL (configuration)
+- Budget data (cached locally)
+- Tool usage metrics (optional)
+- Error logs (local only)
+
+**We do NOT collect**:
+- Personal identification
+- Financial data (stays local)
+- Usage patterns (unless metrics enabled)
+- IP addresses (unless reverse proxy logs)
+
+### Data Storage
+
+**All data stored locally**:
+- Budget cache: `MCP_BRIDGE_DATA_DIR`
+- Logs: `MCP_BRIDGE_LOG_DIR`
+- No cloud storage
+- No external transmission
+
+### Data Retention
+
+**Budget data**: Until manually deleted
+
+**Logs**: 
+- Default: 14 days (with rotation)
+- Configurable via Winston settings
+- Can be disabled entirely
+
+**Metrics**: In-memory only (lost on restart)
+
+### Third-Party Access
+
+**No third-party services**:
+- No analytics
+- No crash reporting
+- No external APIs
+- Self-hosted only
+
+### User Rights
+
+**As a user, you can**:
+- Access all your data (it's local)
+- Export your data (standard Actual Budget export)
+- Delete your data (delete cache directory)
+- Opt out of metrics (disable observability)
+
+---
+
+## 🔧 Docker Security
+
+### Container Security
+
+**Non-root user**:
+```dockerfile
+USER app
+```
+
+**Minimal attack surface**:
+- Alpine base image
+- Multi-stage build
+- Only production dependencies
+
+**Best practices**:
+<!-- install-snippets: fragment -->
+```bash
+# Run with read-only filesystem
+docker run --read-only --tmpfs /tmp
+
+# Limit resources
+docker run --memory=512m --cpus=1
+
+# Drop capabilities
+docker run --cap-drop=ALL
+```
+
+### Secrets Management
+
+**Docker secrets (Swarm/Compose)**:
+```yaml
+secrets:
+  actual_password:
+    file: ./secrets/password.txt
+
+services:
+  mcp:
+    environment:
+      ACTUAL_PASSWORD: ${ACTUAL_PASSWORD}
+```
+
+**Environment variables**:
+<!-- install-snippets: fragment -->
+```bash
+# Recommended: pass via .env file or shell environment
+docker run --env-file .env ...
+```
+
+---
+
+## ✅ Security Compliance
+
+### OWASP Top 10 (2021)
+
+| Risk | Status | Mitigation |
+|------|--------|------------|
+| **A01 Broken Access Control** | ⚠️ Partial | Bearer token auth, no RBAC |
+| **A02 Cryptographic Failures** | ✅ Protected | HTTPS/TLS support |
+| **A03 Injection** | ✅ Protected | Zod validation, prepared statements |
+| **A04 Insecure Design** | ✅ Protected | Security-first architecture |
+| **A05 Security Misconfiguration** | ⚠️ Partial | Default HTTP (users must enable HTTPS) |
+| **A06 Vulnerable Components** | ✅ Monitored | npm audit in CI/CD |
+| **A07 Auth Failures** | ⚠️ Partial | No rate limiting, no MFA |
+| **A08 Data Integrity Failures** | ✅ Protected | Validated inputs, integrity checks |
+| **A09 Logging Failures** | ⚠️ Partial | Needs sanitization |
+| **A10 SSRF** | ✅ Protected | No user-controlled URLs |
+
+**Overall**: Reasonable security for personal use, needs hardening for multi-user
+
+---
+
+## 🔗 Related Documentation
+
+- [Testing & Reliability](../development/testing-and-reliability.md) - Security testing
+- [Architecture](./architecture.md) - Technical security design
+- Planned security work: tracked as [GitHub issues](https://github.com/agigante80/actual-mcp-server/issues) (see the `security` label)
+
+---
+
+## ✨ Summary
+
+**Security Posture**: **Good for personal use, needs hardening for production**
+
+**Key Security Features**:
+- ✅ Bearer token authentication
+- ✅ HTTPS/TLS support
+- ✅ Input validation with Zod
+- ✅ Secrets in environment variables
+- ✅ Non-root Docker container
+
+**Key Security Gaps**:
+- ⚠️ No rate limiting
+- ⚠️ No audit logging
+- ⚠️ No RBAC
+- ⚠️ Log sanitization needed
+
+**Recommendation**: 
+- **Personal use**: Current security is sufficient
+- **Team use**: Add rate limiting and audit logging
+- **Enterprise use**: Add RBAC, SIEM integration, compliance auditing
+
+Planned security improvements are tracked as [GitHub issues](https://github.com/agigante80/actual-mcp-server/issues) (see the `security` label; the rate-limiting and hardening work is issue #203).

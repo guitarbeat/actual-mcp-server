@@ -2,107 +2,65 @@
 // source order, so this arms the Node floor check before zod, before the rejection
 // allowlist, and before the handlers below. `npm start` and the documented
 // `node dist/src/index.js --stdio` reach this file without going through bin/, so the
-// guard cannot live in bin/ alone. Importing the named export does not change that:
-// the module's top-level `enforceNodeVersion()` still fires here, exactly once.
-import { findRootPackageJson } from './lib/node-version-guard.js';
-import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+// guard cannot live in bin/ alone. It is a side-effect import: the module's top-level
+// `enforceNodeVersion()` fires here, exactly once.
+import './lib/node-version-guard.js';
+// #622: MUST be the second import. Registers the unhandledRejection and uncaughtException
+// handlers before any other module evaluates. They write gated records only (no reason,
+// message or stack) and get the logger later through attachProcessLogger below.
+import { attachProcessLogger } from './lib/processHandlersInstall.js';
+import { getMcpServerVersion } from './lib/mcp-version.js';
+import path from 'node:path';
 import { z } from 'zod';
-import { isKnownBenignRejection } from './lib/rejection-allowlist.js';
+import { outputJsonSchema } from './lib/tool-output.js';
+import { PROMPT_DEFINITIONS } from './prompts/index.js';
+import { resolveOfferedPrompts } from './prompts/registry.js';
+import { buildServerInstructions } from './lib/serverInstructions.js';
+import { format } from 'node:util';
+import { writeSync } from 'node:fs';
+import type { StartupTransport } from './lib/startupRecord.js';
 
-/**
- * #277: the single version reader for this module.
+/*
+ * #277 / #541: this module's version comes from `getMcpServerVersion()` (src/lib/mcp-version.ts),
+ * which `--version`, `--help`, the startup banner, the MCP initialize `serverInfo.version` and
+ * `actual_server_info` all share. It reads the ROOT package.json through
+ * `findRootPackageJson`, never the stale `dist/package.json` mirror that a dynamic JSON import
+ * once produced (#277), and it honours a build-time `VERSION`.
  *
- * This used to be a dynamic JSON import of `../package.json` carrying an import
- * attribute, which from the compiled `dist/src/index.js` resolved to `dist/package.json`:
- * a mirror that tsc emitted precisely BECAUSE of this import (rootDir is "."), and that
- * went stale between a version bump and the next build. `src/tools/server_info.ts` reads
- * the ROOT manifest, so the two disagreed. Removing the import removes the mirror too.
- *
- * `findRootPackageJson` walks up to the outermost package.json named actual-mcp-server,
- * skipping that mirror. It never throws (it swallows unreadable and malformed files), so
- * the try/catch is belt-and-braces around a future change rather than a live path.
- * Removing the import attributes also removes the last instance of the construct that
- * crashed on Node 18 in #275.
+ * #541 reversed the gate's "leave `--version` unchanged": the old `readRootVersion()` here
+ * ignored `VERSION`, so a Docker image built as `X-dev-abc` printed plain `X` from
+ * `--version` while clients saw `X-dev-abc`. One reader means one string.
  */
-function readRootVersion(): string {
-  try {
-    const manifest = findRootPackageJson(dirname(fileURLToPath(import.meta.url)));
-    return manifest?.version ?? process.env.VERSION ?? 'unknown';
-  } catch {
-    return process.env.VERSION ?? 'unknown';
-  }
-}
-
-// Add global error handlers
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('=== UNHANDLED REJECTION ===');
-  console.error('Promise:', promise);
-  console.error('Reason:', reason);
-  if (reason instanceof Error) {
-    console.error('Stack:', reason.stack);
-  }
-  console.error('===========================');
-
-  // #275 backstop. The guard above catches both entry points, but a consumer that
-  // imports this package as a library reaches neither. Import attributes are the one
-  // construct here that fails on an under-floor Node, and it fails asynchronously,
-  // so name the real cause rather than letting the reader chase a packaging bug.
-  if ((reason as { code?: string } | undefined)?.code === 'ERR_IMPORT_ASSERTION_TYPE_MISSING') {
-    console.error(`⚠️  This almost certainly means Node ${process.version} is too old.`);
-    console.error('⚠️  actual-mcp-server requires the Node version in package.json "engines".');
-    console.error('⚠️  Import attributes (`with { type: "json" }`) need Node 22 or newer.');
-  }
-
-  if (isKnownBenignRejection(reason)) {
-    console.error('⚠️  Known Actual API domain error escaped to unhandledRejection:');
-    console.error('⚠️  ' + String(reason));
-    console.error('⚠️  Server will continue running. The caller received an error response.');
-    return;
-  }
-
-  process.exit(1);
-});
-
-process.on('uncaughtException', (error) => {
-  const errMsg = String((error as any)?.message || error);
-  const errType = (error as any)?.type;
-  // Bank sync errors from GoCardless/SimpleFIN can surface as uncaughtException
-  // from within the @actual-app/api SDK when the provider API returns an error
-  // asynchronously (e.g. RATE_LIMIT_EXCEEDED from GoCardless/Nordigen).
-  // These are non-fatal — the server should survive and continue serving requests.
-  if (
-    errType === 'BankSyncError' ||
-    errMsg.includes('BankSyncError') ||
-    errMsg.includes('NORDIGEN_ERROR') ||
-    errMsg.includes('RATE_LIMIT_EXCEEDED') ||
-    errMsg.includes('Rate limit exceeded') ||
-    errMsg.includes('Failed syncing account') ||
-    errMsg.includes('GoCardless') ||
-    errMsg.includes('SimpleFIN')
-  ) {
-    console.error('⚠️  [BANK SYNC] Non-fatal bank sync error surfaced as uncaughtException (server continues):');
-    console.error('⚠️  ' + errMsg);
-    return;
-  }
-  console.error('Uncaught Exception:', error);
-  process.exit(1);
-});
 
 // Minimal early help handling before any side-effectful modules (prevents dotenv from running on --help)
 const argsEarly = process.argv.slice(2);
-
-// dotenv v17 outputs diagnostic text to stdout by default (console.log).
-// Suppress it unconditionally — in stdio mode stdout is the JSON-RPC channel
-// (non-JSON corrupts the framing), and in other modes the diagnostic is noise.
-process.env.DOTENV_CONFIG_QUIET = 'true';
 
 // Set MCP_STDIO_MODE before the async IIFE so it is in place when src/logger.ts is first
 // imported. The Winston Console transport reads this env var at construction time to decide
 // whether to route all output to stderr (required in stdio mode — stdout writes corrupt JSON-RPC).
 if (argsEarly.includes('--stdio')) {
   process.env.MCP_STDIO_MODE = 'true';
+}
+
+// #502: the pre-logger stdio chokepoint. Under --stdio, stdout is the JSON-RPC channel, but
+// anything that calls console.log before src/logger.ts loads reaches the real stdout:
+// @dabh/diagnostics (during winston.createLogger, when DEBUG/DIAGNOSTICS is set and NODE_ENV
+// is not production) and potentially dotenv. src/logger.ts wireConsoleAndDebug() replaces
+// these methods once the logger loads, exactly as before. This is installed under --stdio
+// only, so HTTP stdout behaviour is unchanged. It writes straight to process.stderr, so
+// there is no recursion risk. Output in this window bypasses the #220 redaction (as it
+// already did), which is acceptable only because everything printed here is static (the
+// debug notice, winston level names; dotenv is pinned quiet and debug false). A future
+// pre-logger print of dynamic data is a redaction concern.
+function installPreLoggerStderrConsole(): void {
+  const toStderr = (...args: unknown[]): void => {
+    process.stderr.write(format(...args) + '\n');
+  };
+  console.log = toStderr;
+  console.info = toStderr;
+  console.debug = toStderr;
+  console.warn = toStderr;
+  console.error = toStderr;
 }
 
 // Only load dotenv if we're not just showing help
@@ -113,7 +71,9 @@ const KNOWN_FLAGS = new Set([
   '--http', '--stdio', '--test-actual-connection', '--test-mcp-client',
   '--debug', '--help', '-h', '--version', '-v',
 ]);
-const unknownFlags = argsEarly.filter(a => a.startsWith('-') && !KNOWN_FLAGS.has(a));
+// A bare `--` is the conventional end-of-options marker that `node script.js -- --flag` passes
+// through (the npm `dev` and `test:mcp-client` launchers did, #565); it is not an option.
+const unknownFlags = argsEarly.filter(a => a.startsWith('-') && a !== '--' && !KNOWN_FLAGS.has(a));
 if (unknownFlags.length > 0) {
   console.error(`Unknown option: ${unknownFlags.join(', ')}\nRun \`actual-mcp-server --help\` for usage.`);
   process.exit(1);
@@ -142,7 +102,7 @@ if (
 
 if (argsEarly.includes('--help') || argsEarly.includes('-h') ||
     argsEarly.includes('--version') || argsEarly.includes('-v')) {
-  const version = readRootVersion();
+  const version = getMcpServerVersion();
   if (argsEarly.includes('--version') || argsEarly.includes('-v')) {
     console.log(version);
   } else {
@@ -166,10 +126,29 @@ Docs & source: https://github.com/agigante80/actual-mcp-server`);
 // Defer remaining imports until after help check to avoid starting servers on import
 export {};
 (async () => {
+  if (argsEarly.includes('--stdio')) installPreLoggerStderrConsole();
+
   // Load dotenv here (dynamic import) only when not running with --help
   if (!argsEarly.includes('--help')) {
     const dotenv = await import('dotenv');
-    dotenv.config();
+    // #501: this runs BEFORE ./logger.js hijacks console.*, so anything dotenv prints
+    // lands on the real stdout (the JSON-RPC channel under --stdio) and skips the #220
+    // redaction. Explicit options beat every DOTENV_* environment knob, so each is pinned:
+    // quiet and debug keep both streams empty, override keeps a secret already in the
+    // environment authoritative over the file, encoding stops DOTENV_ENCODING from silently
+    // skipping the file (a bogus value loads nothing and reports it only in the discarded
+    // result), fast keeps DOTENV_FAST from swapping in the alternate parser (no input was
+    // found that the two parse differently, so this pin is defensive rather than tested
+    // by behaviour), and path keeps the cwd-relative .env
+    // that npx, `node dist/src/index.js` and Docker (WORKDIR /app) all rely on.
+    dotenv.config({
+      quiet: true,
+      debug: false,
+      override: false,
+      encoding: 'utf8',
+      fast: false,
+      path: path.resolve(process.cwd(), '.env'),
+    });
   }
 
   // Enable verbose debug output when --debug is passed
@@ -180,7 +159,7 @@ export {};
     process.env.LOG_LEVEL = process.env.LOG_LEVEL || 'debug';
     // optional flag your code can check for even more verbose transport logging
     process.env.MCP_BRIDGE_DEBUG_TRANSPORT = 'true';
-    console.log('Debug mode enabled: DEBUG=* LOG_LEVEL=debug');
+    process.stderr.write('Debug mode enabled: DEBUG=* LOG_LEVEL=debug\n');
   }
 
   // dynamic imports to avoid running side effects on module import
@@ -192,7 +171,7 @@ export {};
   const [
     { startHttpServer },
     { startStdioServer },
-    { enforceHttpAuthPosture },
+    { enforceHttpAuthPosture, findWeakTokenVars },
     loggerModule,
     utilsModule,
     actualToolsManagerModule,
@@ -206,29 +185,15 @@ export {};
   ]);
 
   const logger = (loggerModule as unknown as { default: typeof console }).default;
+  // #622: the process handlers log survivable events through the logger from here on.
+  const { createModuleLogger } = await import('./lib/loggerFactory.js');
+  attachProcessLogger(createModuleLogger('PROCESS'));
   const { getLocalIp } = (utilsModule as unknown as { getLocalIp: () => string });
   const actualToolsManager = (actualToolsManagerModule as unknown as { default: any }).default;
 
-  // Load version from environment (Docker build-time) or the ROOT package.json (local dev)
-  let VERSION = process.env.VERSION;
-  if (!VERSION || VERSION === 'unknown') {
-    VERSION = readRootVersion();
-
-    // Append git commit hash for development builds
-    try {
-      const { execSync } = await import('child_process');
-      const branch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8' }).trim();
-      const commitHash = execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
-      if (branch === 'develop' || branch !== 'main') {
-        VERSION = `${VERSION}-dev-${commitHash}`;
-      }
-    } catch (err) {
-      // Git not available or not in a git repo, use version as-is
-      logger.debug('Could not determine git commit hash:', err);
-    }
-  }
-  // Ensure VERSION is always a string (fallback to 0.1.0 if somehow still undefined)
-  const version: string = VERSION || '0.1.0';
+  // #541: the build-time VERSION, or the root package version plus a dev suffix on a
+  // checkout. Shared with actual_server_info so both report the identical string.
+  const version = getMcpServerVersion();
 
   // now continue with the original logic (args, flags, usage, etc.)
   const PORT = process.env.MCP_BRIDGE_PORT ? Number(process.env.MCP_BRIDGE_PORT) : 3600;
@@ -241,10 +206,7 @@ export {};
   const useTestActualConnection = args.includes('--test-actual-connection');
   const useTestMcpClient = args.includes('--test-mcp-client');
 
-  const SERVER_DESCRIPTION = 'Bridge MCP server exposing Actual finance API to LibreChat.';
-  const SERVER_INSTRUCTIONS =
-    'Welcome to the Actual MCP server. The tools listed here are only the ones currently confirmed and tested, ' +
-    'but the server can proxy any API call supported by Actual. As we expand coverage, more tools will be officially exposed.';
+  const SERVER_DESCRIPTION = 'Actual Budget over the Model Context Protocol';
 
   async function main() {
     // Mutual exclusion — stdio and http are incompatible transports
@@ -253,7 +215,7 @@ export {};
       process.exit(1);
     }
 
-    logger.info(`🚀 Starting Actual MCP Server v${VERSION}`);
+    logger.info(`🚀 Starting Actual MCP Server v${version}`);
 
     // NOTE: Persistent connection disabled - using init/shutdown per operation pattern
     // This ensures tombstone=0 for all created entities (they appear in UI)
@@ -270,8 +232,20 @@ export {};
     // Initialize tools before usage
     await actualToolsManager.initialize();
 
-    // Now get implemented tools after initialization
-    const implementedTools = actualToolsManager.getToolNames();
+    // The PUBLISHED tools (#483). This is the one name list every tools/list path receives
+    // (HTTP SDK handler, the no-session LobeChat path, the expired-session shim, stdio).
+    const implementedTools = actualToolsManager.getPublishedToolNames();
+
+    // The initialize `instructions` (#560): built once from the published set and the same
+    // resolved policy, before any transport starts, so no transport can send a different text.
+    const serverInstructionsText = buildServerInstructions(
+      implementedTools,
+      actualToolsManager.getToolPolicy().readOnly,
+    );
+
+    // #660: the prompts offered, resolved ONCE from the published tool list and handed to every
+    // start call below (the #560 `instructions` precedent), so no transport resolves policy.
+    const offeredPrompts = resolveOfferedPrompts(PROMPT_DEFINITIONS, new Set(implementedTools));
 
     // Extract schemas map with tool name → JSON schema
     const toolSchemas: Record<string, unknown> = {};
@@ -282,12 +256,20 @@ export {};
       }
     }
 
+    // #642: published outputSchema per covered tool, computed once and handed to BOTH
+    // transports through one parameter so they cannot be wired differently.
+    const outputSchemas: Record<string, unknown> = {};
+    for (const toolName of implementedTools) {
+      const published = outputJsonSchema(actualToolsManager.getTool(toolName));
+      if (published !== undefined) outputSchemas[toolName] = published;
+    }
+
     // Capabilities object with your fixed capabilities values
     const rawCapabilities = {
       tools: true,
       logging: false,
       events: false,
-      prompts: false,
+      prompts: true,
     };
 
     // Convert to MCP format (object for each capability)
@@ -346,24 +328,31 @@ export {};
     // the configured posture is safe. On a non-loopback bind with no auth and no
     // explicit opt-out this refuses startup (exit 1) rather than silently serving
     // financial data open on the LAN. stdio mode never reaches this check.
+    // #623: kept for the sys_startup record; 'n/a' on stdio, which has no posture.
+    let posture: 'serve' | 'serve-open-warn' | 'n/a' = 'n/a';
     if (useHttp || useTestMcpClient) {
+      const oidcEnabled = process.env.AUTH_PROVIDER === 'oidc';
       const decision = enforceHttpAuthPosture({
         bindHost,
-        hasStaticToken: !!process.env.MCP_SSE_AUTHORIZATION,
-        oidcEnabled: process.env.AUTH_PROVIDER === 'oidc',
+        // #572: MCP_STATIC_TOKENS is authentication too. A set-but-unresolvable value
+        // still counts here: startHttpServer refuses it before binding.
+        hasStaticToken: !!process.env.MCP_SSE_AUTHORIZATION || !!process.env.MCP_STATIC_TOKENS?.trim(),
+        oidcEnabled,
         allowUnauthenticated: process.env.MCP_ALLOW_UNAUTHENTICATED === 'true',
+        // #611: a short or placeholder token refuses a non-loopback bind.
+        weakTokenVars: findWeakTokenVars(process.env, { oidcEnabled }),
       });
       // enforceHttpAuthPosture already called process.exit(1) on 'refuse'. This
       // explicit return makes the open-start path structurally unreachable even
       // if process.exit were ever non-terminal, so we never bind on a refuse.
       if (decision === 'refuse') return;
+      posture = decision;
     }
 
     // If requested, run the MCP client-side tests now that all variables are ready
     if (useTestMcpClient) {
       logger.info('⚙️  --test-mcp-client specified, starting HTTP server and running client-side MCP tests...');
-      // start server in http mode. Bind all interfaces by default (#239): advertisedUrl
-      // uses the LAN IP (getLocalIp), so the self-test client must be able to reach it.
+      // start server in http mode. Bind all interfaces by default (#239).
       await startHttpServer(
         mcp,
         PORT,
@@ -371,17 +360,31 @@ export {};
         capabilities,
         implementedTools,
         SERVER_DESCRIPTION,
-        SERVER_INSTRUCTIONS,
+        serverInstructionsText,
         toolSchemas,
         version,
         bindHost,
-        advertisedUrl
+        advertisedUrl,
+        undefined,
+        outputSchemas,
+        offeredPrompts,
       );
 
       // dynamic import to avoid circular at top
       const { testMcpClient } = await import('./tests/testMcpClient.js');
       try {
-        await testMcpClient(advertisedUrl, PORT, HTTP_PATH);
+        // #565: the self-test talks to the address this process bound, not advertisedUrl. The
+        // advertised LAN IP can be answered by another listener on the same port (a Docker
+        // container publishing it is NATed ahead of local sockets), which turned the run into a
+        // 401 from a different server. A wildcard bind is reached on loopback, '::' on '::1' (an
+        // IPv6-only socket refuses IPv4). The scheme is the listener's, not the advertised one
+        // (MCP_BRIDGE_PUBLIC_SCHEME and MCP_BRIDGE_USE_TLS only change what is advertised).
+        // Under native TLS the advertised host is kept: the certificate names it, not 127.0.0.1.
+        const nativeTls = process.env.MCP_ENABLE_HTTPS === 'true';
+        const loopback = bindHost === '0.0.0.0' ? '127.0.0.1' : bindHost === '::' ? '::1' : bindHost;
+        const selfHost = nativeTls ? advertisedHost : loopback;
+        const selfUrl = `${nativeTls ? 'https' : 'http'}://${selfHost.includes(':') ? `[${selfHost}]` : selfHost}:${PORT}${HTTP_PATH}`;
+        await testMcpClient(selfUrl, HTTP_PATH);
         logger.info('✅ MCP client-side tests passed');
         process.exit(0);
       } catch (err: unknown) {
@@ -396,21 +399,54 @@ export {};
       }
     }
 
-    // Startup banner — skip in stdio mode (stdout writes corrupt JSON-RPC framing)
-    if (!useStdio) {
-      logger.info('---------');
-      logger.info('🟡 MCP SERVER INFO');
-      logger.info(`• Server Description:   ${SERVER_DESCRIPTION}`);
-      logger.info(`• OAuth Required:       false`);
-      logger.info(`• Capabilities:         ${Object.keys(capabilities).join(', ')}`);
-      logger.info(`• Tools:                ${implementedTools.join(', ') || 'none'}`);
-      logger.info(`• Server Instructions:  ${SERVER_INSTRUCTIONS}`);
-      logger.info(`• MCP endpoint (advertised): ${advertisedUrl}`);
-      logger.info('---------');
-    }
+    // #623: the one structured startup record, logged only once the transport is really up
+    // (never on a posture refusal, a port clash or --test-mcp-client). It replaces the old
+    // banner, which printed every tool name and the instructions text. Failure isolated: a
+    // throw here logs one warn line with the error name and never stops a started server.
+    const emitStartupRecord = async (transport: StartupTransport) => {
+      try {
+        const [{ buildStartupRecord }, { resolveLogConfig }, { default: config }, { connectionPool }, { getBudgetRegistrySummary }, { existsSync }] =
+          await Promise.all([
+            import('./lib/startupRecord.js'),
+            import('./logger.js'),
+            import('./config.js'),
+            import('./lib/ActualConnectionPool.js'),
+            import('./lib/actual-adapter.js'),
+            import('node:fs'),
+          ]);
+        const policy = actualToolsManager.getToolPolicy();
+        const record = buildStartupRecord({
+          env: process.env,
+          logConfig: resolveLogConfig(process.env),
+          budgets: getBudgetRegistrySummary(),
+          tools: {
+            published: actualToolsManager.getPublishedToolNames().length,
+            registered: actualToolsManager.getRegisteredToolCount(),
+            policy: { toolsets: policy.toolsets, readOnly: policy.readOnly },
+          },
+          posture,
+          actualApiVerbose: config.ACTUAL_API_VERBOSE,
+          // From the pool, not config: an empty config value parses to NaN (#623 gate).
+          limits: {
+            opTimeoutMs: config.ACTUAL_OP_TIMEOUT_MS,
+            maxSessions: connectionPool.getStats().maxConcurrent,
+            idleTimeoutMs: connectionPool.getIdleTimeoutMinutes() * 60000,
+          },
+          runtime: {
+            container: existsSync('/.dockerenv') || !!process.env.container,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            utcOffsetMinutes: -new Date().getTimezoneOffset(),
+          },
+          transport,
+        });
+        logger.info('sys_startup', record);
+      } catch (err) {
+        logger.warn('sys_startup record failed', { error: err instanceof Error ? err.name : 'unknown' });
+      }
+    };
 
     if (useHttp) {
-      logger.info('Mode: HTTP');
+      // The listen callback is synchronous; the record is fire-and-forget from there.
       await startHttpServer(
         mcp,
         PORT,
@@ -418,13 +454,18 @@ export {};
         capabilities,
         implementedTools,
         SERVER_DESCRIPTION,
-        SERVER_INSTRUCTIONS,
+        serverInstructionsText,
         toolSchemas,
         version,
         // bind host (ensure server accepts connections on that interface)
         bindHost,
         // advertised URL shown to clients
-        advertisedUrl
+        advertisedUrl,
+        (listener) => {
+          void emitStartupRecord({ kind: 'http', bindHost, path: HTTP_PATH, advertisedUrl, listener });
+        },
+        outputSchemas,
+        offeredPrompts,
       );
     } else if (useStdio) {
       logger.debug('Mode: stdio');
@@ -433,10 +474,13 @@ export {};
         capabilities,
         implementedTools,
         SERVER_DESCRIPTION,
-        SERVER_INSTRUCTIONS,
+        serverInstructionsText,
         toolSchemas,
         version,
+        outputSchemas,
+        offeredPrompts,
       );
+      await emitStartupRecord({ kind: 'stdio' });
     } else {
       logger.error('❌ Please specify a transport mode: --http or --stdio');
       process.exit(1);
@@ -444,7 +488,18 @@ export {};
   }
 
   main().catch((err) => {
-    logger.error('Failed to start Actual MCP bridge:', err.message || String(err));
+    // #572: the message goes INTO the format string. Passed as a second argument, winston
+    // treats a string as metadata and printed it one character per line ("0": "M", ...),
+    // so an operator never saw why startup failed.
+    logger.error(`Failed to start Actual MCP bridge: ${err?.message || String(err)}`);
     process.exit(1);
   });
-})();
+})().catch((err) => {
+  // #622: the prelude above (dotenv, the dynamic imports, the logger) runs before main(), so
+  // its failures never reach main().catch. Without this catch they escape as an
+  // unhandledRejection, whose gated record drops the message: a missing package or a broken
+  // build would name no module. Same residual as main().catch: startup text only. The logger
+  // may not exist yet, so this writes synchronously to stderr, never stdout.
+  writeSync(2, `Failed to start Actual MCP bridge: ${err?.message || String(err)}\n`);
+  process.exit(1);
+});

@@ -19,6 +19,7 @@ import { budgetTests } from './budget.js';
 import { rulesTests } from './rules.js';
 import { batchUncategorizedRulesUpsertTests } from './batch_uncategorized_rules_upsert.js';
 import { scheduleTests } from './schedule.js';
+import { scheduleDatesTests } from './schedule_dates.js';
 import { tagTests } from './tags.js';
 import { fail, skip, noteTolerated } from '../assert.js';
 
@@ -35,43 +36,57 @@ export async function advancedTests(client, context, opts = {}) {
   const { callTool } = client;
   console.log("\n-- Running ADVANCED TESTS --");
 
-  // Session list (actual_session_list)
-  console.log("\nListing active sessions...");
+  // #680: the session tools have no compact equivalent, so they are published only on the `all`
+  // surface (and legacy). On the default compact surface a call is refused with "not available";
+  // that is the surface working, not a failure, so skip LOUDLY (never silently) and keep the
+  // test for the surface that publishes them. If tools/list itself cannot be read, run the test.
+  let sessionToolsPublished = true;
   try {
-    const sessionList = await callTool("actual_session_list", {});
-    const total = sessionList?.totalSessions ?? sessionList?.result?.totalSessions;
-    // #280: stdio has no MCP sessions by construction (the connection pool is keyed by
-    // session id, which only the HTTP transport establishes). Zero is the CORRECT answer
-    // there, so assert the transport-appropriate expectation rather than a blanket >= 1.
-    const STDIO = (process.env.MCP_TEST_TRANSPORT || 'http').toLowerCase() === 'stdio';
-    if (STDIO) {
-      console.log(`  ✓ Verify session_list [stdio]: totalSessions=${total} (stdio has no MCP sessions; expected 0)`);
-    } else if (typeof total === 'number' && total >= 1) {
-      console.log(`  ✓ Verify session_list: totalSessions=${total}, activeSessions=${sessionList?.activeSessions ?? sessionList?.result?.activeSessions}`);
-    } else {
-      fail(`Verify session_list: expected totalSessions >= 1, got ${JSON.stringify(sessionList).slice(0, 120)}`);
-    }
-  } catch (err) {
-    fail(`session_list failed: ${err.message}`);
-  }
+    const names = new Set((await client.listTools()).map((t) => t?.name));
+    sessionToolsPublished = names.has('actual_session_list') && names.has('actual_session_close');
+  } catch { /* unknown: run the test and let it report */ }
 
-  // Session close: no sessionId, closes oldest idle session (or reports none to close)
-  console.log("\nTesting session close (no-op, current session protected)...");
-  try {
-    const closeResult = await callTool("actual_session_close", {});
-    const success = closeResult?.success ?? closeResult?.result?.success;
-    const message = closeResult?.message ?? closeResult?.result?.message ?? '';
-    if (success === true) {
-      console.log(`  ✓ Verify session_close: closed session (${message})`);
-    } else if (typeof message === 'string' && (
-      message.includes('No other sessions') || message.includes('No sessions')
-    )) {
-      console.log(`  ✓ Verify session_close: correctly reported no closable sessions (${message})`);
-    } else {
-      fail(`Verify session_close: unexpected response: ${JSON.stringify(closeResult).slice(0, 120)}`);
+  if (!sessionToolsPublished) {
+    skip("skip: actual_session_list and actual_session_close are not published on this server's tool surface (they have no compact tool; set MCP_TOOL_SURFACE=all to run them)");
+  } else {
+    // Session list (actual_session_list)
+    console.log("\nListing active sessions...");
+    try {
+      const sessionList = await callTool("actual_session_list", {});
+      const total = sessionList?.totalSessions ?? sessionList?.result?.totalSessions;
+      // #280: stdio has no MCP sessions by construction (the connection pool is keyed by
+      // session id, which only the HTTP transport establishes). Zero is the CORRECT answer
+      // there, so assert the transport-appropriate expectation rather than a blanket >= 1.
+      const STDIO = (process.env.MCP_TEST_TRANSPORT || 'http').toLowerCase() === 'stdio';
+      if (STDIO) {
+        console.log(`  ✓ Verify session_list [stdio]: totalSessions=${total} (stdio has no MCP sessions; expected 0)`);
+      } else if (typeof total === 'number' && total >= 1) {
+        console.log(`  ✓ Verify session_list: totalSessions=${total}, activeSessions=${sessionList?.activeSessions ?? sessionList?.result?.activeSessions}`);
+      } else {
+        fail(`Verify session_list: expected totalSessions >= 1, got ${JSON.stringify(sessionList).slice(0, 120)}`);
+      }
+    } catch (err) {
+      fail(`session_list failed: ${err.message}`);
     }
-  } catch (err) {
-    fail(`session_close failed: ${err.message}`);
+
+    // Session close: no sessionId, closes oldest idle session (or reports none to close)
+    console.log("\nTesting session close (no-op, current session protected)...");
+    try {
+      const closeResult = await callTool("actual_session_close", {});
+      const success = closeResult?.success ?? closeResult?.result?.success;
+      const message = closeResult?.message ?? closeResult?.result?.message ?? '';
+      if (success === true) {
+        console.log(`  ✓ Verify session_close: closed session (${message})`);
+      } else if (typeof message === 'string' && (
+        message.includes('No other sessions') || message.includes('No sessions')
+      )) {
+        console.log(`  ✓ Verify session_close: correctly reported no closable sessions (${message})`);
+      } else {
+        fail(`Verify session_close: unexpected response: ${JSON.stringify(closeResult).slice(0, 120)}`);
+      }
+    } catch (err) {
+      fail(`session_close failed: ${err.message}`);
+    }
   }
 
   // ActualQL search/summary tools
@@ -79,10 +94,10 @@ export async function advancedTests(client, context, opts = {}) {
   const monthStart = `${currentMonth}-01`;
   const today = new Date().toISOString().split('T')[0];
 
-  // actual_transactions_search_by_month
-  console.log("\nSearching transactions by month (actual_transactions_search_by_month)...");
+  // search_transactions month
+  console.log("\nSearching transactions by month (search_transactions month)...");
   try {
-    const byMonth = await callTool("actual_transactions_search_by_month", { month: currentMonth });
+    const byMonth = await callTool("search_transactions", { by: "month", month: currentMonth });
     const count = byMonth?.count ?? byMonth?.result?.count;
     const totalAmount = byMonth?.totalAmount ?? byMonth?.result?.totalAmount;
     if (typeof count === 'number' && typeof totalAmount === 'number') {
@@ -94,14 +109,15 @@ export async function advancedTests(client, context, opts = {}) {
     fail(`search_by_month failed: ${err.message}`);
   }
 
-  // actual_transactions_search_by_amount
-  console.log("\nSearching transactions by amount range (actual_transactions_search_by_amount)...");
+  // search_transactions amount
+  console.log("\nSearching transactions by amount range (search_transactions amount)...");
   try {
-    const byAmount = await callTool("actual_transactions_search_by_amount", {
-      minAmount: -100000000,
-      maxAmount: 100000000,
-      startDate: monthStart,
-      endDate: today,
+    const byAmount = await callTool("search_transactions", {
+      by: "amount",
+      min_amount: -100000000,
+      max_amount: 100000000,
+      start_date: monthStart,
+      end_date: today,
     });
     const transactions = byAmount?.transactions ?? byAmount?.result?.transactions ?? byAmount?.result ?? byAmount;
     if (Array.isArray(transactions)) {
@@ -113,12 +129,13 @@ export async function advancedTests(client, context, opts = {}) {
     fail(`search_by_amount failed: ${err.message}`);
   }
 
-  // actual_transactions_search_by_category (no filter: all categories)
-  console.log("\nSearching transactions by category (actual_transactions_search_by_category)...");
+  // search_transactions category (no filter: all categories)
+  console.log("\nSearching transactions by category (search_transactions category)...");
   try {
-    const byCategory = await callTool("actual_transactions_search_by_category", {
-      startDate: monthStart,
-      endDate: today,
+    const byCategory = await callTool("search_transactions", {
+      by: "category",
+      start_date: monthStart,
+      end_date: today,
     });
     const transactions = byCategory?.transactions ?? byCategory?.result?.transactions ?? byCategory?.result ?? byCategory;
     if (Array.isArray(transactions)) {
@@ -130,12 +147,13 @@ export async function advancedTests(client, context, opts = {}) {
     fail(`search_by_category failed: ${err.message}`);
   }
 
-  // actual_transactions_search_by_payee (no filter: all payees)
-  console.log("\nSearching transactions by payee (actual_transactions_search_by_payee)...");
+  // search_transactions payee (no filter: all payees)
+  console.log("\nSearching transactions by payee (search_transactions payee)...");
   try {
-    const byPayee = await callTool("actual_transactions_search_by_payee", {
-      startDate: monthStart,
-      endDate: today,
+    const byPayee = await callTool("search_transactions", {
+      by: "payee",
+      start_date: monthStart,
+      end_date: today,
     });
     const transactions = byPayee?.transactions ?? byPayee?.result?.transactions ?? byPayee?.result ?? byPayee;
     if (Array.isArray(transactions)) {
@@ -147,12 +165,13 @@ export async function advancedTests(client, context, opts = {}) {
     fail(`search_by_payee failed: ${err.message}`);
   }
 
-  // actual_transactions_summary_by_category
-  console.log("\nSummarizing transactions by category (actual_transactions_summary_by_category)...");
+  // summarize_transactions by_category
+  console.log("\nSummarizing transactions by category (summarize_transactions by_category)...");
   try {
-    const sumByCat = await callTool("actual_transactions_summary_by_category", {
-      startDate: monthStart,
-      endDate: today,
+    const sumByCat = await callTool("summarize_transactions", {
+      report: "by_category",
+      start_date: monthStart,
+      end_date: today,
     });
     const data = sumByCat?.summary ?? sumByCat?.result?.summary ?? sumByCat?.result ?? sumByCat;
     if (Array.isArray(data)) {
@@ -164,12 +183,13 @@ export async function advancedTests(client, context, opts = {}) {
     fail(`summary_by_category failed: ${err.message}`);
   }
 
-  // actual_transactions_summary_by_payee
-  console.log("\nSummarizing transactions by payee (actual_transactions_summary_by_payee)...");
+  // summarize_transactions by_payee
+  console.log("\nSummarizing transactions by payee (summarize_transactions by_payee)...");
   try {
-    const sumByPayee = await callTool("actual_transactions_summary_by_payee", {
-      startDate: monthStart,
-      endDate: today,
+    const sumByPayee = await callTool("summarize_transactions", {
+      report: "by_payee",
+      start_date: monthStart,
+      end_date: today,
     });
     const data = sumByPayee?.summary ?? sumByPayee?.result?.summary ?? sumByPayee?.result ?? sumByPayee;
     if (Array.isArray(data)) {
@@ -181,15 +201,15 @@ export async function advancedTests(client, context, opts = {}) {
     fail(`summary_by_payee failed: ${err.message}`);
   }
 
-  // ── actual_get_id_by_name: all 4 supported types ──────────────────────────
-  console.log("\nTesting actual_get_id_by_name (all 4 supported types)...");
+  // ── list_entities type lookup by name: all 4 supported types ──────────────────────────
+  console.log("\nTesting list_entities type lookup by name (all 4 supported types)...");
 
   // Type: 'accounts': list accounts, pick first
   try {
-    const accts = await callTool("actual_accounts_list", {});
+    const accts = await callTool("list_entities", { type: "account" });
     const firstAcct = Array.isArray(accts) && accts.length > 0 ? accts[0] : null;
     if (firstAcct?.name) {
-      const res = await callTool("actual_get_id_by_name", { type: 'accounts', name: firstAcct.name });
+      const res = await callTool("list_entities", { type: 'account', name: firstAcct.name });
       const resolvedId = res?.id ?? res?.result?.id;
       if (resolvedId === firstAcct.id) {
         console.log(`  ✓ get_id_by_name [accounts]: "${firstAcct.name}" → ${resolvedId}`);
@@ -205,11 +225,11 @@ export async function advancedTests(client, context, opts = {}) {
 
   // Type: 'categories': list categories, pick first
   try {
-    const cats = await callTool("actual_categories_get", {});
+    const cats = await callTool("list_entities", { type: "category" });
     const flatCats = Array.isArray(cats) ? cats : [];
     const firstCat = flatCats.find(c => c?.name);
     if (firstCat?.name) {
-      const res = await callTool("actual_get_id_by_name", { type: 'categories', name: firstCat.name });
+      const res = await callTool("list_entities", { type: 'category', name: firstCat.name });
       const resolvedId = res?.id ?? res?.result?.id;
       if (resolvedId === firstCat.id) {
         console.log(`  ✓ get_id_by_name [categories]: "${firstCat.name}" → ${resolvedId}`);
@@ -225,12 +245,12 @@ export async function advancedTests(client, context, opts = {}) {
 
   // Type: 'payees': list payees, pick first non-transfer payee
   try {
-    const payees = await callTool("actual_payees_get", {});
+    const payees = await callTool("list_entities", { type: "payee" });
     const flatPayees = Array.isArray(payees) ? payees : [];
     // Transfer payees have transfer_acct set: skip them
     const firstPayee = flatPayees.find(p => p?.name && !p?.transfer_acct);
     if (firstPayee?.name) {
-      const res = await callTool("actual_get_id_by_name", { type: 'payees', name: firstPayee.name });
+      const res = await callTool("list_entities", { type: 'payee', name: firstPayee.name });
       const resolvedId = res?.id ?? res?.result?.id;
       if (resolvedId === firstPayee.id) {
         console.log(`  ✓ get_id_by_name [payees]: "${firstPayee.name}" → ${resolvedId}`);
@@ -251,19 +271,19 @@ export async function advancedTests(client, context, opts = {}) {
     const seedSchedName = `MCP-Schedule-IdByName-${Date.now()}`;
     let seedSchedId = null;
     try {
-      const mk = await callTool("actual_schedules_create", { name: seedSchedName, date: "2026-06-15", amount: -4200, amountOp: "is", posts_transaction: false });
+      const mk = await callTool("manage_schedules", { action: "create", name: seedSchedName, date: "2026-06-15", amount: -4200, amount_op: "is", posts_transaction: false });
       seedSchedId = mk?.id ?? mk?.result?.id ?? (typeof mk === "string" ? mk : null);
     } catch (err) { console.log(`  warn get_id_by_name [schedules]: could not seed a schedule (${err.message?.slice(0,80)})`); }
     const firstSched = seedSchedId ? { id: seedSchedId, name: seedSchedName } : null;
     if (firstSched?.name) {
-      const res = await callTool("actual_get_id_by_name", { type: 'schedules', name: firstSched.name });
+      const res = await callTool("list_entities", { type: 'schedule', name: firstSched.name });
       const resolvedId = res?.id ?? res?.result?.id;
       if (typeof resolvedId === 'string' && resolvedId.length > 0) {
         console.log(`  ✓ get_id_by_name [schedules]: "${firstSched.name}" → ${resolvedId}`);
       } else {
         fail(`get_id_by_name [schedules]: could not resolve "${firstSched.name}", got ${JSON.stringify(res).slice(0, 120)}`);
       }
-      if (seedSchedId) { try { await callTool("actual_schedules_delete", { id: seedSchedId }); } catch { /* residue sweep covers it */ } }
+      if (seedSchedId) { try { await callTool("manage_schedules", { action: "delete", id: seedSchedId }); } catch { /* residue sweep covers it */ } }
     } else {
       console.log("  ℹ get_id_by_name [schedules]: schedule seed unavailable; block skipped");
     }
@@ -272,15 +292,16 @@ export async function advancedTests(client, context, opts = {}) {
     console.log("  ℹ get_id_by_name [schedules]: could not test: informational:", err.message);
   }
 
+  // Bank sync goes through callMCP (not callTool) so it is never retried and has its own timeout.
+  const bankSyncCall = (accountId) => ["manage_accounts", { action: "bank_sync", account_id: accountId }];
+
   // Bank sync: opt-in only (set MCP_TEST_BANK_SYNC=true to enable).
-  // Skipped by default: takes 30-90s per account, requires GoCardless/SimpleFIN.
+  // Skipped by default: reaches a real provider, requires GoCardless/SimpleFIN.
   if (opts.bankSync) {
     console.log("\nBank sync: negative-path tests...");
     try {
-      await client.callMCP("tools/call", {
-        name: "actual_bank_sync",
-        arguments: { accountId: "00000000-0000-0000-0000-000000000000" },
-      }, 0, 0, 10000);
+      const [syncName, syncArgs] = bankSyncCall("00000000-0000-0000-0000-000000000000");
+      await client.callMCP("tools/call", { name: syncName, arguments: syncArgs }, 0, 0, 10000);
       fail("non-existent accountId: expected error but got success");
     } catch (err) {
       const msg = err.message || String(err);
@@ -291,7 +312,7 @@ export async function advancedTests(client, context, opts = {}) {
 
     let accounts = [];
     try {
-      const acctRaw = await callTool("actual_accounts_list", {});
+      const acctRaw = await callTool("list_entities", { type: "account" });
       accounts = Array.isArray(acctRaw) ? acctRaw : (acctRaw?.accounts ?? acctRaw?.result ?? []);
     } catch (err) {
       fail(`Could not list accounts for bank sync: ${err.message}`);
@@ -305,21 +326,24 @@ export async function advancedTests(client, context, opts = {}) {
       for (const acct of accounts) {
         const label = `${acct.name} (${acct.id})`;
         try {
-          const raw = await client.callMCP("tools/call", {
-            name: "actual_bank_sync",
-            arguments: { accountId: acct.id },
-          }, 0 /* maxRetries: never retry bank sync */, 0, 90000 /* 90s per account */);
+          const [syncName, syncArgs] = bankSyncCall(acct.id);
+          const raw = await client.callMCP("tools/call", { name: syncName, arguments: syncArgs }, 0 /* maxRetries: never retry bank sync */, 0, 90000 /* 90s per account */);
           const syncText = raw?.content?.[0]?.text;
           const syncResult = syncText
             ? (() => { try { return JSON.parse(syncText); } catch { return syncText; } })()
             : raw;
-          const msg = syncResult?.result ?? JSON.stringify(syncResult).slice(0, 80);
-          console.log(`  ✓ ${label}: ${msg}`);
-          syncOk++;
+          // #548: the report shape; ids are capped, counts are not.
+          const lists = ["newTransactions", "matchedTransactions", "updatedAccounts"].map((k) => syncResult?.[k]);
+          if (!lists.every((l) => Number.isInteger(l?.count) && Array.isArray(l?.ids) && l.ids.length <= l.count) || typeof syncResult?.truncated !== "boolean") {
+            fail(`${label}: unexpected bank sync report: ${JSON.stringify(syncResult).slice(0, 120)}`);
+          } else {
+            console.log(`  ✓ ${label}: ${lists.map((l) => l.count).join(" new / ")} (new / matched / updated accounts)`);
+            syncOk++;
+          }
         } catch (err) {
           const msg = err.message || String(err);
-          if (/local account|not configured/i.test(msg)) {
-            console.log(`  ✓ ${label}: correctly identified as local account`);
+          if (/local account|not configured|is closed/i.test(msg)) {
+            console.log(`  ✓ ${label}: correctly refused (local or closed account)`);
           } else {
             // #387: genuinely tolerated. Bank sync is opt-in and reaches a THIRD PARTY, so a
             // real link can be rate-limited or need re-auth for reasons that are not this
@@ -333,9 +357,9 @@ export async function advancedTests(client, context, opts = {}) {
     }
   } else { skip("Bank sync skipped (set MCP_TEST_BANK_SYNC=true to enable)"); }
 
-  // SQL query validation: exercises the query-validator middleware via actual_query_run.
+  // SQL query validation: exercises the query-validator middleware via run_query.
   // Valid queries should succeed; invalid ones should be rejected before execution.
-  console.log("\nTesting query validation (actual_query_run)...");
+  console.log("\nTesting query validation (run_query)...");
   const queryValidationTests = [
     // valid
     { query: "SELECT * FROM transactions LIMIT 10",                                                              shouldPass: true,  label: "SELECT * with LIMIT" },
@@ -367,7 +391,7 @@ export async function advancedTests(client, context, opts = {}) {
   let qvPassed = 0, qvFailed = 0;
   for (const { query, shouldPass, label } of queryValidationTests) {
     try {
-      await callTool("actual_query_run", { query });
+      await callTool("run_query", { query });
       if (shouldPass) {
         console.log(`  ✓ ${label}`);
         qvPassed++;
@@ -401,31 +425,31 @@ export async function advancedTests(client, context, opts = {}) {
   // cases above already give positive and negative integration coverage.
   const runtag = `${Date.now()}`;
   const markerValue = `MCP178-AMAZON-${runtag}`;
-  // #283: actual_query_run returns { data: [...], dependencies: [...] }, NOT { result }.
+  // #283: run_query returns { data: [...], dependencies: [...] }, NOT { result }.
   // The old `r?.result ?? ...` extractor therefore read `undefined` for every query and
   // silently yielded [], so the seed lookup always found 0 rows and this block always
   // skipped, mislabeled as a "cold-query window". There is no cold window: a freshly
   // created transaction is queryable immediately. Read `.data` first; keep `.result`
-  // and array fallbacks for actual_accounts_list, which returns a bare array.
+  // and array fallbacks for list_entities account, which returns a bare array.
   const rowsOf = (r) => r?.data ?? r?.result ?? (Array.isArray(r) ? r : []);
   let seedTxnId = null;
   try {
-    const accts = rowsOf(await callTool("actual_accounts_list", {}));
+    const accts = rowsOf(await callTool("list_entities", { type: "account" }));
     const acctId = accts.find(a => !a.closed)?.id ?? accts[0]?.id ?? null;
     if (acctId) {
       // transactions_create does not accept imported_payee, so set it via update.
-      await callTool("actual_transactions_create", { account: acctId, date: today, amount: -178, notes: `MCP178SEED-${runtag}` });
-      const found = rowsOf(await callTool("actual_query_run", { query: `SELECT id FROM transactions WHERE notes = 'MCP178SEED-${runtag}'` }));
+      await callTool("manage_transactions", { action: "create", account: acctId, date: today, amount: -178, notes: `MCP178SEED-${runtag}` });
+      const found = rowsOf(await callTool("run_query", { query: `SELECT id FROM transactions WHERE notes = 'MCP178SEED-${runtag}'` }));
       seedTxnId = found.length > 0 ? found[0].id : null;
       if (seedTxnId) {
-        await callTool("actual_transactions_update", { id: seedTxnId, fields: { imported_payee: markerValue } });
+        await callTool("manage_transactions", { action: "update", id: seedTxnId, imported_payee: markerValue });
       }
     }
   } catch (err) {
     console.log(`  ℹ skipped: could not create seed transaction (${err.message.slice(0, 80)})`);
   }
   if (!seedTxnId) {
-    skip("imported_payee filtering: no seed transaction (no usable account, or the write was blocked/rate-limited). This is an environmental skip, not a query-engine issue: actual_query_run finds a freshly created transaction immediately.");
+    skip("imported_payee filtering: no seed transaction (no usable account, or the write was blocked/rate-limited). This is an environmental skip, not a query-engine issue: run_query finds a freshly created transaction immediately.");
   } else {
     let impPassed = 0, impFailed = 0;
     const check = (cond, ok, bad) => {
@@ -435,7 +459,7 @@ export async function advancedTests(client, context, opts = {}) {
     try {
       // Positive: a lowercase pattern must match the uppercase-seeded value,
       // because ActualQL $like normalises both sides (case and accent insensitive).
-      const pos = rowsOf(await callTool("actual_query_run", {
+      const pos = rowsOf(await callTool("run_query", {
         query: `SELECT id, imported_payee FROM transactions WHERE imported_payee LIKE '%amazon-${runtag}%'`,
       }));
       check(pos.some(r => r.id === seedTxnId),
@@ -444,7 +468,7 @@ export async function advancedTests(client, context, opts = {}) {
 
       // Negative: a pattern matching nothing must return empty, proving the
       // filter is applied rather than silently dropped.
-      const neg = rowsOf(await callTool("actual_query_run", {
+      const neg = rowsOf(await callTool("run_query", {
         query: `SELECT id FROM transactions WHERE imported_payee LIKE '%zzznomatch-${runtag}%'`,
       }));
       check(neg.length === 0,
@@ -452,7 +476,7 @@ export async function advancedTests(client, context, opts = {}) {
         `negative LIKE returned ${neg.length} row(s): filter NOT applied`);
 
       // IS NOT NULL must include the row we just seeded.
-      const notNull = rowsOf(await callTool("actual_query_run", {
+      const notNull = rowsOf(await callTool("run_query", {
         query: "SELECT id FROM transactions WHERE imported_payee IS NOT NULL",
       }));
       check(notNull.some(r => r.id === seedTxnId),
@@ -463,7 +487,7 @@ export async function advancedTests(client, context, opts = {}) {
       impFailed++;
     } finally {
       // Delete the throwaway transaction so the test leaves no state behind.
-      try { await callTool("actual_transactions_delete", { id: seedTxnId }); } catch { /* best-effort cleanup */ }
+      try { await callTool("manage_transactions", { action: "delete", id: seedTxnId }); } catch { /* best-effort cleanup */ }
     }
     console.log(`  imported_payee filtering: ${impPassed}/${impPassed + impFailed} passed${impFailed ? ` (${impFailed} failed)` : ''}`);
   }
@@ -504,6 +528,7 @@ export async function fullTests(client, context, opts = {}) {
   await rulesTests(client, context);
   await batchUncategorizedRulesUpsertTests(client, context);
   await scheduleTests(client, context);
+  await scheduleDatesTests(client, context);
   // #451: tags are self-contained (no account, category or transaction), so they sit here in
   // `full` rather than in `extended`: the block WRITES, and extended is the read-heavier level.
   await tagTests(client, context);

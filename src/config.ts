@@ -1,9 +1,39 @@
 import { z } from 'zod';
 import { parseIdentityMap } from './auth/identity-map.js';
+import { parseBudgetAcl } from './auth/budget-acl-parse.js';
+import { parseStaticTokensConfig, staticTokensConfigured } from './auth/static-tokens.js';
+import { parseAllowedOrigins } from './lib/origin-allowlist.js';
+
+/** #612: MCP_ALLOWED_HOSTS as a list: comma-separated, trimmed, lowercased, empties dropped. */
+export function parseAllowedHostsList(value: string | undefined): string[] {
+  return (value ?? '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+}
+
+// #466: the byte count body-parser will ACTUALLY enforce for MCP_HTTP_BODY_LIMIT, or
+// null when the value must be refused. Mirrors `bytes.parse` (what body-parser uses)
+// without importing that transitive package: floor(number * unit), units b and kb
+// through pb in powers of 1024. Stricter than `bytes` in exactly the places `bytes`
+// silently misreads: surrounding whitespace ("  512kb" is 512 bytes), trailing text
+// ("10 potatoes" is 10), separators ("1,000" is 1), a decimal with no unit or with b
+// ("1.5" is 1). The COMPUTED size is what is bounded, because a tiny fraction floors to
+// a 0-byte cap (every request 413) and a huge value is Infinity, which body-parser 2.3.0
+// accepts as NO cap at all: GHSA-v422-hmwv-36x6 by another route.
+const BODY_LIMIT_UNITS: Record<string, number> = { b: 1, kb: 2 ** 10, mb: 2 ** 20, gb: 2 ** 30, tb: 2 ** 40, pb: 2 ** 50 };
+const BODY_LIMIT_RE = new RegExp(`^(\\d+(?:\\.\\d+)?) *(${Object.keys(BODY_LIMIT_UNITS).join('|')})?$`, 'i');
+export function parseStrictByteSize(value: string): number | null {
+  const m = BODY_LIMIT_RE.exec(value);
+  if (!m) return null;
+  const unit = (m[2] ?? 'b').toLowerCase();
+  if (unit === 'b' && m[1].includes('.')) return null;
+  const n = Math.floor(parseFloat(m[1]) * BODY_LIMIT_UNITS[unit]);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
+}
 
 export const configSchema = z.object({
   ACTUAL_SERVER_URL: z.string().url(),
   ACTUAL_PASSWORD: z.string().default(''),
+  // Actual 26+ session token (Settings, then Show advanced). When this is set and
+  // the budget password is empty, init sends sessionToken and omits password.
   ACTUAL_SESSION_TOKEN: z.string().optional(),
   ACTUAL_BUDGET_SYNC_ID: z.string().min(1),
   // Optional per-budget encryption password (leave unset for unencrypted budgets)
@@ -61,6 +91,10 @@ export const configSchema = z.object({
   // password is set (e.g. an isolated Docker network where the hop is trusted).
   // Off by default so a plaintext upstream + encryption password is refused.
   ALLOW_INSECURE_UPSTREAM: z.string().optional().transform(val => val === 'true'),
+  // #620: upstream @actual-app/api logs at its own info/debug level (sync chatter, and on every
+  // import or bank sync a dump of each reconciled transaction) unless init is told otherwise.
+  // Off by default; `=== 'true'` fails safe, since turning it on is what carries the risk.
+  ACTUAL_API_VERBOSE: z.string().optional().transform(val => val === 'true'),
   MCP_BRIDGE_DATA_DIR: z.string().default('./actual-data'),
   // #332: where actual_budgets_export writes budget zips. A budget export is
   // megabytes of binary, so the tool returns a PATH plus metadata rather than
@@ -78,27 +112,146 @@ export const configSchema = z.object({
   MCP_BRIDGE_PORT: z.string().default('3600'),
   MCP_TRANSPORT_MODE: z.enum(['--http']).default('--http'),
   MCP_SSE_AUTHORIZATION: z.string().optional(),
+  // #572: several static Bearer tokens, each with its own principal and budget
+  // allow-list, as a JSON object keyed by principal:
+  //   {"alice":{"tokenEnv":"MCP_TOKEN_ALICE","budgets":["Home"]}}
+  // Only the SHAPE is checked here (both transports). The tokens themselves
+  // (MCP_TOKEN_*) and the budget names are resolved by the HTTP server before it
+  // binds (src/auth/static-tokens.ts). Unset or blank means the feature is off.
+  MCP_STATIC_TOKENS: z
+    .string()
+    .optional()
+    .superRefine((v: string | undefined, ctx: z.RefinementCtx) => {
+      try {
+        parseStaticTokensConfig(v);
+      } catch (err) {
+        // Safe by contract: names principals and variables, never a token value.
+        ctx.addIssue({ code: 'custom', message: err instanceof Error ? err.message : String(err) });
+      }
+    }),
   // #242: explicit opt-out for the required-by-default HTTP auth gate. When auth
   // is unconfigured AND the bind is non-loopback, the server refuses to start
   // unless this is the exact string 'true'. Strict parse (only 'true' enables)
   // so a typo like 'yes'/'1' cannot silently leave the server open.
   MCP_ALLOW_UNAUTHENTICATED: z.string().optional().transform(val => val === 'true'),
   MCP_ENABLE_HTTPS: z.string().optional().transform(val => val === 'true'),
+  // #612: extra hostnames the HTTP server accepts as Host (and as Origin in open
+  // mode), comma-separated, additive to localhost, 127.0.0.1 and [::1]. Each entry
+  // must already be in the form new URL() normalises a hostname to: no port, path,
+  // scheme or wildcard, IPv6 bracketed, IPv4 dotted. Parsed to a lowercased array.
+  MCP_ALLOWED_HOSTS: z
+    .string()
+    .optional()
+    .superRefine((v: string | undefined, ctx: z.RefinementCtx) => {
+      for (const entry of parseAllowedHostsList(v)) {
+        let normalised: string | null = null;
+        try {
+          normalised = new URL(`http://${entry}`).hostname;
+        } catch {
+          // reported below
+        }
+        if (entry.includes('*') || normalised !== entry) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `MCP_ALLOWED_HOSTS entry "${entry}" is not a bare hostname (no port, path, scheme or wildcard; IPv6 in brackets)`,
+          });
+        }
+      }
+    })
+    .transform(parseAllowedHostsList),
+  // Exact browser origins allowed to call the MCP routes. Empty adds no extra
+  // Origin gate (#612 still applies in open mode). A non-empty list is enforced
+  // on the MCP paths in every auth mode, before bearer or OIDC. An invalid entry
+  // refuses startup. A request with no Origin header stays allowed.
+  MCP_ALLOWED_ORIGINS: z.string().default('').superRefine((v, ctx) => {
+    if (!v.trim()) return;
+    try {
+      parseAllowedOrigins(v);
+    } catch (err) {
+      ctx.addIssue({ code: 'custom', message: err instanceof Error ? err.message : String(err) });
+    }
+  }),
   MCP_HTTPS_CERT: z.string().optional(),
   MCP_HTTPS_KEY: z.string().optional(),
   // Explicit cap on incoming JSON request bodies (#168). Passed to
   // express.json({ limit }). Express accepts a byte string like '512kb' or '2mb'.
   // Default 512kb is generous headroom over the largest legitimate batch payload
   // while bounding the memory-exhaustion surface. Raise it for bulk-import jobs.
-  MCP_HTTP_BODY_LIMIT: z.string().default('512kb'),
-  // Comma-separated exact http(s) origins allowed to send an Origin header to
-  // the Streamable HTTP transport. Empty derives safe public/loopback origins
-  // from the advertised host; explicit values are validated fail-closed.
-  MCP_ALLOWED_ORIGINS: z.string().default(''),
+  // #466: validated HERE, because body-parser 2.3.0 throws an opaque TypeError at HTTP
+  // startup on an unparseable limit (2.2.x silently ran with no cap), and some values
+  // it still silently misreads. Refused, never defaulted away. stdio parses this file
+  // too, so a bad value refuses stdio startup as well (as AUTH_BUDGET_ACL_CLAIM does).
+  MCP_HTTP_BODY_LIMIT: z.string().default('512kb').refine(
+    (v) => parseStrictByteSize(v) !== null,
+    'MCP_HTTP_BODY_LIMIT must be a positive byte size such as 512kb, 1mb or 1048576 (units b, kb, mb, gb, tb, pb; ' +
+      'no spaces around it, no separators; at least 1 byte and at most 9007199254740991 bytes) (#466)',
+  ),
   MAX_CONCURRENT_SESSIONS: z.string().default('15').transform(val => parseInt(val, 10)),
+  // #577: optional per-principal session cap under MAX_CONCURRENT_SESSIONS. Unset or empty means
+  // no per-principal cap; an empty value in a compose file must not abort startup, which
+  // z.coerce.number() would do (it turns '' into 0). Anything set must be a positive integer.
+  MAX_SESSIONS_PER_PRINCIPAL: z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      const v = (raw ?? '').trim();
+      if (v === '') return undefined;
+      if (/^[1-9]\d*$/.test(v)) return parseInt(v, 10);
+      ctx.addIssue({
+        code: 'custom',
+        message: `MAX_SESSIONS_PER_PRINCIPAL must be a positive integer (unset or empty means no per-principal cap), got ${JSON.stringify(raw)}.`,
+      });
+      return z.NEVER;
+    }),
 
-  // --- OIDC / mcp-auth (CF-5) ---
-  // Set AUTH_PROVIDER=oidc to enable JWT validation via mcp-auth.
+  // --- Published tool surface (#483) ---
+  // Which tools this process publishes AND dispatches. Names are validated, and an unknown
+  // one aborts startup, by resolvePublishedToolNames (src/lib/toolsets.ts) in
+  // actualToolsManager.initialize(), because the registry is only known there.
+  //   MCP_TOOLSETS  comma list of toolsets and presets ('all' by default = every tool).
+  //   MCP_TOOLS     extra individual tool names published on top of MCP_TOOLSETS.
+  MCP_TOOLSETS: z.string().default('all'),
+  MCP_TOOLS: z.string().default(''),
+  // MCP_READ_ONLY drops every write-capable tool, and operators read it as a safety
+  // promise, so it is parsed STRICTLY and in this one place: trimmed and case-insensitive
+  // 'true' or 'false'; unset or empty is false; anything else ('1', 'yes', 'on', a typo)
+  // refuses startup naming the value. The usual `=== 'true'` idiom is wrong here: it
+  // fails SAFE for a flag that enables risk, but would fail OPEN for this one, silently
+  // publishing every writer when an operator wrote MCP_READ_ONLY=1.
+  MCP_READ_ONLY: z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      const v = (raw ?? '').trim().toLowerCase();
+      if (v === '' || v === 'false') return false;
+      if (v === 'true') return true;
+      ctx.addIssue({
+        code: 'custom',
+        message: `MCP_READ_ONLY must be "true" or "false" (case-insensitive; unset or empty means false), got ${JSON.stringify(raw)}.`,
+      });
+      return z.NEVER;
+    }),
+
+  // MCP_TOOL_SURFACE (#671) picks WHICH list of tools this process publishes: the compact
+  // registry ('compact', the default since #680), the 85 legacy tools ('legacy', the opt-out),
+  // or both ('all', for the test stacks). Trimmed and case-insensitive; anything else refuses startup naming the
+  // value, like MCP_READ_ONLY. docs/explanation/compact-tool-surface.md has the design.
+  MCP_TOOL_SURFACE: z
+    .string()
+    .optional()
+    .transform((raw, ctx): 'legacy' | 'compact' | 'all' => {
+      const v = (raw ?? '').trim().toLowerCase();
+      if (v === '') return 'compact';
+      if (v === 'legacy' || v === 'compact' || v === 'all') return v;
+      ctx.addIssue({
+        code: 'custom',
+        message: `MCP_TOOL_SURFACE must be "legacy", "compact" or "all" (case-insensitive; unset or empty means compact), got ${JSON.stringify(raw)}.`,
+      });
+      return z.NEVER;
+    }),
+
+  // --- OIDC bearer auth (CF-5) ---
+  // Set AUTH_PROVIDER=oidc to enable JWT validation (src/auth/bearer.ts).
   // When 'none' (default), the legacy MCP_SSE_AUTHORIZATION static Bearer token is used.
   AUTH_PROVIDER: z.enum(['none', 'oidc']).default('none'),
   // OIDC issuer URL (e.g. https://auth.example.com/realms/myrealm). Required when AUTH_PROVIDER=oidc.
@@ -121,13 +274,53 @@ export const configSchema = z.object({
   // here; parsed fail-fast by buildTrustedJwksHosts (oidc-discovery.ts) at the
   // composition root, per the #245 pattern. Default empty: same-origin only.
   OIDC_JWKS_TRUSTED_HOSTS: z.string().optional(),
-  // Comma-separated required scopes (e.g. "read,write"). Optional.
+  // #462: a DIRECT JWKS URL that bypasses OpenID discovery, for issuers that publish
+  // no discovery document (Cloudflare Access: https://<team>.cloudflareaccess.com/cdn-cgi/access/certs).
+  // Validated at startup by resolveDirectJwksUri with the same https / credentials /
+  // origin-or-trusted-host rules as a discovered jwks_uri, plus no query or fragment.
+  // When set, nothing is discovered, so there is no RFC 8414 document to re-serve.
+  OIDC_JWKS_URI: z.string().optional(),
+  // #462: where the bearer JWT is read from. 'cf-access-jwt-assertion' is Cloudflare's
+  // documented pattern for an MCP server behind Access with Managed OAuth: the client's
+  // bearer is opaque, the edge forwards a signed JWT in that header, and the origin must
+  // validate it. In that mode Authorization is NEVER consulted (one source, one
+  // verification, no fallback). Closed enum, default is today's behaviour.
+  OIDC_TOKEN_SOURCE: z.enum(['authorization', 'cf-access-jwt-assertion']).default('authorization'),
+  // Comma-separated required (enforced) scopes; also advertised (e.g. "read,write"). Optional.
   OIDC_SCOPES: z.string().optional(),
+  // Comma-separated scopes advertised in discovery (scopes_supported) but not enforced. Optional.
+  OIDC_SCOPES_SUPPORTED: z.string().optional(),
   // JSON map of principal → budget sync-ID list for per-user budget ACL.
   // Keys: email, sub, or "group:<name>". Values: array of sync IDs or ["*"] for all.
   // Example: {"alice@example.com":["budget-1"],"group:admin":["*"]}
   // Leave unset to allow all authenticated users to access all budgets.
-  AUTH_BUDGET_ACL: z.string().optional(),
+  // #551: a SET value must parse, whatever AUTH_PROVIDER and AUTH_BUDGET_ACL_SOURCE
+  // are. Unset and '' mean "no restrictions" and are not validated. Before this
+  // refine an invalid value was parsed lazily at runtime and degraded to an empty
+  // map, which the ACL read as "open": a typo granted every budget to every user.
+  // The parser is a zero-import leaf so this file can call it (see its header).
+  AUTH_BUDGET_ACL: z
+    .string()
+    .optional()
+    .superRefine((v: string | undefined, ctx: z.RefinementCtx) => {
+      if (v === undefined || v === '') return;
+      try {
+        parseBudgetAcl(v);
+      } catch (err) {
+        // The parser's message is safe by contract (variable name, problem class,
+        // entry index and JSON type only; never a key, a value or JSON.parse's
+        // echo of the input). Its own "AUTH_BUDGET_ACL: " prefix is dropped here
+        // because the sentence already names the variable.
+        const reason = (err instanceof Error ? err.message : String(err)).replace(/^AUTH_BUDGET_ACL: /, '');
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            `AUTH_BUDGET_ACL is malformed (${reason}). ` +
+            'Expected a JSON object mapping each principal to an array of budget sync ids, for example ' +
+            '{"<email or sub>":["<sync id>"],"group:<name>":["*"]}. See docs/reference/configuration.md.',
+        });
+      }
+    }),
   // #338: where the budget ACL comes from.
   //   'static' (default) = AUTH_BUDGET_ACL above, exactly as before.
   //   'actual'           = derived from the Actual server's own per-file access
@@ -200,7 +393,7 @@ export const configSchema = z.object({
           message:
             `AUTH_BUDGET_ACL_IDENTITY_MAP is malformed: ${reason}. ` +
             'Expected "<sub>=<actual userName>" entries separated by commas, for example ' +
-            '"a1b2c3=jdoe,d4e5f6=asmith". See docs/CONFIGURATION.md.',
+            '"a1b2c3=jdoe,d4e5f6=asmith". See docs/reference/configuration.md.',
         });
       }
     }),
@@ -229,6 +422,18 @@ export const configSchema = z.object({
         'See #343.',
     },
   )
+  // #572: static tokens are their own authentication mode. Under OIDC the verified
+  // JWT decides the principal and AUTH_BUDGET_ACL the budgets, so a static token
+  // would either be ignored or open a second door; refuse the pairing.
+  .refine(
+    (cfg) => !(cfg.AUTH_PROVIDER === 'oidc' && staticTokensConfigured(cfg.MCP_STATIC_TOKENS)),
+    {
+      path: ['MCP_STATIC_TOKENS'],
+      message:
+        'MCP_STATIC_TOKENS cannot be combined with AUTH_PROVIDER=oidc: under OIDC the verified token decides ' +
+        'the principal and AUTH_BUDGET_ACL decides its budgets. Unset one of them (#572).',
+    },
+  )
   // When native TLS is enabled, both the cert and key paths must be provided.
   // MCP_ENABLE_HTTPS is transformed to a boolean above, so this object-level
   // refine sees the parsed value (a field-level refine would see the raw
@@ -244,6 +449,49 @@ export const configSchema = z.object({
   .refine(
     (cfg) => !cfg.ACTUAL_BUDGET_PASSWORD || cfg.ALLOW_INSECURE_UPSTREAM || !/^http:\/\//i.test(cfg.ACTUAL_SERVER_URL),
     { message: 'ACTUAL_BUDGET_PASSWORD (E2E encryption) must not be sent over an http:// upstream. Use https:// for ACTUAL_SERVER_URL, or set ALLOW_INSECURE_UPSTREAM=true to override (e.g. a trusted isolated network).' },
+  )
+  // #462: the assertion mode and the direct JWKS knob only mean something under
+  // AUTH_PROVIDER=oidc. Under 'none' the static bearer branch authenticates, and
+  // silently ignoring the knob would let an operator believe Cloudflare protects an
+  // origin that the static token does. Refuse loudly.
+  .refine(
+    (cfg) => cfg.AUTH_PROVIDER === 'oidc' || (cfg.OIDC_TOKEN_SOURCE === 'authorization' && !cfg.OIDC_JWKS_URI),
+    {
+      path: ['OIDC_TOKEN_SOURCE'],
+      message:
+        'OIDC_TOKEN_SOURCE=cf-access-jwt-assertion and OIDC_JWKS_URI require AUTH_PROVIDER=oidc. Under ' +
+        'AUTH_PROVIDER=none the static bearer token is what authenticates, so these settings would be ' +
+        'silently ignored (#462).',
+    },
+  )
+  // #462: the Access application token carries no `scope` claim, so any required
+  // scope would make the bearer middleware answer 403 missing_required_scopes on EVERY request,
+  // invisibly to the 401 tests. Refuse the pairing rather than ship a dead deployment.
+  .refine(
+    (cfg) => cfg.OIDC_TOKEN_SOURCE !== 'cf-access-jwt-assertion' || !(cfg.OIDC_SCOPES ?? '').trim(),
+    {
+      path: ['OIDC_SCOPES'],
+      message:
+        'OIDC_SCOPES must be empty with OIDC_TOKEN_SOURCE=cf-access-jwt-assertion: the Cloudflare Access ' +
+        'assertion carries no scope claim, so every request would be refused with missing_required_scopes (#462).',
+    },
+  )
+  // #462: the UserInfo identity source (#346) needs a resolved discovery document and
+  // a bearer that the IdP's UserInfo endpoint accepts. With OIDC_JWKS_URI nothing is
+  // discovered, and userinfo-identity.ts would fetch discovery on the REQUEST path
+  // against a domain that does not publish it, denying every request with a log that
+  // blames UserInfo (the #343 shape). In assertion mode the bearer is the assertion,
+  // which Cloudflare's UserInfo does not accept. Either pairing is refused at startup.
+  .refine(
+    (cfg) => cfg.AUTH_BUDGET_ACL_IDENTITY_SOURCE !== 'userinfo' || (!cfg.OIDC_JWKS_URI && cfg.OIDC_TOKEN_SOURCE === 'authorization'),
+    {
+      path: ['AUTH_BUDGET_ACL_IDENTITY_SOURCE'],
+      message:
+        'AUTH_BUDGET_ACL_IDENTITY_SOURCE=userinfo cannot be combined with OIDC_JWKS_URI (no discovery ' +
+        'document is fetched, so the UserInfo endpoint cannot be resolved) or with ' +
+        'OIDC_TOKEN_SOURCE=cf-access-jwt-assertion (the bearer is the Cloudflare assertion, which the ' +
+        "IdP's UserInfo endpoint does not accept). Use AUTH_BUDGET_ACL_IDENTITY_SOURCE=token (#462).",
+    },
   );
 
 export type Config = z.infer<typeof configSchema>;
@@ -265,7 +513,7 @@ function getConfig(): Config {
     console.error(
       `\n❌ Missing or invalid environment variables:\n${missing}\n\n` +
       `Set them in a .env file in the current directory, or export them before running.\n` +
-      `Required: ACTUAL_SERVER_URL, ACTUAL_BUDGET_SYNC_ID, and ACTUAL_PASSWORD or ACTUAL_SESSION_TOKEN\n` +
+      `Required: ACTUAL_SERVER_URL, ACTUAL_BUDGET_SYNC_ID. Actual login: ACTUAL_PASSWORD (empty if the server has none) or ACTUAL_SESSION_TOKEN.\n` +
       `See: https://github.com/agigante80/actual-mcp-server\n`
     );
     process.exit(1);
