@@ -50,7 +50,10 @@ services:
       #   http://actual-main:5006        - Actual Budget in the same Docker network (service name)
       # Note: actual-mcp does NOT need to run on the same machine as Actual Budget.
       - ACTUAL_SERVER_URL=${ACTUAL_SERVER_URL:-http://actual-main:5006}
-      - ACTUAL_PASSWORD=${ACTUAL_PASSWORD:?ACTUAL_PASSWORD is required}
+      # Password or session token. An empty password is valid when ACTUAL_SESSION_TOKEN
+      # is the Actual login, so Compose must not refuse a blank password.
+      - ACTUAL_PASSWORD=${ACTUAL_PASSWORD:-}
+      - ACTUAL_SESSION_TOKEN=${ACTUAL_SESSION_TOKEN:-}
       - ACTUAL_BUDGET_SYNC_ID=${ACTUAL_BUDGET_SYNC_ID:?ACTUAL_BUDGET_SYNC_ID is required}
       # Optional: encryption password for E2E-encrypted default budget.
       # #161: if you set this AND the upstream above is http://, the server
@@ -158,7 +161,10 @@ services:
       # http://host.docker.internal:5006 (Actual on the Docker host).
       # If on the same Docker network, use the container service name: http://actual:5006
       - ACTUAL_SERVER_URL=${ACTUAL_SERVER_URL:?ACTUAL_SERVER_URL is required}
-      - ACTUAL_PASSWORD=${ACTUAL_PASSWORD:?ACTUAL_PASSWORD is required}
+      # Password or session token. An empty password is valid when ACTUAL_SESSION_TOKEN
+      # is the Actual login, so Compose must not refuse a blank password.
+      - ACTUAL_PASSWORD=${ACTUAL_PASSWORD:-}
+      - ACTUAL_SESSION_TOKEN=${ACTUAL_SESSION_TOKEN:-}
       - ACTUAL_BUDGET_SYNC_ID=${ACTUAL_BUDGET_SYNC_ID:?ACTUAL_BUDGET_SYNC_ID is required}
       # Optional: encryption password for E2E-encrypted default budget.
       # #161: if you set this AND the upstream above is http://, the server

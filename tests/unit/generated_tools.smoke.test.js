@@ -261,7 +261,7 @@ console.log('Running generated tools smoke tests');
   if (name.includes('budgets_get_month')) inputExample.month = '2025-12';
   if (name.includes('budget_updates_batch')) inputExample.operations = [{ month: '2025-12', categoryId: '10000000-0000-4000-8000-000000000001', amount: 100 }];
   if (name.includes('budgets_hold_for_next_month')) inputExample.month = '2025-12', inputExample.amount = 10000;
-  if (name.includes('budgets_reset_hold')) inputExample.month = '2025-12'; // no categoryId — tool operates on whole month
+  if (name.includes('budgets_reset_hold')) inputExample.month = '2025-12'; // no categoryId: tool operates on the whole month
   if (name.includes('budgets_set_carryover')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.flag = true;
   // #332: a fixed name keeps the smoke run from accumulating timestamped files.
   if (name.includes('budgets_export')) inputExample.filename = 'smoke-export.zip';
