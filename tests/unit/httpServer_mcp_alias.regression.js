@@ -7,6 +7,9 @@ process.env.ACTUAL_BUDGET_SYNC_ID = 'sync-mcp-alias-test';
 process.env.ACTUAL_PASSWORD = 'stub-password-for-unit-test';
 process.env.MCP_SSE_AUTHORIZATION = 'mcp-alias-bearer-token';
 process.env.AUTH_PROVIDER = 'none';
+delete process.env.MCP_STATIC_TOKENS;
+delete process.env.AUTH_BUDGET_ACL;
+delete process.env.MCP_ALLOWED_ORIGINS;
 
 const { startHttpServer } = await import('../../dist/src/server/httpServer.js');
 const { connectionPool } = await import('../../dist/src/lib/ActualConnectionPool.js');

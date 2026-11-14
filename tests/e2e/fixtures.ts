@@ -114,7 +114,18 @@ export type McpClient = {
   raw(tool: string, args?: Record<string, unknown>): Promise<any>;
   /** Post an arbitrary JSON-RPC payload and return the HTTP response, for error-envelope tests. */
   post(payload: unknown): Promise<APIResponse>;
+  /** #641: the published tools/list entries, on either transport. */
+  listTools(): Promise<any[]>;
+  /** #660: the `capabilities` object the server returned from `initialize`, on either transport. */
+  serverCapabilities(): Promise<Record<string, unknown> | undefined>;
+  /** #660: the prompts/list entries. Throws on a JSON-RPC error. */
+  listPrompts(): Promise<any[]>;
+  /** #660: prompts/get. Returns the result, or `{ error: { code, message } }` on a JSON-RPC error, on both transports. */
+  getPrompt(name: string, args?: Record<string, unknown>): Promise<PromptGetOutcome>;
 };
+
+/** The outcome of prompts/get: the parsed result, or the JSON-RPC error (same shape on both transports). */
+export type PromptGetOutcome = { result?: any; error?: { code: number; message: string } };
 
 export type AccountRef = { id: string; name: string };
 export type CategoryGroupRef = { id: string; name: string };
@@ -158,6 +169,8 @@ export type Fixtures = {
     notes?: string;
     payee?: string;
     category?: string;
+    /** #514: an imported_id marks the row as bank-imported, which upstream's merge keeps over a manual one. */
+    imported_id?: string;
   }) => Promise<TransactionRef>;
   makeRule: (opts: {
     marker?: string;
@@ -165,7 +178,17 @@ export type Fixtures = {
     /** Omit the action's `op` field, which is a supported shorthand this suite covers. */
     withoutOp?: boolean;
   }) => Promise<RuleRef>;
-  makeSchedule: (opts?: { name?: string; date?: string; amount?: number }) => Promise<ScheduleRef>;
+  makeSchedule: (opts?: {
+    name?: string;
+    /** A YYYY-MM-DD one-off date, or a recurrence config (#478: monthly patterns). */
+    date?: string | Record<string, unknown>;
+    /** A number for 'is' and 'isapprox', or a { num1, num2 } range for 'isbetween' (#527). */
+    amount?: number | { num1: number; num2: number };
+    amountOp?: 'is' | 'isapprox' | 'isbetween';
+    /** #547: both optional; a schedule without one is a legitimate shape that must still link. */
+    payee?: string;
+    account?: string;
+  }) => Promise<ScheduleRef>;
 };
 
 /**
@@ -175,6 +198,7 @@ export type Fixtures = {
  * in its own process, so two workers never share this.
  */
 let cachedSessionId: string | undefined;
+let cachedCapabilities: Record<string, unknown> | undefined;
 
 async function initSession(request: APIRequestContext): Promise<string> {
   if (cachedSessionId) return cachedSessionId;
@@ -204,6 +228,11 @@ async function initSession(request: APIRequestContext): Promise<string> {
   const isHealthy = await waitForMCPHealth(request, `${DEFAULT_MCP_SERVER_URL}/health`);
   expect(isHealthy, 'the MCP server must report healthy before tests run').toBeTruthy();
 
+  try {
+    cachedCapabilities = (await initRes.json())?.result?.capabilities;
+  } catch {
+    cachedCapabilities = undefined;
+  }
   cachedSessionId = sessionId;
   return sessionId;
 }
@@ -224,6 +253,48 @@ function makeClient(request: APIRequestContext, sessionId: string): McpClient {
         data: JSON.stringify(payload),
         headers: { 'Content-Type': 'application/json', 'mcp-session-id': sessionId },
       }),
+    listTools: async () => {
+      const res = await request.post(`${DEFAULT_MCP_SERVER_URL}${HTTP_PATH}`, {
+        data: JSON.stringify({ jsonrpc: '2.0', id: 4641, method: 'tools/list', params: {} }),
+        headers: { 'Content-Type': 'application/json', 'mcp-session-id': sessionId },
+      });
+      // Name the real cause (a 404 session, a JSON-RPC error) instead of returning [] and
+      // failing later on a tool count.
+      const text = await res.text();
+      let body: any;
+      try { body = JSON.parse(text); } catch { body = undefined; }
+      if (!res.ok() || !Array.isArray(body?.result?.tools)) {
+        throw new Error(`tools/list failed: HTTP ${res.status()} ${text.slice(0, 300)}`);
+      }
+      return body.result.tools;
+    },
+    serverCapabilities: async () => cachedCapabilities,
+    listPrompts: async () => {
+      const res = await request.post(`${DEFAULT_MCP_SERVER_URL}${HTTP_PATH}`, {
+        data: JSON.stringify({ jsonrpc: '2.0', id: 6601, method: 'prompts/list', params: {} }),
+        headers: { 'Content-Type': 'application/json', 'mcp-session-id': sessionId },
+      });
+      const text = await res.text();
+      let body: any;
+      try { body = JSON.parse(text); } catch { body = undefined; }
+      if (!res.ok() || !Array.isArray(body?.result?.prompts)) {
+        throw new Error(`prompts/list failed: HTTP ${res.status()} ${text.slice(0, 300)}`);
+      }
+      return body.result.prompts;
+    },
+    getPrompt: async (name, args) => {
+      const res = await request.post(`${DEFAULT_MCP_SERVER_URL}${HTTP_PATH}`, {
+        data: JSON.stringify({ jsonrpc: '2.0', id: 6602, method: 'prompts/get', params: { name, ...(args ? { arguments: args } : {}) } }),
+        headers: { 'Content-Type': 'application/json', 'mcp-session-id': sessionId },
+      });
+      const text = await res.text();
+      let body: any;
+      try { body = JSON.parse(text); } catch { body = undefined; }
+      if (!body || (body.result === undefined && body.error === undefined)) {
+        throw new Error(`prompts/get gave no JSON-RPC outcome: HTTP ${res.status()} ${text.slice(0, 300)}`);
+      }
+      return body.error ? { error: { code: body.error.code, message: String(body.error.message) } } : { result: body.result };
+    },
   };
 }
 
@@ -291,6 +362,10 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
         sessionId: 'stdio',
         raw: session.raw,
         call: session.call,
+        listTools: session.listTools,
+        serverCapabilities: session.serverCapabilities,
+        listPrompts: session.listPrompts,
+        getPrompt: session.getPrompt,
         // stdio has no HTTP envelope to inspect. The two callers of `post` assert on the raw
         // JSON-RPC error shape, which the SDK surfaces as a thrown exception instead, so they
         // are scoped to HTTP rather than asserted differently here. Throwing names the reason.
@@ -414,6 +489,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
       };
       if (opts.payee) args.payee = opts.payee;
       if (opts.category) args.category = opts.category;
+      if (opts.imported_id) args.imported_id = opts.imported_id;
 
       const created = await mcp.call('actual_transactions_create', args);
       // transactions_create returns the id for a single create. Fall back to a
@@ -461,8 +537,10 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
         name,
         date: opts.date ?? '2026-06-15',
         amount: opts.amount ?? -5000,
-        amountOp: 'is',
+        amountOp: opts.amountOp ?? 'is',
         posts_transaction: false,
+        ...(opts.payee ? { payee: opts.payee } : {}),
+        ...(opts.account ? { account: opts.account } : {}),
       });
       const id = (typeof data === 'string' ? data : data?.id) as string;
       cleanup.add(CLEANUP_ORDER.schedule, `schedule ${name}`, async () => {

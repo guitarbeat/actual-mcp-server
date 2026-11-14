@@ -50,39 +50,31 @@ type BatchResult = {
 
 const tool: ToolDefinition = {
   name: 'actual_transactions_update_batch',
-  description: `Update multiple transactions in a single call. Accepts up to 50 {id, fields} pairs. Each update is applied independently: partial failures are reported per-item so you know exactly which succeeded and which failed. Splits are not supported here: a subtransactions field is ignored in batch. Use actual_transactions_update to edit an existing split's children.
+  description: `Update multiple transactions in a single call. Accepts up to 50 {id, fields} pairs. Each update is applied independently and NOT atomically: items applied before a failure stay applied. A missing id or an update Actual rejects is reported per item in failed, and the rest continue. If the call itself fails (lost connection, out of memory, timeout), the error names the ids already applied; read the transactions back with actual_transactions_get BEFORE retrying. An item whose error says "not attempted" was never sent, because the batch ran out of time; read back before retrying it too, since others may have been applied. Splits are not supported here: a subtransactions field is ignored in batch. Use actual_transactions_update to edit an existing split's children.
 
 Returns: { succeeded: [{id}], failed: [{id, error}], total, successCount, failureCount }
 
 Example: { updates: [{ id: "txn-uuid-1", fields: { category: "cat-uuid" } }, { id: "txn-uuid-2", fields: { notes: "Reimbursement" } }] }`,
   inputSchema: InputSchema,
   call: async (args: unknown, _meta?: unknown) => {
-    try {
-      const input = InputSchema.parse(args || {});
+    // No catch-all here (#517): a ZodError must reach actualToolsManager.callTool, which
+    // formats it, and a whole-call failure (no budget, timeout, lock) must surface as a
+    // tool error. Wrapping either as failed: [{id: 'batch'}] read as a per-item outcome.
+    const input = InputSchema.parse(args || {});
 
-      // Single adapter call: all updates share one init/sync/shutdown cycle (fixes issue #79).
-      // Calling adapter.updateTransaction() in a loop would trigger N separate budget sessions.
-      const { succeeded, failed } = await adapter.updateTransactionBatch(input.updates);
+    // Single adapter call: all updates share one init/sync/shutdown cycle (fixes issue #79).
+    // Calling adapter.updateTransaction() in a loop would trigger N separate budget sessions.
+    const { succeeded, failed } = await adapter.updateTransactionBatch(input.updates);
 
-      const result: BatchResult = {
-        succeeded,
-        failed,
-        total: input.updates.length,
-        successCount: succeeded.length,
-        failureCount: failed.length,
-      };
+    const result: BatchResult = {
+      succeeded,
+      failed,
+      total: input.updates.length,
+      successCount: succeeded.length,
+      failureCount: failed.length,
+    };
 
-      return result;
-    } catch (error: any) {
-      const message = error?.message || String(error);
-      return {
-        succeeded: [],
-        failed: [{ id: 'batch', error: `update_batch failed: ${message}` }],
-        total: 0,
-        successCount: 0,
-        failureCount: 1,
-      };
-    }
+    return result;
   },
 };
 

@@ -35,6 +35,58 @@ export interface BudgetConfig {
 }
 
 /**
+ * #621: a server URL as it may appear in a log line: scheme, host and port only. URL userinfo
+ * (a reverse-proxy credential), path and query are dropped. Never throws; an unparseable URL
+ * or one with a `null` origin (a non-special scheme such as a schemeless `user:pass@host`
+ * typo) becomes `<invalid url>`. Display text only, for log lines and tool results (#628):
+ * its output is never used to connect, and the login itself must keep the full URL.
+ */
+export function logSafeOrigin(url: string): string {
+  try {
+    const origin = new URL(url).origin;
+    return origin === 'null' ? '<invalid url>' : origin;
+  } catch {
+    return '<invalid url>';
+  }
+}
+
+/** #623: what the startup record and the registry line may say about the budgets. */
+export interface BudgetRegistrySummary {
+  count: number;
+  distinctServers: number;
+  /** Sorted, each one of http, https, other or invalid. */
+  schemes: string[];
+}
+
+/**
+ * #621 / #623: counts and schemes only, from PARSED URLs, so no budget name, host or credential
+ * can leave through it. Servers are counted by the same [serverUrl, password] key
+ * setLoginsSpanServers uses, so the two can never disagree. Never throws.
+ */
+export function summarizeBudgetRegistry(registry: Map<string, BudgetConfig>): BudgetRegistrySummary {
+  const budgets = [...registry.values()];
+  const distinctServers = new Set(budgets.map((b) => JSON.stringify([b.serverUrl, b.password || '']))).size;
+  const schemes = new Set<string>();
+  for (const b of budgets) {
+    let scheme: string;
+    try {
+      const protocol = new URL(b.serverUrl).protocol;
+      scheme = protocol === 'http:' ? 'http' : protocol === 'https:' ? 'https' : 'other';
+    } catch {
+      scheme = 'invalid';
+    }
+    schemes.add(scheme);
+  }
+  return { count: budgets.length, distinctServers, schemes: [...schemes].sort() };
+}
+
+/** #621: the startup registry line, built from summarizeBudgetRegistry. Never throws. */
+export function formatBudgetRegistrySummary(registry: Map<string, BudgetConfig>): string {
+  const { count, distinctServers, schemes } = summarizeBudgetRegistry(registry);
+  return `Budget registry: ${count} budget(s) across ${distinctServers} server(s) (${schemes.join(', ')})`;
+}
+
+/**
  * Parse the budget registry from environment variables.
  * Always includes the default budget from the provided defaults (ACTUAL_* vars).
  * Additional budgets are read from sequential BUDGET_n_* groups.
@@ -80,7 +132,7 @@ export function parseBudgetRegistry(
     // password over an http:// upstream unless ALLOW_INSECURE_UPSTREAM is set.
     if (encryptionPassword && env.ALLOW_INSECURE_UPSTREAM !== 'true' && /^http:\/\//i.test(serverUrl)) {
       console.error(
-        `[CONFIG] BUDGET_${i}_ENCRYPTION_PASSWORD is set but the upstream URL is http:// (${serverUrl}). ` +
+        `[CONFIG] BUDGET_${i}_ENCRYPTION_PASSWORD is set but the upstream URL is http:// (${logSafeOrigin(serverUrl)}). ` +
         `Refusing to send the encryption password over plaintext (#161). ` +
         `Use https:// or set ALLOW_INSECURE_UPSTREAM=true to override.`,
       );

@@ -83,5 +83,84 @@ check('opt-out -> no exit, decision serve-open-warn, warns once', () => {
   assert.strictEqual(log.errors.length, 0);
 });
 
+console.log('\n[auth-posture-wiring] #572 index.ts counts MCP_STATIC_TOKENS as authentication');
+{
+  // Through the real entrypoint, on an exposed bind, with MCP_STATIC_TOKENS as the only auth.
+  // The token names an unknown budget, so startHttpServer refuses before binding: nothing
+  // listens, and the refusal it prints proves the posture guard let it through. Without the
+  // index.ts wiring the run stops earlier at "Refusing to start: no authentication configured".
+  const { spawnSync } = await import('node:child_process');
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const c = spawnSync(process.execPath, ['dist/src/index.js', '--http'], {
+    cwd: root, encoding: 'utf8', timeout: 30000,
+    env: {
+      PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: 'production',
+      ACTUAL_SERVER_URL: 'http://127.0.0.1:5999', ACTUAL_PASSWORD: 'dummy', ACTUAL_BUDGET_SYNC_ID: 'alpha-sync',
+      BUDGET_DEFAULT_NAME: 'Alpha', MCP_BRIDGE_PORT: '3655', MCP_BRIDGE_BIND_HOST: '0.0.0.0',
+      MCP_BRIDGE_DATA_DIR: mkdtempSync(join(tmpdir(), 'unit572w-')),
+      MCP_STATIC_TOKENS: JSON.stringify({ alice: { tokenEnv: 'MCP_TOKEN_ALICE', budgets: ['Nope'] } }),
+      MCP_TOKEN_ALICE: 'w'.repeat(40),
+    },
+  });
+  const out = (c.stdout || '') + (c.stderr || '');
+  check('static-only on 0.0.0.0 passes the posture guard (no "Refusing to start")', () => {
+    assert.ok(!/Refusing to start/.test(out), out.slice(-1500));
+    assert.ok(/references unknown budget/.test(out), out.slice(-1500));
+    assert.ok(c.status !== 0, `status ${c.status}`);
+  });
+}
+
+console.log('\n[auth-posture-wiring] #611 index.ts refuses a placeholder token on an exposed bind');
+{
+  const { spawnSync } = await import('node:child_process');
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const c = spawnSync(process.execPath, ['dist/src/index.js', '--http'], {
+    cwd: root, encoding: 'utf8', timeout: 30000,
+    env: {
+      PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: 'production',
+      ACTUAL_SERVER_URL: 'http://127.0.0.1:5999', ACTUAL_PASSWORD: 'dummy', ACTUAL_BUDGET_SYNC_ID: 'alpha-sync',
+      MCP_BRIDGE_PORT: '3655', MCP_BRIDGE_BIND_HOST: '0.0.0.0',
+      MCP_BRIDGE_DATA_DIR: mkdtempSync(join(tmpdir(), 'unit611w-')),
+      MCP_SSE_AUTHORIZATION: 'replace-with-openssl-rand-hex-32',
+    },
+  });
+  const out = (c.stdout || '') + (c.stderr || '');
+  check('placeholder MCP_SSE_AUTHORIZATION on 0.0.0.0: exits 1 on its own, refusal printed, never listens', () => {
+    assert.strictEqual(c.signal, null, `killed by ${c.signal} (timeout?)`);
+    assert.strictEqual(c.status, 1, out.slice(-1500));
+    assert.ok(/Refusing to start: weak token on a non-loopback bind/.test(out), out.slice(-1500));
+    assert.ok(!/listening on/.test(out), out.slice(-1500));
+  });
+
+  // Under OIDC a stale weak MCP_SSE_AUTHORIZATION is not a credential, so index.ts must pass
+  // oidcEnabled through. The run then stops later on the plaintext issuer (#244); reaching the
+  // OIDC setup line is the proof that the posture check let it through.
+  const o = spawnSync(process.execPath, ['dist/src/index.js', '--http'], {
+    cwd: root, encoding: 'utf8', timeout: 30000,
+    env: {
+      PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: 'production',
+      ACTUAL_SERVER_URL: 'http://127.0.0.1:5999', ACTUAL_PASSWORD: 'dummy', ACTUAL_BUDGET_SYNC_ID: 'alpha-sync',
+      MCP_BRIDGE_PORT: '3655', MCP_BRIDGE_BIND_HOST: '0.0.0.0',
+      MCP_BRIDGE_DATA_DIR: mkdtempSync(join(tmpdir(), 'unit611o-')),
+      MCP_SSE_AUTHORIZATION: 'changeme',
+      AUTH_PROVIDER: 'oidc', OIDC_ISSUER: 'http://oidc.example', OIDC_RESOURCE: 'http://mcp.example/http',
+    },
+  });
+  const oOut = (o.stdout || '') + (o.stderr || '');
+  check('OIDC on 0.0.0.0 with a stale weak MCP_SSE_AUTHORIZATION: no weak-token refusal, reaches OIDC setup', () => {
+    assert.strictEqual(o.signal, null, `killed by ${o.signal} (timeout?)`);
+    assert.ok(!/weak token/.test(oOut), oOut.slice(-1500));
+    assert.ok(/\[OIDC\] Configuring bearer auth/.test(oOut), oOut.slice(-1500));
+  });
+}
+
 console.log(`\n[auth-posture-wiring] Results: ${failed === 0 ? 'all passed' : failed + ' failed'}`);
 process.exit(failed > 0 ? 1 : 0);

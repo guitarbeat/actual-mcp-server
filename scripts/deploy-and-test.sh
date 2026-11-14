@@ -46,13 +46,16 @@ set -euo pipefail
 # ── Config ─────────────────────────────────────────────────────────────────
 DOCKER_DIR="$HOME/docker/librechat-MCP-actual"
 # DERIVED from this script's own location, never hardcoded. The previous absolute
-# path ($HOME/dev-github-personal/actual-mcp-server) rotted when the repo moved on
+# path ($HOME/<old-checkout-root>/actual-mcp-server) rotted when the repo moved on
 # 2026-09-04, and the failure was quiet in the worst way: step 1 died before the
 # sync ran, so the Docker build context kept whatever it held (a 0.19.3 tree), and
 # every later "full gate" would have tested code from before the move while
 # reporting the current sha. Overridable for an unusual layout, but the default
 # now follows the script.
 DEV_DIR="${DEV_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# #576: the release evidence is written as the LAST step. Remove a previous run's file
+# first, so this run can only end with fresh evidence or none.
+rm -f "$DEV_DIR/.release/dual-transport-report.json"
 if [ ! -d "$DEV_DIR/.git" ]; then
   echo "FATAL: DEV_DIR is not a git working tree: $DEV_DIR" >&2
   exit 2
@@ -74,8 +77,7 @@ if [ "${MCP_TEST_BANK_SYNC:-}" = "true" ]; then
   BANK_SYNC_FLAG="true"
 fi
 HEALTH_RETRIES=30          # × 3s = 90s max wait
-# Count registered tools directly from source, stays correct automatically
-EXPECTED_TOOL_COUNT=$(grep -c "^\s*'actual_" "$DEV_DIR/src/actualToolsManager.ts")
+# EXPECTED_TOOL_COUNT is computed after Step 6 (#681): it depends on the surface the container publishes.
 
 # ── Colours ────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -141,6 +143,21 @@ pull_image "ghcr.io/danny-avila/librechat:latest"                   "LibreChat"
 pull_image "ghcr.io/danny-avila/librechat-rag-api-dev-lite:latest"  "LibreChat RAG API"
 pull_image "lobehub/lobe-chat-database:latest"                      "LobeChat"
 
+# #618: a pull alone never reached the running Actual server, so it stayed on 26.7.0
+# while the image tag moved to 26.11.0 and every gate tested against the old server.
+# Without --force-recreate compose replaces the container only when its image changed.
+docker compose -f "$DOCKER_DIR/Finance-actual-budget/docker-compose.yml" up -d actual-main
+for i in $(seq 1 "$HEALTH_RETRIES"); do
+  curl -sf http://127.0.0.1:5006/health >/dev/null 2>&1 && break
+  if [ "$i" -eq "$HEALTH_RETRIES" ]; then
+    err "Actual Budget (port 5006) did not become healthy after $((HEALTH_RETRIES * 3))s, aborting"
+    docker logs --tail 30 finance-actual-budget-main >&2
+    exit 1
+  fi
+  sleep 3
+done
+ok "Actual Budget server running $(docker exec finance-actual-budget-main node -p "require('/app/package.json').version" 2>/dev/null || echo 'unknown version')"
+
 # ── 3. Recreate MCP server containers ─────────────────────────────────────
 info "Step 3/9: Recreating both MCP server containers (OIDC:3600 + Bearer:3601)..."
 docker compose \
@@ -179,6 +196,45 @@ for i in $(seq 1 "$HEALTH_RETRIES"); do
   echo "  ($i/${HEALTH_RETRIES}) status=${STATUS:-unknown}, waiting 3s..."
   sleep 3
 done
+
+# ── 6b. Work out the expected tool count for the surface the container publishes (#681) ──
+# The count depends on MCP_TOOL_SURFACE (legacy 85, compact 15, all 100), so it is computed
+# only now, from the RUNNING container's own configuration, not from the source alone. The
+# container's surface comes from the local-env config (outside this repository); unset means the default, compact. The suite assumes the
+# full set is published, so a narrowed set is refused rather than counted wrongly.
+container_env() { docker exec actual-mcp-bearer-backend printenv "$1" 2>/dev/null | tr 'A-Z' 'a-z' || true; }
+TOOL_SURFACE="$(container_env MCP_TOOL_SURFACE)"
+# Unset (or empty) is the DEFAULT surface, compact since #680, which is what the suite should
+# prove for the default deployment; the local-env config may also pin legacy, compact or all.
+if [ -z "$TOOL_SURFACE" ]; then
+  TOOL_SURFACE="compact"
+  info "MCP_TOOL_SURFACE is unset on actual-mcp-bearer-backend: the server default (compact) applies"
+fi
+CONT_TOOLSETS="$(container_env MCP_TOOLSETS)"
+if [ -n "$CONT_TOOLSETS" ] && [ "$CONT_TOOLSETS" != "all" ]; then
+  err "MCP_TOOLSETS is '$CONT_TOOLSETS' on actual-mcp-bearer-backend: the suite needs it empty or 'all'"
+  exit 1
+fi
+if [ -n "$(container_env MCP_TOOLS)" ]; then
+  err "MCP_TOOLS is set on actual-mcp-bearer-backend: the suite needs the full tool set, so unset MCP_TOOLS"
+  exit 1
+fi
+if [ "$(container_env MCP_READ_ONLY)" = "true" ]; then
+  err "MCP_READ_ONLY is true on actual-mcp-bearer-backend: the suite writes, so it must be unset or false"
+  exit 1
+fi
+LEGACY_TOOL_COUNT=$(grep -c "^\s*'actual_" "$DEV_DIR/src/actualToolsManager.ts" || true)
+COMPACT_TOOL_COUNT=$(grep -m1 '^export const COMPACT_TOOLS' "$DEV_DIR/src/compact/registry.ts" \
+  | sed -E 's/.*= *\[(.*)\].*/\1/' | awk -F',' '{ n = 0; for (i = 1; i <= NF; i++) if ($i ~ /[A-Za-z0-9_]/) n++; print n }')
+case "$LEGACY_TOOL_COUNT" in ''|0|*[!0-9]*) err "could not count legacy tools in src/actualToolsManager.ts (got '$LEGACY_TOOL_COUNT')"; exit 1 ;; esac
+case "$COMPACT_TOOL_COUNT" in ''|0|*[!0-9]*) err "could not count COMPACT_TOOLS in src/compact/registry.ts (got '$COMPACT_TOOL_COUNT')"; exit 1 ;; esac
+case "$TOOL_SURFACE" in
+  legacy)  EXPECTED_TOOL_COUNT="$LEGACY_TOOL_COUNT" ;;
+  compact) EXPECTED_TOOL_COUNT="$COMPACT_TOOL_COUNT" ;;
+  all)     EXPECTED_TOOL_COUNT=$((LEGACY_TOOL_COUNT + COMPACT_TOOL_COUNT)) ;;
+  *)       err "MCP_TOOL_SURFACE='$TOOL_SURFACE' on actual-mcp-bearer-backend is not legacy, compact or all"; exit 1 ;;
+esac
+ok "Tool surface: surface=${TOOL_SURFACE}, tools=${EXPECTED_TOOL_COUNT}"
 
 # ── 7. Run the integration suite over HTTP (bearer instance, port 3601) ────
 # #280: this is HALF the gate. Step 8 runs the SAME suite over stdio. A promotion to
@@ -226,7 +282,7 @@ else
   echo "  Residue sweep DISABLED: no budget designated disposable (MCP_TEST_BUDGET_SYNC_ID unset)."
 fi
 
-info "Step 7/9: HTTP integration tests against bearer instance port 3601 (level=${TEST_LEVEL}${BANK_SYNC_LABEL}, tools=${EXPECTED_TOOL_COUNT})..."
+info "Step 7/9: HTTP integration tests against bearer instance port 3601 (level=${TEST_LEVEL}${BANK_SYNC_LABEL}, surface=${TOOL_SURFACE}, tools=${EXPECTED_TOOL_COUNT})..."
 echo ""
 set +e
 EXPECTED_TOOL_COUNT="$EXPECTED_TOOL_COUNT" \
@@ -252,11 +308,51 @@ echo ""
 # READ-ONLY calls). It now runs the identical level-gated module suite through
 # `docker exec ... --stdio`, so both transports have equal write-path coverage.
 # The old smoke is still used at sanity/smoke levels, where the full suite does not run.
-info "Step 8/9: stdio integration tests against ${STDIO_CONTAINER} (level=${TEST_LEVEL}, tools=${EXPECTED_TOOL_COUNT})..."
+info "Step 8/9: stdio integration tests against ${STDIO_CONTAINER} (level=${TEST_LEVEL}, surface=${TOOL_SURFACE}, tools=${EXPECTED_TOOL_COUNT})..."
 echo ""
 STDIO_EXIT=0
 case "$TEST_LEVEL" in
   normal|extended|full)
+    # #595: every stdio op downloads the test budget into an empty data dir and replays
+    # every message newer than the server's stored file. Nothing else refreshes that file,
+    # so the replay grew about 800 messages per run until a load crossed the 30 s op
+    # timeout. Re-upload it (same groupId) right before this leg, so the leg replays only
+    # its own messages. It writes to the server, so it refuses unless the loaded budget is
+    # designated disposable, and a refusal or failure ends the run: a stdio leg on a stale
+    # snapshot fails later for a reason unrelated to the change under test.
+    info "  Refreshing the test budget's server snapshot (#595)..."
+    # Every sync id the OIDC instance serves: the refresh refuses to write to any of them.
+    # An unreadable OIDC container fails the run: an empty list would silently disable exit 3.
+    # Filtered inside the container, so its other secrets never reach this shell.
+    if ! OIDC_ENV=$(docker exec actual-mcp-server-backend sh -c \
+        "printenv | grep -E '^(ACTUAL_BUDGET_SYNC_ID|BUDGET_[0-9]+_SYNC_ID)=' || true"); then
+      err "cannot read actual-mcp-server-backend's environment; test budget refresh not run"
+      exit 1
+    fi
+    OIDC_SYNC_IDS=$(printf '%s\n' "$OIDC_ENV" | cut -d= -f2- | grep -v '^$' | paste -sd, - || true)
+    if [ -z "$OIDC_SYNC_IDS" ]; then
+      err "actual-mcp-server-backend exposes no sync id; test budget refresh not run"
+      exit 1
+    fi
+    REFRESH_LOG=$(mktemp)
+    set +e
+    timeout 300 docker exec -i -u app -w /app \
+      -e MCP_TEST_BUDGET_SYNC_ID="${MCP_TEST_BUDGET_SYNC_ID:-}" \
+      -e MCP_REFRESH_FORBIDDEN_SYNC_IDS="${OIDC_SYNC_IDS}" \
+      "$STDIO_CONTAINER" node --input-type=module - \
+      < "$DEV_DIR/scripts/refresh-test-budget-snapshot.mjs" > "$REFRESH_LOG" 2>&1
+    REFRESH_EXIT=$?
+    set -e
+    grep -E '^(  |refusing)' "$REFRESH_LOG" || true
+    if [ "$REFRESH_EXIT" -ne 0 ]; then
+      # Show the unfiltered tail: a docker or import failure prints nothing the filter keeps.
+      tail -n 40 "$REFRESH_LOG" >&2
+      rm -f "$REFRESH_LOG"
+      err "test budget snapshot refresh failed (exit ${REFRESH_EXIT}); stdio leg not run"
+      exit "$REFRESH_EXIT"
+    fi
+    rm -f "$REFRESH_LOG"
+    ok "  Test budget snapshot refreshed"
     set +e
     EXPECTED_TOOL_COUNT="$EXPECTED_TOOL_COUNT" \
       MCP_TEST_BANK_SYNC="${BANK_SYNC_FLAG}" \
@@ -286,32 +382,8 @@ if [ "$STDIO_EXIT" -ne 0 ]; then
 fi
 echo ""
 
-# ── 8b. Emit the release evidence artifact ─────────────────────────────────
-# #280: the release skill's precondition 5 verifies this file. The `sha` makes the
-# evidence unforgeable across commits: any new commit on develop invalidates it, so a
-# promotion can never rest on a stale or recycled run. Never committed (.gitignore).
-#
-# `residue: 0` is sound by construction, not an assumption: the runner exits 3 when its
-# post-run zero-residue assertion finds anything, and both branches above abort the script
-# on a non-zero exit. Reaching this line therefore means both transports asserted clean.
-REPORT_DIR="$DEV_DIR/.release"
-mkdir -p "$REPORT_DIR"
-cat > "$REPORT_DIR/dual-transport-report.json" <<JSON
-{
-  "sha": "$(git -C "$DEV_DIR" rev-parse HEAD)",
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "level": "${TEST_LEVEL}",
-  "transports": {
-    "http":  { "exit": ${HTTP_EXIT}, "residue": 0 },
-    "stdio": { "exit": ${STDIO_EXIT}, "residue": 0 }
-  }
-}
-JSON
-ok "Release evidence written: .release/dual-transport-report.json"
-echo ""
-
 # ── 9. (full level only) #270 upstream-stall regression (stdio + HTTP) ──────
-# Reproduces the personal-finance production hang: a stalled upstream operation
+# Reproduces the budget-tracker production hang: a stalled upstream operation
 # must reject within a bounded time (per-op timeout) and release the global api
 # mutex, instead of hanging forever and wedging every subsequent tool call.
 # stdio hits this on every op (legacy init+download); HTTP hits it at session
@@ -368,7 +440,50 @@ if [ "$TEST_LEVEL" = "full" ]; then
     node "$DEV_DIR/scripts/diag-270-http.mjs"
   set -e
   echo ""
+  # #576: step 9 runs after the runner's zero-residue assertion, so its leaks were
+  # invisible to the release evidence (236 REG270 categories piled up). Re-assert,
+  # settled, before the report can say clean.
+  info "  Post-step-9 zero-residue check (#576)..."
+  set +e
+  env "MCP_AUTH_TOKEN=$MCP_AUTH_TOKEN" "MCP_HTTP_URL=$MCP_SERVER_URL" \
+    node "$DEV_DIR/scripts/assert-no-residue.mjs"
+  RESIDUE_EXIT=$?
+  set -e
+  if [ "$RESIDUE_EXIT" -ne 0 ]; then
+    err "Post-step-9 residue check failed (exit ${RESIDUE_EXIT}); no release evidence written."
+    exit "$RESIDUE_EXIT"
+  fi
+  ok "  Post-step-9: zero residue"
+  echo ""
 else
   info "Step 9/9: #270 upstream-stall regression skipped (runs at 'full' level only; current level=${TEST_LEVEL})."
 fi
+# ── 10. Emit the release evidence artifact ─────────────────────────────────
+# #280: the release skill's precondition 5 verifies this file. The `sha` makes the
+# evidence unforgeable across commits: any new commit on develop invalidates it, so a
+# promotion can never rest on a stale or recycled run. Never committed (.gitignore).
+#
+# `residue: 0` is sound by construction, not an assumption: the runner exits 3 when its
+# post-run zero-residue assertion finds anything, and both branches above abort the script
+# on a non-zero exit. At the full level step 9 runs AFTER those assertions, so the
+# post-step-9 check (#576) re-asserts zero residue and also aborts on failure. Reaching
+# this line therefore means both transports, and step 9, left the budget clean. It is
+# written last, and the stale file is removed at the start of the run, so a run that
+# dies anywhere never leaves a green artifact behind.
+REPORT_DIR="$DEV_DIR/.release"
+mkdir -p "$REPORT_DIR"
+cat > "$REPORT_DIR/dual-transport-report.json" <<JSON
+{
+  "sha": "$(git -C "$DEV_DIR" rev-parse HEAD)",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "level": "${TEST_LEVEL}",
+  "transports": {
+    "http":  { "exit": ${HTTP_EXIT}, "residue": 0 },
+    "stdio": { "exit": ${STDIO_EXIT}, "residue": 0 }
+  }
+}
+JSON
+ok "Release evidence written: .release/dual-transport-report.json"
+echo ""
+
 ok "All done: deploy-and-test complete (HTTP + stdio${TEST_LEVEL:+, level=$TEST_LEVEL})"

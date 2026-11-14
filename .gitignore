@@ -103,3 +103,112 @@ __pycache__/
 # Session scratchpad artifacts (never commit)
 scratchpad-*
 scratchpad-pr399/
+# --- AI assistant files (local only, never published) ---
+# Anchored entries (/NAME) are root-only on purpose: a nested AGENTS.md or
+# CLAUDE.md can belong to the project's own content and must stay tracked.
+.claude/
+/CLAUDE.md
+/CLAUDE.local.md
+# /AGENTS.md is deliberately NOT here: it is PUBLIC by decision (#496), a contributor
+# map to the tracked docs. A forge-kit leak-guard baseline re-sync must not re-add it
+# to this block or the baseline block below. tests/unit/contributor_docs.test.js fails
+# if it is ignored again.
+/GEMINI.md
+.gemini/
+.codex/
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.windsurf/
+.windsurfrules
+.clinerules
+.roo/
+.roomodes
+.devin/
+.specstory/
+.github/copilot-instructions.md
+# --- leak-guard baseline: do not edit between the markers ---
+# Assistant state directories, matched at any depth.
+.antigravity/
+.codeium/
+.cline/
+.sourcegraph/
+.cody/
+.tabnine/
+.amazonq/
+.junie/
+.qodo/
+.openhands/
+.goose/
+.kilocode/
+.augment/
+.trae/
+.bolt/
+.opencode/
+.crush/
+.factory/
+.amp/
+.codebuff/
+.agent-os/
+.taskmaster/
+.copilot/
+# Instruction and config files, ROOT-ANCHORED: a nested AGENTS.md or CLAUDE.md can be
+# the project's own content.
+/AGENT.md
+/.cursorrules
+/.cursorignore
+/.cursorindexingignore
+/.windsurfrules
+/.clinerules
+/.roomodes
+/.rooignore
+/.aider.conf.yml
+/.aiderignore
+/.augmentignore
+/.gptignore
+/.llmignore
+/.airules
+/.mcp.json
+/.github/copilot-instructions.md
+# Chat transcripts — the highest-value leak in the category.
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v*/
+repomix-output.*
+# Coverage and test caches: an absolute path in every record.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+lcov.info
+.pytest_cache/
+.tox/
+.nox/
+# Type and lint caches.
+.mypy_cache/
+.ruff_cache/
+# Build output: embeds the build root.
+build/
+*.egg-info/
+*.sarif
+# Environments: absolute paths in every script shebang.
+.venv/
+venv/
+env/
+*.py[cod]
+# Secrets. The negations are mandatory: six repos track a .env.example on purpose.
+.env.*
+!.env.example
+!.env.template
+# Editor and OS. An upstream fork can track editor config, and editor dirs are
+# becoming assistant dirs.
+.zed/
+*.swp
+*.swo
+Thumbs.db
+# --- end leak-guard baseline ---
+
+# MCP Registry: CI stamps a versioned copy of server.json (#610)
+server.stamped.json

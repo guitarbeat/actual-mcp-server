@@ -55,6 +55,7 @@ async function expectCallError(tool, input, label) {
   // Import tools from compiled dist (requires `npm run build` first)
   const [
     rules_create,
+    rules_create_batch,
     batch,
     transfer,
     setAmount,
@@ -74,11 +75,13 @@ async function expectCallError(tool, input, label) {
     rules_update_tool,
     transactions_create_tool,
     entities_search_tool,
+    transactions_merge_tool,
   ] = await Promise.all([
     import('../../dist/src/tools/rules_create.js').then(m => m.default),
+    import('../../dist/src/tools/rules_create_batch.js').then(m => m.default),
     import('../../dist/src/tools/budget_updates_batch.js').then(m => m.default),
     import('../../dist/src/tools/budgets_transfer.js').then(m => m.default),
-    import('../../dist/src/tools/budgets_setAmount.js').then(m => m.default),
+    import('../../dist/src/tools/budgets_set_amount.js').then(m => m.default),
     import('../../dist/src/tools/schedules_create.js').then(m => m.default),
     import('../../dist/src/tools/schedules_update.js').then(m => m.default),
     import('../../dist/src/tools/schedules_delete.js').then(m => m.default),
@@ -95,6 +98,7 @@ async function expectCallError(tool, input, label) {
     import('../../dist/src/tools/rules_update.js').then(m => m.default),
     import('../../dist/src/tools/transactions_create.js').then(m => m.default),
     import('../../dist/src/tools/entities_search.js').then(m => m.default),
+    import('../../dist/src/tools/transactions_merge.js').then(m => m.default),
   ]);
 
   let failures = 0;
@@ -116,6 +120,18 @@ async function expectCallError(tool, input, label) {
     actions:    [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }],
   }, 'valid minimal rule')) fail();
 
+  // ── actual_rules_create_batch (#485) ────────────────────────────────────
+  console.log('\n[actual_rules_create_batch]');
+
+  const batchRule = { conditions: [{ field: 'notes', op: 'contains', value: 'test' }], actions: [{ op: 'set', field: 'notes', value: 'n' }] };
+  if (!expectParseError(rules_create_batch, {}, 'empty input, missing rules')) fail();
+  if (!expectParseError(rules_create_batch, { rules: [] }, 'rules must have at least 1 item')) fail();
+  if (!expectParseError(rules_create_batch, { rules: Array.from({ length: 51 }, () => batchRule) }, '51 rules exceeds the cap')) fail();
+  if (!expectParseError(rules_create_batch, { rules: [{ ...batchRule, stage: 'default' }] }, 'stage "default" is rejected')) fail();
+  if (!expectParseError(rules_create_batch, { rules: [{ ...batchRule, conditionsOp: 'xor' }] }, 'conditionsOp must be and|or')) fail();
+  if (!expectParseError(rules_create_batch, { rules: [{ conditions: batchRule.conditions }] }, 'rule missing actions')) fail();
+  if (!expectParseOk(rules_create_batch, { rules: Array.from({ length: 50 }, () => batchRule) }, '50 rules is accepted')) fail();
+
   // ── actual_budget_updates_batch ─────────────────────────────────────────
   console.log('\n[actual_budget_updates_batch]');
 
@@ -123,10 +139,32 @@ async function expectCallError(tool, input, label) {
   if (!expectParseError(batch, { operations: 'not-array' }, 'operations must be an array')) fail();
   if (!expectParseError(batch, { operations: [{ categoryId: '10000000-0000-4000-8000-000000000001', amount: 100 }] },
     'operation missing required month')) fail();
-  if (!expectParseError(batch, { operations: [{ month: '2025-13', categoryId: '10000000-0000-4000-8000-000000000001' }] },
-    'invalid month format (month 13)')) fail();
-  if (!expectParseError(batch, { operations: [{ month: '25-01', categoryId: '10000000-0000-4000-8000-000000000001' }] },
-    'invalid month format (2-digit year)')) fail();
+  // #516: integer cents, at-least-one-of, and the 1..100 bounds, with the exact messages
+  const CAT = '10000000-0000-4000-8000-000000000001';
+  const expectMessage = (input, fragment, label) => {
+    try { batch.inputSchema.parse(input); console.error(`  FAIL (expected Zod error) [${label}]`); return false; }
+    catch (e) {
+      const text = (e.issues ?? []).map((i) => i.message).join(' | ');
+      if (text.includes(fragment)) { console.log(`  ✓ rejected with "${fragment}" [${label}]`); return true; }
+      console.error(`  FAIL [${label}]: message "${text}" lacks "${fragment}"`); return false;
+    }
+  };
+  // amount: 1 so the at-least-one-of refine passes and only the month regex can reject
+  if (!expectMessage({ operations: [{ month: '2025-13', categoryId: CAT, amount: 1 }] },
+    'month must be in YYYY-MM format', 'invalid month format (month 13)')) fail();
+  if (!expectMessage({ operations: [{ month: '25-01', categoryId: CAT, amount: 1 }] },
+    'month must be in YYYY-MM format', 'invalid month format (2-digit year)')) fail();
+  if (!expectMessage({ operations: [{ month: '2026-03', categoryId: CAT, amount: 12.5 }] },
+    'Amount must be an integer (cents)', 'amount 12.5 is not integer cents')) fail();
+  if (!expectMessage({ operations: [{ month: '2026-03', categoryId: CAT }] },
+    'each operation needs at least one of amount or carryover', 'neither amount nor carryover')) fail();
+  if (!expectParseError(batch, { operations: [] }, 'empty operations array')) fail();
+  if (!expectParseError(batch, { operations: Array.from({ length: 101 }, () => ({ month: '2026-03', categoryId: CAT, amount: 1 })) },
+    '101 operations exceed the cap')) fail();
+  if (!expectParseOk(batch, { operations: Array.from({ length: 100 }, () => ({ month: '2026-03', categoryId: CAT, amount: 1 })) },
+    '100 operations is the cap and is accepted')) fail();
+  if (!expectParseOk(batch, { operations: [{ month: '2026-03', categoryId: CAT, carryover: false }] },
+    'carryover alone (false is a value)')) fail();
   // Valid minimal input
   if (!expectParseOk(batch, {
     operations: [{ month: '2026-03', categoryId: '10000000-0000-4000-8000-000000000001', amount: 10000 }],
@@ -156,8 +194,8 @@ async function expectCallError(tool, input, label) {
     { month: '2026-03', fromCategoryId: '10000000-0000-4000-8000-000000000001', toCategoryId: '10000000-0000-4000-8000-000000000001', amount: 100 },
     'same from/to category must be rejected at runtime')) fail();
 
-  // ── actual_budgets_setAmount ────────────────────────────────────────────
-  console.log('\n[actual_budgets_setAmount]');
+  // ── actual_budgets_set_amount ────────────────────────────────────────────
+  console.log('\n[actual_budgets_set_amount]');
 
   if (!expectParseError(setAmount, {}, 'empty input — all fields required')) fail();
   if (!expectParseError(setAmount,
@@ -223,6 +261,30 @@ async function expectCallError(tool, input, label) {
   if (!expectParseOk(schedules_update_tool,
     { id: '00000000-0000-0000-0000-000000000001', name: 'Rent', resetNextDate: true },
     'valid update with name + resetNextDate')) fail();
+  // #627: upstream refuses completed and next_date as system-managed, so the strict schema
+  // refuses them (and any unknown key) before the write queue, naming the reason.
+  const { formatZodError } = await import('../../dist/src/lib/zod-error-format.js');
+  for (const key of ['completed', 'next_date']) {
+    const r = schedules_update_tool.inputSchema.safeParse({ id: '00000000-0000-0000-0000-000000000001', [key]: key === 'completed' ? true : '2026-01-01' });
+    const msg = r.success ? '' : formatZodError(r.error, schedules_update_tool.inputSchema);
+    if (r.success || !msg.includes(`unexpected field(s): ${key}`)) {
+      console.error(`  ✗ ${key} on update must be refused naming the reason, got: ${r.success ? 'success' : msg}`);
+      fail();
+    } else {
+      console.log(`  ✓ ${key} on update refused: ${msg}`);
+    }
+  }
+  if (!expectParseError(schedules_update_tool,
+    { id: '00000000-0000-0000-0000-000000000001', nmae: 'typo' },
+    'an unknown key is refused, not silently stripped (#627)')) fail();
+  if (!/managed by Actual/.test(schedules_update_tool.description)) {
+    console.error('  ✗ the actual_schedules_update description must say completion is managed by Actual (#627)');
+    fail();
+  }
+  if ('completed' in schedules_update_tool.inputSchema.shape) {
+    console.error('  ✗ completed must not be advertised on actual_schedules_update (#627)');
+    fail();
+  }
   // #225: date now accepts a one-off date string OR a typed RecurConfig (shared schema).
   if (!expectParseOk(schedules_update_tool,
     { id: '00000000-0000-0000-0000-000000000001', date: '2026-06-15', resetNextDate: true },
@@ -232,7 +294,7 @@ async function expectCallError(tool, input, label) {
     'valid update with a typed RecurConfig')) fail();
   if (!expectParseError(schedules_update_tool,
     { id: '00000000-0000-0000-0000-000000000001', date: { frequency: 'monthly' } },
-    'malformed RecurConfig (missing start/endMode) is rejected, not forwarded unshaped')) fail();
+    'malformed RecurConfig (missing start) is rejected, not forwarded unshaped (endMode is optional since #478)')) fail();
   if (!expectParseError(schedules_update_tool,
     { id: '00000000-0000-0000-0000-000000000001', date: { frequency: 'fortnightly', start: '2026-01-01', endMode: 'never' } },
     'invalid RecurConfig frequency is rejected')) fail();
@@ -415,6 +477,27 @@ async function expectCallError(tool, input, label) {
   if (!expectParseError(payees_merge_tool,
     { targetId: '11111111-1111-4111-8111-111111111111', mergeIds: ['22222222-2222-4222-8222-222222222222', 'p3'] },
     'a non-UUID inside mergeIds is rejected')) fail();
+
+  // ── actual_transactions_merge (#514) ──────────────────────────────────────
+  console.log('\n[actual_transactions_merge: exactly two DIFFERENT UUID ids]');
+  const MA = '11111111-1111-4111-8111-111111111111';
+  const MB = '22222222-2222-4222-8222-222222222222';
+  const MC = '33333333-3333-4333-8333-333333333333';
+  const mergeMsg = (input) => {
+    try { transactions_merge_tool.inputSchema.parse(input); return null; } catch (e) { return String(e.message); }
+  };
+  if (!expectParseError(transactions_merge_tool, {}, 'missing ids rejected')) fail();
+  if (!expectParseError(transactions_merge_tool, { ids: [MA] }, 'one id rejected')) fail();
+  if (!expectParseError(transactions_merge_tool, { ids: [MA, MB, MC] }, 'three ids rejected')) fail();
+  if (!expectParseError(transactions_merge_tool, { ids: [MA, 'not-a-uuid'] }, 'non-UUID id rejected')) fail();
+  if (!expectParseError(transactions_merge_tool, { ids: [MA, MA] }, 'the same id twice rejected')) fail();
+  if (!(mergeMsg({ ids: [MA, MA] }) || '').includes('ids must be two DIFFERENT transaction ids')) {
+    console.error('  FAIL: same-id message is not actionable'); fail();
+  } else console.log('  ✓ same-id message says ids must be two DIFFERENT transaction ids');
+  if (!(mergeMsg({ ids: [MA, 'not-a-uuid'] }) || '').includes('Invalid transaction ID format')) {
+    console.error('  FAIL: non-UUID message does not name the format'); fail();
+  } else console.log('  ✓ non-UUID message names the expected format');
+  if (!expectParseOk(transactions_merge_tool, { ids: [MA, MB] }, 'two distinct UUIDs accepted')) fail();
 
   // ── actual_get_id_by_name (Q1) ────────────────────────────────────────────
   console.log('\n[actual_get_id_by_name — required type enum + non-empty name]');

@@ -52,7 +52,8 @@ function fixture({ locked, composeTag, workflowTag }) {
   writeFileSync(join(dir, 'package-lock.json'), JSON.stringify({
     packages: { 'node_modules/@playwright/test': { version: locked } },
   }));
-  writeFileSync(join(dir, 'docker-compose.test.yaml'),
+  mkdirSync(join(dir, 'tests', 'e2e'), { recursive: true });
+  writeFileSync(join(dir, 'tests', 'e2e', 'compose.yaml'),
     composeTag ? `services:\n  e2e-test-runner:\n    image: mcr.microsoft.com/playwright:${composeTag}\n` : 'services: {}\n');
   if (workflowTag) {
     mkdirSync(join(dir, '.github', 'workflows'), { recursive: true });
@@ -74,11 +75,71 @@ check('the real tree pins the image at exactly the lockfile version', () => {
   // (for instance a scan that found no sites) cannot also make this pass.
   const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
   const locked = lock.packages['node_modules/@playwright/test'].version;
-  const compose = readFileSync(join(ROOT, 'docker-compose.test.yaml'), 'utf8');
+  const compose = readFileSync(join(ROOT, 'tests', 'e2e', 'compose.yaml'), 'utf8');
   assert.ok(
     compose.includes(`mcr.microsoft.com/playwright:v${locked}-`),
-    `docker-compose.test.yaml does not pin v${locked}`,
+    `tests/e2e/compose.yaml does not pin v${locked}`,
   );
+});
+
+// #508 / #593: the runner image has no make/g++, and better-sqlite3 13.x (from @actual-app/api
+// 26.10.0) makes a plain `npm ci` run `node-gyp rebuild`. #508 installed the toolchain from the
+// Ubuntu mirrors first, which stalled 3 of 6 CI runs in one day; #593 replaced that with
+// `npm ci --ignore-scripts`, which the runner can afford because nothing it runs loads the
+// module. Dropping the flag re-breaks only the NIGHTLY train, and reintroducing apt re-opens the
+// stall, so both shapes are pinned here. The check takes the compose TEXT so the fixture cases
+// below can mutate a copy; the real file is checked last.
+function checkRunnerCommand(compose) {
+  const start = compose.indexOf('e2e-test-runner:');
+  assert.ok(start !== -1, 'tests/e2e/compose.yaml no longer defines e2e-test-runner');
+  const runner = compose.slice(start);
+  // The `command:` block is the folded scalar after `command: >`: every following line indented
+  // deeper than the key. Scoped to it so the service's comment may mention apt in prose. The
+  // indent is `[ \t]`, not `\s`: under the `m` flag `\s*` would swallow a blank line ahead of
+  // the key into the captured indent and the continuation lines would stop matching. A blank
+  // line INSIDE the folded scalar is still part of it, so the block also accepts empty lines;
+  // otherwise an apt call written after one would fall outside the scanned text.
+  const m = /^([ \t]*)command:[^\n]*\n((?:(?:\1[ \t]+[^\n]*|[ \t]*)\n)*)/m.exec(runner);
+  assert.ok(m, 'e2e-test-runner no longer has a command block');
+  const command = m[2];
+  assert.ok(/\bnpm ci --ignore-scripts\b/.test(command), 'e2e-test-runner no longer runs npm ci --ignore-scripts');
+  assert.ok(!/\bapt-get\b/.test(command), 'e2e-test-runner must not call apt-get (#593)');
+}
+
+const REAL_COMPOSE = readFileSync(join(ROOT, 'tests', 'e2e', 'compose.yaml'), 'utf8');
+
+check('CATCHES a runner command that lost --ignore-scripts (#593)', () => {
+  // replaceAll: the service comment also quotes the flag, and a first-occurrence replace would
+  // mutate the prose and leave the command intact (which is exactly how this check first passed
+  // without firing).
+  const mutated = REAL_COMPOSE.replaceAll('npm ci --ignore-scripts', 'npm ci');
+  assert.notStrictEqual(mutated, REAL_COMPOSE, 'fixture mutation did not apply');
+  assert.throws(() => checkRunnerCommand(mutated), /no longer runs npm ci --ignore-scripts/);
+});
+
+check('CATCHES an apt call placed after a blank line inside the command block (review of #593)', () => {
+  const compose = REAL_COMPOSE.replace('npm ci --ignore-scripts &&', 'npm ci --ignore-scripts &&\n\n        apt-get install -y -qq make &&');
+  assert.ok(compose !== REAL_COMPOSE, 'fixture did not insert the apt line');
+  assert.throws(() => checkRunnerCommand(compose), /must not call apt-get \(#593\)/);
+});
+
+check('still finds the command block when a blank line precedes the key (review of #593)', () => {
+  const compose = REAL_COMPOSE.replace(/\n(\s*)command: >/, '\n\n$1command: >');
+  assert.ok(compose !== REAL_COMPOSE, 'fixture did not insert the blank line');
+  checkRunnerCommand(compose);
+});
+
+check('CATCHES a reintroduced apt prologue in the runner command (#593)', () => {
+  const mutated = REAL_COMPOSE.replace(
+    'npm ci --ignore-scripts &&',
+    'apt-get update -qq && apt-get install -y -qq make g++ && npm ci --ignore-scripts &&',
+  );
+  assert.notStrictEqual(mutated, REAL_COMPOSE, 'fixture mutation did not apply');
+  assert.throws(() => checkRunnerCommand(mutated), /must not call apt-get \(#593\)/);
+});
+
+check('the real runner runs npm ci --ignore-scripts and never apt-get (#508, #593)', () => {
+  checkRunnerCommand(REAL_COMPOSE);
 });
 
 check('CATCHES a drifted compose tag (the state this ticket was filed for)', () => {
@@ -118,6 +179,17 @@ check('FAILS rather than passing vacuously when no image reference exists', () =
     const { code, out } = run(dir);
     assert.strictEqual(code, 1, 'guard passed with nothing to check');
     assert.ok(/stale|no mcr/i.test(out), `message does not say the scan found nothing:\n${out}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+check('FAILS when the compose file is missing, naming tests/e2e/compose.yaml', () => {
+  // A missing compose file must not silently drop its pin from the check.
+  const dir = fixture({ locked: '1.62.1', composeTag: 'v1.62.1-jammy', workflowTag: 'v1.62.1-jammy' });
+  try {
+    rmSync(join(dir, 'tests', 'e2e', 'compose.yaml'));
+    const { code, out } = run(dir);
+    assert.strictEqual(code, 1, 'guard passed with the compose file missing');
+    assert.ok(/tests\/e2e\/compose\.yaml/.test(out), `message does not name the compose file:\n${out}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -24,6 +24,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { pace, extractResult } from '../shared/e2e-helpers.js';
@@ -34,7 +35,7 @@ export const STDIO_CONTAINER = process.env.MCP_STDIO_CONTAINER || 'mcp-server-e2
 /**
  * Its own budget cache, never the one the HTTP server is using. See the header.
  *
- * It is its OWN named volume (`mcp-test-stdio-data`), declared in docker-compose.test.yaml, and
+ * It is its OWN named volume (`mcp-test-stdio-data`), declared in tests/e2e/compose.yaml, and
  * both halves of that are forced. It cannot live under /app/data because that is the HTTP
  * server's cache and the whole point is not to share one. It cannot live under /tmp either:
  * this image's root filesystem is read-only, which is exactly how the first attempt failed, with
@@ -56,9 +57,29 @@ const SYNC_ID_FILE = process.env.MCP_STDIO_SYNC_ID_FILE || '/tmp/actual-sync-id.
 // container's CONFIGURED environment, and the configured ACTUAL_SERVER_URL is the HTTP leg's.
 const SERVER_URL_OVERRIDE = process.env.MCP_STDIO_SERVER_URL || '';
 
+// #681: which tool surface the exec'd server publishes. Unset means "inherit the container's own"
+// (`all` on the compose stack, so the legacy-bound rows and the compact rows both run). The
+// compact leg (tests/e2e/compact-surface.e2e.spec.ts, project docker-e2e-compact-stdio) sets it
+// to `compact`, which `docker exec -e` makes win over the container's configured value.
+const TOOL_SURFACE_OVERRIDE = process.env.MCP_E2E_TOOL_SURFACE || '';
+
 export type StdioSession = {
   raw(tool: string, args?: Record<string, unknown>): Promise<any>;
   call(tool: string, args?: Record<string, unknown>): Promise<any>;
+  /** #560: the `instructions` string the server returned from `initialize`. */
+  instructions(): string | undefined;
+  /** #624: the `serverInfo` the server returned from `initialize`. */
+  serverInfo(): { name: string; version: string } | undefined;
+  /** #560: the tool names this server publishes, from `tools/list`. */
+  listToolNames(): Promise<string[]>;
+  /** #641: the full tools/list entries (title, annotations, schemas), parsed by the SDK. */
+  listTools(): Promise<any[]>;
+  /** #660: the server capabilities from `initialize`, parsed by the SDK. */
+  serverCapabilities(): Promise<Record<string, unknown> | undefined>;
+  /** #660: prompts/list entries. */
+  listPrompts(): Promise<any[]>;
+  /** #660: prompts/get. A JSON-RPC error (an SDK McpError) is returned as `{ error }`, like the HTTP client. */
+  getPrompt(name: string, args?: Record<string, unknown>): Promise<{ result?: any; error?: { code: number; message: string } }>;
   close(): Promise<void>;
 };
 
@@ -87,7 +108,7 @@ export async function openStdioSession(): Promise<StdioSession> {
     const detail = (err as { stderr?: Buffer }).stderr?.toString().trim() || (err as Error).message;
     throw new Error(
       `could not prepare the stdio data dir ${DATA_DIR} in "${STDIO_CONTAINER}": ${detail}\n` +
-      `It must exist and be writable by uid 1001. docker-compose.test.yaml mounts the named ` +
+      `It must exist and be writable by uid 1001. tests/e2e/compose.yaml mounts the named ` +
       `volume mcp-test-stdio-data there for exactly this; if you are pointing at a different ` +
       `stack, give it a writable mount and set MCP_STDIO_DATA_DIR. Or the container is not running.`,
     );
@@ -107,6 +128,7 @@ export async function openStdioSession(): Promise<StdioSession> {
       '-u', 'app',
       '-e', `MCP_BRIDGE_DATA_DIR=${DATA_DIR}`,
       ...(SERVER_URL_OVERRIDE ? ['-e', `ACTUAL_SERVER_URL=${SERVER_URL_OVERRIDE}`] : []),
+      ...(TOOL_SURFACE_OVERRIDE ? ['-e', `MCP_TOOL_SURFACE=${TOOL_SURFACE_OVERRIDE}`] : []),
       STDIO_CONTAINER,
       'sh', '-c',
       `export ACTUAL_BUDGET_SYNC_ID=$(cat ${SYNC_ID_FILE}) && exec node dist/src/index.js --stdio`,
@@ -142,6 +164,21 @@ export async function openStdioSession(): Promise<StdioSession> {
   return {
     raw,
     call: async (tool, args = {}) => extractResult(await raw(tool, args)),
+    instructions: () => client.getInstructions(),
+    serverInfo: () => client.getServerVersion(),
+    listToolNames: async () => (await client.listTools()).tools.map((t) => t.name),
+    listTools: async () => (await client.listTools()).tools,
+    serverCapabilities: async () => client.getServerCapabilities() as Record<string, unknown> | undefined,
+    listPrompts: async () => (await client.listPrompts()).prompts,
+    getPrompt: async (name, args) => {
+      try {
+        // The SDK types prompt arguments as strings; a test that passes another type is the test's bug.
+        return { result: await client.getPrompt({ name, ...(args ? { arguments: args as Record<string, string> } : {}) }) };
+      } catch (err) {
+        if (err instanceof McpError) return { error: { code: err.code, message: err.message } };
+        throw err;
+      }
+    },
     close,
   };
 }

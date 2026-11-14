@@ -1,4 +1,5 @@
-// Streamable HTTP Origin validation and RFC 6750 scope challenge coverage.
+// Streamable HTTP Origin validation when MCP_ALLOWED_ORIGINS is set.
+// The guard runs before auth, on the configured path and on the /mcp alias.
 
 import assert from 'node:assert/strict';
 
@@ -8,11 +9,13 @@ process.env.ACTUAL_PASSWORD = 'stub-password-for-unit-test';
 process.env.AUTH_PROVIDER = 'none';
 process.env.MCP_SSE_AUTHORIZATION = 'origin-test-token';
 process.env.MCP_ALLOWED_ORIGINS = 'https://allowed.example.com';
+delete process.env.MCP_STATIC_TOKENS;
+delete process.env.AUTH_BUDGET_ACL;
 
 const { startHttpServer } = await import('../../dist/src/server/httpServer.js');
 
 const { listener, cleanup } = await startHttpServer(
-  {}, 0, '/custom-mcp', {}, [], 'Origin test server', 'test instructions', {}, '0.19.3', '127.0.0.1',
+  {}, 0, '/custom-mcp', {}, [], 'Origin test server', 'test instructions', {}, '0.30.0', '127.0.0.1',
 );
 
 try {
@@ -43,6 +46,7 @@ try {
       Origin: 'https://allowed.example.com',
       Authorization: 'Bearer origin-test-token',
       'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
     },
     body,
   });
@@ -50,7 +54,7 @@ try {
 
   const omitted = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
     body,
   });
   assert.equal(omitted.status, 401, 'requests without Origin remain valid and reach auth');

@@ -49,6 +49,16 @@ function _splitInList(valuesStr: string): string[] {
  *  `'McDonald''s'` matches; `'McDonald's'` (a lone quote) does not. */
 const SQL_ESCAPED_SINGLE_QUOTED = /^'(?:[^']|'')*'$/;
 
+// ActualQL's value compiler escapes comparison and LIKE strings for SQLite, so SQL's doubled
+// apostrophe must be decoded first. IN uses a separate path that deliberately preserves it.
+function _stripWhereSqlLiteral(s: string): string {
+  const t = s.trim();
+  if (SQL_ESCAPED_SINGLE_QUOTED.test(t)) {
+    return t.slice(1, -1).replace(/''/g, "'");
+  }
+  return _stripWhereQuotes(s);
+}
+
 function _isSafeInListElement(raw: string): boolean {
   const t = raw.trim();
   // #433: a single-quoted element may now carry DOUBLED internal quotes. That is
@@ -84,11 +94,11 @@ function _coerceInListValue(s: string): string | number {
   return _coerceWhereValue(s);
 }
 
-// Coerce a SQL value literal to a number when it looks numeric, else keep the
-// (unquoted) string. Used for IN lists and comparison operands. Empty stays a
-// string so an empty literal is not silently turned into 0.
+// Coerce a comparison operand (and an IN element with no doubled quote) to a number when it
+// looks numeric, else keep the unquoted string. Empty stays a string so an empty literal is not
+// turned into 0.
 function _coerceWhereValue(s: string): string | number {
-  const v = _stripWhereQuotes(s);
+  const v = _stripWhereSqlLiteral(s);
   if (v === '') return v;
   const n = Number(v);
   return isNaN(n) ? v : n;
@@ -166,7 +176,7 @@ export function parseWhereClause(query: any, whereClause: string, tableName?: st
     const notLikeMatch = trimmedCondition.match(/^([\w.]+)\s+NOT\s+LIKE\s+(.+)$/i);
     if (notLikeMatch) {
       const [, field, valueStr] = notLikeMatch;
-      query = query.filter({ [field]: { $notlike: _stripWhereQuotes(valueStr) } });
+      query = query.filter({ [field]: { $notlike: _stripWhereSqlLiteral(valueStr) } });
       continue;
     }
 
@@ -176,7 +186,7 @@ export function parseWhereClause(query: any, whereClause: string, tableName?: st
     const likeMatch = trimmedCondition.match(/^([\w.]+)\s+LIKE\s+(.+)$/i);
     if (likeMatch) {
       const [, field, valueStr] = likeMatch;
-      query = query.filter({ [field]: { $like: _stripWhereQuotes(valueStr) } });
+      query = query.filter({ [field]: { $like: _stripWhereSqlLiteral(valueStr) } });
       continue;
     }
 
@@ -233,7 +243,27 @@ export function parseWhereClause(query: any, whereClause: string, tableName?: st
       // operators are left to their normal path, where ActualQL will reject them for a boolean as
       // it does today, rather than us inventing an ordering the column does not have.
       const isBool = _isBooleanField(tableName, field) && (actualOp === '$eq' || actualOp === '$ne');
-      const finalValue = isBool ? _coerceBoolean(field, valueStr) : _coerceWhereValue(valueStr);
+      const isText = tableName !== undefined && getFieldType(tableName, field) === 'string';
+      // #567 review: a quoted number stays a string on a text column. Coercing `notes = '123'` to
+      // the number 123 made upstream throw "Can't convert integer to string".
+      const finalValue = isBool
+        ? _coerceBoolean(field, valueStr)
+        : isText ? _stripWhereSqlLiteral(valueStr) : _coerceWhereValue(valueStr);
+      // #567 review: upstream's val() (aql/compiler.ts) re-escapes a value only when it casts to
+      // type `string`. A value compared against an `id` column is inlined as `'${value}'` with NO
+      // escaping, so a quote in it closes the literal: `account = 'x'||(SELECT ...)||'x'` ran the
+      // subquery, past both validators, and decoding `''` made the doubled form do the same. A
+      // quote is therefore allowed only on a column our schema types as `string` (checked against
+      // upstream's schema: every one of them is `string` there, or does not exist and fails to
+      // compile). Any other or unknown type refuses it, which is fail closed: no id, date, number
+      // or boolean legitimately contains a single quote. LIKE and NOT LIKE always cast to string,
+      // so they need no such check.
+      if (!isText && typeof finalValue === 'string' && finalValue.includes("'")) {
+        throw new Error(
+          `Invalid value for column "${field}": a single quote is only allowed in a value ` +
+          `compared against a text column (for example payee.name = 'O''Brien').`,
+        );
+      }
       if (actualOp === '$eq') {
         // Simple equality can use the direct field: value shorthand.
         query = query.filter({ [field]: finalValue });
@@ -254,4 +284,79 @@ export function parseWhereClause(query: any, whereClause: string, tableName?: st
   }
 
   return query;
+}
+
+// #561: the joined name columns an empty-result hint can check, and the table that lists each.
+const NAME_CONDITION_TABLES: Record<string, { table: string; noun: string }> = {
+  'category.name': { table: 'categories', noun: 'category' },
+  'payee.name': { table: 'payees', noun: 'payee' },
+  'account.name': { table: 'accounts', noun: 'account' },
+};
+
+/** One name condition, as the main query filtered on it. */
+export interface NameConditionLookup {
+  table: string;
+  noun: string;
+  /** The filter applied to the entity's `name` column: the SAME operator and value as the main
+   *  query, so "no entity matches" means exactly what made the result empty. */
+  nameFilter: unknown;
+  /** For an IN list: each element as the caller meant it (doubling undone), matched against the
+   *  names the ONE `$oneof` lookup returns. Absent for `=` and `LIKE`, where an empty lookup means
+   *  the single value matched nothing. */
+  inValues?: string[];
+  /** The value as the caller wrote it, for the hint (`=` and `LIKE` only). */
+  value?: string;
+}
+
+/**
+ * #561: the `=`, `IN` and `LIKE` conditions on category.name, payee.name or account.name in a
+ * query built by parseWhereClause, read back from its serialized filterExpressions. `!=` and
+ * `NOT LIKE` are skipped: an unknown name there cannot make the result empty. Each condition is
+ * ONE lookup, an IN list included (the ticket allows one extra read per name condition), and the
+ * lookup reuses the main query's operator and value, so a `$oneof` element compiles exactly as in
+ * the main query (where upstream inlines the doubled-quote form #433 keeps). The three name
+ * columns are text, so since #567 a numeric-looking `=` value arrives as a string; a number is
+ * still accepted (an IN element can be one) and kept as is.
+ */
+export function nameConditionLookups(filterExpressions: unknown[]): NameConditionLookup[] {
+  const out: NameConditionLookup[] = [];
+  const isScalar = (v: unknown): v is string | number => typeof v === 'string' || typeof v === 'number';
+  for (const expr of filterExpressions) {
+    if (expr === null || typeof expr !== 'object') continue;
+    for (const [field, cond] of Object.entries(expr as Record<string, unknown>)) {
+      const target = NAME_CONDITION_TABLES[field];
+      if (!target) continue;
+      if (isScalar(cond)) {
+        out.push({ ...target, nameFilter: cond, value: String(cond) });
+      } else if (cond !== null && typeof cond === 'object') {
+        const c = cond as Record<string, unknown>;
+        if (typeof c.$like === 'string') {
+          out.push({ ...target, nameFilter: { $like: c.$like }, value: c.$like });
+        } else if (Array.isArray(c.$oneof) && c.$oneof.length > 0 && c.$oneof.every(isScalar)) {
+          out.push({
+            ...target,
+            nameFilter: { $oneof: c.$oneof },
+            inValues: c.$oneof.map((v) => String(v).replace(/''/g, "'")),
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * #561: the hint lines for one condition, given the names its lookup returned. Each value is
+ * echoed at most 100 characters. For an IN list the comparison is exact, because upstream compiles
+ * `$oneof` to a plain SQL IN, which is case-sensitive: 'groceries' does not match 'Groceries' in
+ * the main query, so it must not count as found here either (#561 review round 2).
+ */
+export function nameConditionHintLines(lookup: NameConditionLookup, foundNames: string[]): string[] {
+  const line = (v: string) => `No ${lookup.noun} matches '${v.slice(0, 100)}'. ` +
+    `List the exact names with: SELECT id, name FROM ${lookup.table}`;
+  if (lookup.inValues) {
+    const found = new Set(foundNames);
+    return [...new Set(lookup.inValues)].filter((v) => !found.has(v)).map(line);
+  }
+  return foundNames.length === 0 ? [line(lookup.value ?? '')] : [];
 }

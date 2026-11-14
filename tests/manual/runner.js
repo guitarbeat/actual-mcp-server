@@ -23,17 +23,20 @@
  *   MCP_AUTH_TOKEN        Bearer token override
  *   MCP_TEST_LEVEL        Test level override
  *   ACTUAL_SERVER_URL     Actual Budget server URL (shown in cleanup prompt)
- *   EXPECTED_TOOL_COUNT   Expected number of MCP tools (default: 81)
+ *   EXPECTED_TOOL_COUNT   Expected number of MCP tools (default: 85)
  */
 
+import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { config as loadDotenv } from 'dotenv';
 
 import { createClient } from './mcp-client.js';
 import { createClient as createStdioClient } from './mcp-client-stdio.js';
-import { sweepResidue, assertNoResidue, EXIT_RESIDUE, EXIT_UNSAFE_BUDGET } from './residue.js';
-import { failureCount, failureList } from './assert.js';
+import { sweepResidue, assertNoResidue, ResidueUnreadableError, EXIT_RESIDUE, EXIT_UNSAFE_BUDGET } from './residue.js';
+import { budgetFilesCall, remove } from './compact-calls.js';
+import { fail, failureCount, failureList } from './assert.js';
+import { shouldDeleteCategory } from './context.js';
 import { sanityTests } from './tests/sanity.js';
 import { smokeTests } from './tests/smoke.js';
 import { accountTests } from './tests/account.js';
@@ -42,8 +45,9 @@ import { extendedTests, fullTests } from './tests/advanced.js';
 import { roundtripTests } from './tests/roundtrip.js';
 import { cleanupMcpTestAccounts } from './cleanup.js';
 
-// Load .env from project root
-loadDotenv();
+// Load .env from the current directory (run from the repo root), with every dotenv option
+// pinned so no DOTENV_* variable in the shell changes what loads (#505).
+loadDotenv({ quiet: true, debug: false, override: false, encoding: 'utf8', fast: false, path: path.resolve(process.cwd(), '.env') });
 
 // Default targets the bearer instance (port 3601) — safe for automated tests.
 // The OIDC instance (port 3600) requires a Casdoor JWT and cannot be tested without a browser.
@@ -216,7 +220,7 @@ export async function run() {
       guard.setLastCompleted('extendedTests');
       await fullTests(client, context, testOpts);
       guard.setLastCompleted('fullTests');
-      // #332/#334: LAST, and only at `full`. actual_budgets_import LOADS the
+      // #332/#334: LAST, and only at `full`. manage_budget_files import LOADS the
       // imported budget, so anything running after it would silently target the
       // imported copy. The module switches back before returning, but running it
       // last is the primary defence and the switch-back is the backstop. Its own
@@ -236,8 +240,9 @@ export async function run() {
     // Show which budget was used
     let budgetName = "Unknown";
     try {
-      const budgets = await client.callTool("actual_budgets_get_all", {});
-      const activeBudget = budgets.result?.find(b => b.id === "_test-budget") || budgets.result?.[0];
+      const budgets = await client.callTool(...budgetFilesCall());
+      const budgetList = Array.isArray(budgets) ? budgets : budgets?.result;
+      const activeBudget = budgetList?.find?.(b => b.id === "_test-budget") || budgetList?.[0];
       if (activeBudget) budgetName = activeBudget.name || "Test Budget";
     } catch { /* ignore */ }
 
@@ -273,42 +278,59 @@ export async function run() {
 
       if (context.transactionId) {
         console.log("\nDeleting test transaction...");
-        await callTool("actual_transactions_delete", { id: context.transactionId });
+        await remove(callTool, "transaction", context.transactionId);
         console.log("✓ Transaction deleted");
       }
       if (context.ruleWithoutOpId) {
         console.log("\nDeleting test rule (without op)...");
-        await callTool("actual_rules_delete", { id: context.ruleWithoutOpId });
+        await remove(callTool, "rule", context.ruleWithoutOpId);
         console.log("✓ Rule (without op) deleted");
       }
       if (context.rulesUpsertId) {
         console.log("\nDeleting test rule (upsert)...");
-        await callTool("actual_rules_delete", { id: context.rulesUpsertId });
+        await remove(callTool, "rule", context.rulesUpsertId);
         console.log("✓ Rule (upsert) deleted");
+      }
+      // #585: a backstop for a module delete that failed WITHOUT throwing (fail() records and
+      // returns). Its own try/catch, so a failure here cannot skip the deletes below; a module
+      // that threw never reaches this phase, and the next run's pre-run sweep removes its rule.
+      if (context.ruleStage342Id) {
+        console.log("\nDeleting test rule (#342 stage)...");
+        try {
+          await remove(callTool, "rule", context.ruleStage342Id);
+          // Not verified here: a tool error comes back as a reply, not a throw. The post-run
+          // zero-residue assertion reads rules and is the check.
+          console.log("  Rule (#342 stage) delete requested; the zero-residue assertion verifies it");
+        } catch (err) {
+          fail(`Could not delete the #342 stage rule ${context.ruleStage342Id}: ${err.message}. That is residue.`);
+        }
       }
       if (context.ruleId) {
         console.log("\nDeleting test rule...");
-        await callTool("actual_rules_delete", { id: context.ruleId });
+        await remove(callTool, "rule", context.ruleId);
         console.log("✓ Rule deleted");
       }
       if (context.payeeId) {
         console.log("\nDeleting test payee...");
-        await callTool("actual_payees_delete", { id: context.payeeId });
+        await remove(callTool, "payee", context.payeeId);
         console.log("✓ Payee deleted");
       }
-      if (context.categoryId) {
+      if (shouldDeleteCategory(context)) {
         console.log("\nDeleting test category...");
-        await callTool("actual_categories_delete", { id: context.categoryId });
+        await remove(callTool, "category", context.categoryId);
         console.log("✓ Category deleted");
+      } else if (context.categoryId) {
+        // #590: the modules borrowed a PRE-EXISTING category; it is the budget's, not ours.
+        console.log(`\nLeaving pre-existing category ${context.categoryId} in place (borrowed, not created by the suite)`);
       }
       if (context.categoryGroupId) {
         console.log("\nDeleting test category group...");
-        await callTool("actual_category_groups_delete", { id: context.categoryGroupId });
+        await remove(callTool, "group", context.categoryGroupId);
         console.log("✓ Category group deleted");
       }
       if (context.accountId) {
         console.log("\nDeleting test account...");
-        await callTool("actual_accounts_delete", { id: context.accountId });
+        await remove(callTool, "account", context.accountId);
         console.log("✓ Account deleted");
       }
 
@@ -320,10 +342,20 @@ export async function run() {
     // precedence. A failed assertion (exit 1) is the primary signal and wins the exit code,
     // but the residue leak is still reported. Exit 2 (runtime budget) and exit 4 (unsafe
     // budget) fire earlier where they already do and are unchanged.
+    // #583: a listing that could not be read means the budget was not checked. That is its own
+    // verdict (exit 1), folded in here so the failed-assertion ledger is still printed; any
+    // other error still reaches the outer catch.
     let residue = 0;
+    let unreadable = null;
     if (['normal', 'extended', 'full'].includes(level)) {
       console.log("\n--- Post-run zero-residue assertion ---");
-      residue = await assertNoResidue(client.callTool);
+      try {
+        residue = await assertNoResidue(client.callTool);
+      } catch (err) {
+        if (!(err instanceof ResidueUnreadableError)) throw err;
+        unreadable = err;
+        console.error(`  ✗ ${err.message}`);
+      }
     }
 
     // #281: a failed assertion in any module now FAILS the run. Before this, modules printed
@@ -335,6 +367,17 @@ export async function run() {
       if (residue > 0) {
         console.error(`\n(Also: ${residue} test object(s) survived cleanup; see the residue verdict above.)`);
       }
+      if (unreadable) {
+        console.error(`\n(Also: the residue check could not read ${unreadable.tools.join(', ')}; see above.)`);
+      }
+      await teardown();
+      if (guard) guard.clear();
+      rl.close();
+      process.exit(1);
+    }
+
+    if (unreadable) {
+      console.error(`\n❌ The zero-residue assertion could not read ${unreadable.tools.join(', ')}. The budget was not checked, so this run cannot certify it clean; repeat the run.`);
       await teardown();
       if (guard) guard.clear();
       rl.close();

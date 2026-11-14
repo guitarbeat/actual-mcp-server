@@ -34,7 +34,7 @@ const UPSTREAM_DEPENDENT = [
   'actual_categories_delete (upstream throws "Category with id X not found")',
   'actual_schedules_update (upstream throws "Schedule X not found")',
   'actual_transactions_delete / actual_transactions_update (upstream returns [] for a missing id)',
-  'actual_budgets_setCarryover (upstream validates month and category)',
+  'actual_budgets_set_carryover (upstream validates month and category)',
 ];
 
 export function readAuditedVersion(text) {
@@ -107,7 +107,7 @@ function main() {
  * Exact entry-point check, through realpath. Node's ESM loader realpaths
  * `import.meta.url`, so comparing a non-realpathed `process.argv[1]` makes this script a
  * SILENT no-op when invoked through a symlink, and this repo is reachable through one
- * (`/home/alien/dev-github-personal`). Silent-and-exit-0 is indistinguishable from
+ * (`~/proj/actual-mcp-server`). Silent-and-exit-0 is indistinguishable from
  * "current", which is precisely the failure mode #362 exists to remove.
  *
  * `realpathSync` THROWS on a path that does not exist, and an uncaught throw here would

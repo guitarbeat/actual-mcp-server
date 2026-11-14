@@ -21,14 +21,14 @@ export interface RawEnvVar {
   name: string;
   /** Why it is read raw rather than through the validated config object. */
   reason: string;
-  /** Where it is read, for the read-site map in docs/CONFIGURATION.md. */
+  /** Where it is read, for the read-site map in docs/reference/configuration.md. */
   readSite: string;
   /** True if the value is sensitive (secret/credential). */
   secret?: boolean;
   /**
    * Whether this var belongs in the user-facing docs (.env.example, README env
    * table). Defaults to true. Set false for internal vars that are not operator
-   * knobs (a build arg, a dotenv flag, a CLI-flag mirror), so the drift guard does
+   * knobs (a build arg, a CLI-flag mirror), so the drift guard does
    * not force documenting them while the enumeration still accounts for them.
    */
   documented?: boolean;
@@ -52,8 +52,8 @@ export const RAW_ENV_ALLOWLIST: readonly RawEnvVar[] = [
 
   // Deferred-config entry: read in src/index.ts to preserve the fast --help exit (#230).
   { name: 'MCP_BRIDGE_BIND_HOST', reason: 'deferred-config entry (index.ts reads process.env directly, #230)', readSite: 'index.ts' },
-  { name: 'MCP_HTTP_PATH', reason: 'deferred-config entry; the path the server LISTENS on', readSite: 'index.ts:195' },
-  { name: 'MCP_BRIDGE_HTTP_PATH', reason: 'deferred-config entry; the path ADVERTISED to clients, falls back to MCP_HTTP_PATH', readSite: 'index.ts:281' },
+  { name: 'MCP_HTTP_PATH', reason: 'deferred-config entry; the path the server LISTENS on', readSite: 'index.ts:235' },
+  { name: 'MCP_BRIDGE_HTTP_PATH', reason: 'deferred-config entry; the path ADVERTISED to clients, falls back to MCP_HTTP_PATH', readSite: 'index.ts:321' },
   { name: 'MCP_BRIDGE_PUBLIC_HOST', reason: 'deferred-config entry; advertised public host', readSite: 'index.ts:269, httpServer.ts:581' },
   { name: 'MCP_BRIDGE_PUBLIC_SCHEME', reason: 'deferred-config entry; advertised scheme override', readSite: 'index.ts' },
   { name: 'MCP_BRIDGE_USE_TLS', reason: 'deprecated alias of MCP_ENABLE_HTTPS; affects only advertised-scheme detection', readSite: 'index.ts:277' },
@@ -63,7 +63,6 @@ export const RAW_ENV_ALLOWLIST: readonly RawEnvVar[] = [
   { name: 'NODE_ENV', reason: 'framework var; selects prod log format and prod behaviours', readSite: 'httpServer.ts, logger.ts (resolveLogConfig)' },
   { name: 'DEBUG', reason: 'framework debug toggle', readSite: 'utils.ts, index.ts' },
   { name: 'LOG_LEVEL', reason: 'debug-detection toggle (distinct from MCP_BRIDGE_LOG_LEVEL, the winston level)', readSite: 'utils.ts' },
-  { name: 'DOTENV_CONFIG_QUIET', reason: 'dotenv internal flag, not an operator knob', readSite: 'index.ts', documented: false },
   { name: 'VERSION', reason: 'build-time version arg, injected by the Docker build, not an operator knob', readSite: 'index.ts, server_info.ts', documented: false },
 
   // Domain-time: read after config loads; future candidates for schema promotion.
@@ -92,7 +91,8 @@ export const SCHEMA_VARS_ALSO_READ_RAW: ReadonlyArray<{ name: string; readSite: 
  * one. `.env.example` documents example members (BUDGET_1_*, BUDGET_2_*, ...); the
  * drift guard collapses any name starting with one of these to the family.
  */
-export const DYNAMIC_ENV_FAMILIES: readonly string[] = ['BUDGET_'];
+// MCP_TOKEN_ (#572): the per-principal static token values that MCP_STATIC_TOKENS names.
+export const DYNAMIC_ENV_FAMILIES: readonly string[] = ['BUDGET_', 'MCP_TOKEN_'];
 
 /**
  * Variables documented for the operator (e.g. in Docker) but read by the OS or
@@ -113,9 +113,9 @@ export function canonicalConfigVars(schemaKeys: readonly string[]): Set<string> 
 
 /**
  * The subset of canonical vars that MUST appear in the user-facing docs
- * (.env.example and the README env table): every schema key, plus every allowlist
- * entry not flagged `documented: false`. Internal vars (build arg, dotenv flag,
- * CLI-flag mirror) are accounted for by the enumeration but exempt from the docs.
+ * (.env.example and docs/reference/configuration.md): every schema key, plus every allowlist
+ * entry not flagged `documented: false`. Internal vars (build arg, CLI-flag mirror)
+ * are accounted for by the enumeration but exempt from the docs.
  */
 export function documentedConfigVars(schemaKeys: readonly string[]): Set<string> {
   return new Set<string>([

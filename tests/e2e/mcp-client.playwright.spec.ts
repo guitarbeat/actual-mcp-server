@@ -144,6 +144,9 @@ test.describe('MCP end-to-end (initialize, tools/list, tools/call, SSE)', () => 
     expect(probeResult).toBeTruthy();
     expect(typeof probeResult.capabilities).toBe('object');
     expect(typeof probeResult.capabilities.tools === 'object' || Array.isArray(probeResult.tools)).toBeTruthy();
+    // #560: the spec field, as a plain string, and no longer the non-spec serverInstructions object.
+    expect(typeof probeResult.instructions).toBe('string');
+    expect('serverInstructions' in probeResult).toBe(false);
     console.log('✅ Well-known resource probe successful');
 
     // 2) initialize JSON-RPC with retry
@@ -328,7 +331,7 @@ test.describe('MCP end-to-end (initialize, tools/list, tools/call, SSE)', () => 
 
     // 1) A non-init method (tools/call) with the bogus session must 404 / -32001.
     const callRes = await retryRequest(() => request.post(rpcUrl, {
-      data: JSON.stringify({ jsonrpc: '2.0', id: 101, method: 'tools/call', params: { name: 'actual_server_info', arguments: {} } }),
+      data: JSON.stringify({ jsonrpc: '2.0', id: 101, method: 'tools/call', params: { name: 'get_context', arguments: { topic: 'server' } } }),
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',

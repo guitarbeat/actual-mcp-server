@@ -1,33 +1,18 @@
-import config from '../config.js';
-import api from '@actual-app/api';
-
 /**
- * Options for `@actual-app/api` init.
+ * Credential fields for the single `api.init` chokepoint in `apiLogin.ts`.
  *
- * Actual 26+ reads `sessionToken`. Empty passwords are omitted so a token-only
- * deployment does not attempt the password login path.
+ * Actual 26+ reads `sessionToken` and ignores the older `token` field. An empty
+ * password is omitted when a session token is present so init does not take the
+ * password login path. With no session token the password is always passed,
+ * including `''`, which is upstream's no-credential init.
  */
-export function actualApiInitOptions(
-  dataDir: string,
-  serverURL: string,
-  password?: string,
-): Record<string, unknown> {
-  const sessionToken = config.ACTUAL_SESSION_TOKEN || undefined;
-  return {
-    dataDir,
-    serverURL,
-    ...(password ? { password } : {}),
-    ...(sessionToken ? { sessionToken } : {}),
-  };
-}
-
-/** Initialize Actual through the fork's single credential-normalization seam. */
-export async function initializeActualApi(
-  dataDir: string,
-  serverURL: string,
-  password?: string,
-): Promise<void> {
-  await (api.init as unknown as (options: Record<string, unknown>) => Promise<void>)(
-    actualApiInitOptions(dataDir, serverURL, password),
-  );
+export function actualApiCredentialFields(
+  password: string | undefined,
+  sessionToken: string | undefined,
+): { password?: string; sessionToken?: string } {
+  const token = sessionToken?.trim() || undefined;
+  if (token && !password) return { sessionToken: token };
+  const fields: { password?: string; sessionToken?: string } = { password: password ?? '' };
+  if (token) fields.sessionToken = token;
+  return fields;
 }

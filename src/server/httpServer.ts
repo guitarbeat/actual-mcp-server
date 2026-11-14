@@ -1,7 +1,7 @@
 // src/server/httpServer.ts
 import type { ActualMCPConnection } from '../lib/ActualMCPConnection.ts';
 import express, { Request, Response } from 'express';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
@@ -9,20 +9,38 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import logger, { resolveRequestId } from '../logger.js';
+import { registerPromptHandlers } from '../lib/promptHandlers.js';
+import type { PromptDefinition } from '../prompts/registry.js';
+import { attachTransportErrorLogger } from '../lib/transportErrorLogger.js';
+import { SERVER_NAME } from '../lib/mcp-version.js';
+import { createModuleLogger } from '../lib/loggerFactory.js';
 import { getLocalIp } from '../utils.js';
 import actualToolsManager from '../actualToolsManager.js';
-import { getConnectionState, connectToActualForSession, shutdownActualForSession, shutdownActual, canAcceptNewSession } from '../actualConnection.js';
-import { connectionPool } from '../lib/ActualConnectionPool.js';
+import { getConnectionState, connectToActualForSession, shutdownActualForSession, shutdownActual, admitSession, releaseAdmission, isConnectionPoolEnabled } from '../actualConnection.js';
+import { connectionPool, type EvictionReason } from '../lib/ActualConnectionPool.js';
+import { clearSessionBudgetState, setSessionLivenessCheck, initialBudgetForSession, getBudgetRegistry, awaitWritesIdle } from '../lib/actual-adapter.js';
+import { errorLogFields } from '../lib/errors.js';
 import observability from '../observability.js';
 import config from '../config.js';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import { MCPAuthTokenVerificationError } from 'mcp-auth';
+import { TokenVerificationError } from '../auth/bearer.js';
+import { isAllowedOrigin, parseAllowedOrigins } from '../lib/origin-allowlist.js';
 import { createMcpAuth } from '../auth/setup.js';
-import { discoverOidcMetadata, buildTrustedJwksHosts, setResolvedOidcMetadata } from '../lib/oidc-discovery.js';
+import { resolveJwksSource, buildTrustedJwksHosts, setResolvedOidcMetadata } from '../lib/oidc-discovery.js';
+import { createAssertionPromotionMiddleware } from '../lib/oidc-token-source.js';
+import { isRootMetadataRequest, oidcResourceStartupWarnings, resourceMetadataPath, rootMetadataRewriteUrl } from '../lib/oidc-resource.js';
+import { stripJoseCause } from '../lib/oidc-error-cause.js';
 import { buildAcceptedAudiences } from '../lib/oidc-audiences.js';
+import { parseScopeList } from '../lib/oidc-scopes.js';
 import { budgetAclMiddleware } from '../auth/budget-acl.js';
+import { resolveStaticTokens, matchBearerToken, LEGACY_STATIC_PRINCIPAL } from '../auth/static-tokens.js';
 import { runAclPreflight } from '../auth/budget-acl-dynamic.js';
+import { hostHeaderValidation } from '@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js';
+import { resolveAllowedHosts } from '../lib/authPosture.js';
+import { logSafeOrigin } from '../lib/budget-registry.js';
+import type { HttpListenerFacts } from '../lib/startupRecord.js';
 import * as https from 'node:https';
+import { finished } from 'node:stream';
 import * as fs from 'node:fs';
 
 // AsyncLocalStorage for request context: moved to src/lib/requestContext.ts
@@ -30,29 +48,60 @@ import * as fs from 'node:fs';
 // Re-exported here for backward compatibility with any callers that imported
 // `requestContext` from this module.
 import { requestContext } from '../lib/requestContext.js';
+import { createShutdownGate, createShutdownHandler } from './shutdown.js';
+import { recordSessionOwner, forgetSessionOwner, sessionOwnerMatches } from '../lib/session-owners.js';
 import { buildToolListEntries } from '../lib/tool-list-entry.js';
-import { appendBearerScope } from '../lib/bearer-challenge.js';
-import { deriveAllowedOrigins, isAllowedOrigin, parseAllowedOrigins } from '../lib/origin-allowlist.js';
+import { executeAndFrame } from '../lib/tool-output.js';
 
 // #438 / #452: the init-failure classifier now lives in src/lib/init-failure.ts so BOTH
 // transports can reach it (stdio could not, which was the whole of #452). Re-exported here
 // unchanged so existing importers and tests are unaffected.
 import { classifyInitFailure, type InitFailureCause } from '../lib/init-failure.js';
+import { createHttpErrorHandler } from './httpErrorHandler.js';
+
 export { classifyInitFailure };
 export type { InitFailureCause };
+
+const httpLog = createModuleLogger('HTTP');
 
 export { requestContext };
 
 // Resolve the authenticated principal for the per-principal budget preference
-// (#189). OIDC: the verified JWT subject. Static-bearer: a single shared
-// identity (all bearer callers are the same user). Auth-disabled: undefined, so
-// the preference simply no-ops. Never derived from a client-supplied value.
+// (#189). OIDC: the verified JWT subject. A MCP_STATIC_TOKENS token (#572): its
+// own principal, set by authenticateRequest on a match. Legacy static bearer: a
+// single shared identity (all its callers are the same user). Auth-disabled:
+// undefined, so the preference simply no-ops. Never derived from a
+// client-supplied value.
 function resolvePrincipal(req: Request): string | undefined {
   if (config.AUTH_PROVIDER === 'oidc') {
     return (req as Request & { auth?: { subject?: string } }).auth?.subject;
   }
-  return config.MCP_SSE_AUTHORIZATION ? 'static-bearer' : undefined;
+  const staticPrincipal = (req as Request & { staticPrincipal?: string }).staticPrincipal;
+  if (staticPrincipal) return staticPrincipal;
+  return config.MCP_SSE_AUTHORIZATION ? LEGACY_STATIC_PRINCIPAL : undefined;
 }
+
+// #577: the principal MAX_SESSIONS_PER_PRINCIPAL caps, decided by HOW the request authenticated,
+// never by the principal string (an OIDC subject that happens to read "static-bearer" is capped).
+// OIDC: the verified subject. A MCP_STATIC_TOKENS token: its own principal. Exempt, so bounded by
+// the global cap alone: the legacy MCP_SSE_AUTHORIZATION token, which every holder shares (capping
+// it would silently lower the effective global cap on every single-token deployment), and an
+// unauthenticated request, which has no principal.
+function capPrincipal(req: Request): string | undefined {
+  if (config.AUTH_PROVIDER === 'oidc') {
+    return (req as Request & { auth?: { subject?: string } }).auth?.subject;
+  }
+  return (req as Request & { staticPrincipal?: string }).staticPrincipal;
+}
+
+/** Idle keep-alive for the HTTP listener, in milliseconds. */
+export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 65000;
+
+/**
+ * #632: a SIGTERM or SIGINT shutdown that has not finished by then exits 1. Under Docker's
+ * default 10s stop grace, so the process ends itself before the SIGKILL.
+ */
+const SHUTDOWN_DEADLINE_MS = 8000;
 
 export async function startHttpServer(
   mcp: ActualMCPConnection,
@@ -61,58 +110,165 @@ export async function startHttpServer(
   capabilities: Record<string, object>,          // was passed by index.ts
   implementedTools: string[],                    // was passed by index.ts
   serverDescription: string,                     // was passed by index.ts
-  serverInstructions: string,                    // was passed by index.ts
+  instructions: string,                          // was passed by index.ts (#560: built once there)
   toolSchemas: Record<string, unknown>,              // was passed by index.ts
   version: string,                               // server version from package.json
   bindHost = 'localhost',                        // #239: interface to bind; forwarded to listen()
-  advertisedUrl?: string
+  advertisedUrl?: string,
+  onListening?: (facts: HttpListenerFacts) => void, // #623: index.ts logs sys_startup from here
+  outputSchemas: Record<string, unknown> = {},       // #642: published outputSchema per covered tool
+  offeredPrompts: readonly PromptDefinition[] = [],  // #660: resolved once in index.ts; LAST so positional callers still compile
 ) {
+  // #572: resolve MCP_STATIC_TOKENS (token variables, budget names) before anything
+  // binds, so a bad entry refuses startup like an unreadable TLS key. The registry is
+  // read outside any request context, so it is the full, unfiltered list. config.ts
+  // already refused the variable under OIDC, where these entries are never consulted.
+  const bearerEntries = config.AUTH_PROVIDER === 'oidc'
+    ? []
+    : resolveStaticTokens(config.MCP_STATIC_TOKENS, process.env, getBudgetRegistry(), config.MCP_SSE_AUTHORIZATION);
+  const staticPrincipals = bearerEntries.filter((e) => e.allowedBudgets);
+
+  // #612: the ONE open-mode predicate, shared by the Host/Origin guard below and
+  // checkAuth's no-token branch, so the two can never disagree.
+  const openMode = config.AUTH_PROVIDER !== 'oidc' && bearerEntries.length === 0;
+
+  // #632: the signal handler (registered at the end of this function). Created here so the 503
+  // gate below can read it; `listener` and `cleanup` are defined later and only read at signal time.
+  const shutdownHandler = createShutdownHandler({
+    closeListener: () => { listener.close(); listener.closeIdleConnections(); },
+    awaitInFlight: async () => {
+      while (shutdownGate.inFlight() > 0) await new Promise((r) => setTimeout(r, 25));
+      await awaitWritesIdle();
+    },
+    cleanup: () => cleanup(),
+    exit: (code) => process.exit(code),
+    logger,
+    deadlineMs: SHUTDOWN_DEADLINE_MS,
+  });
+
+  // Auth0 resource identifiers are often the public /mcp URL, while MCP_HTTP_PATH
+  // stays /http. Serve both, once each. Same auth, body limit, session and transport.
+  const mcpPaths: string[] = httpPath === '/mcp' ? [httpPath] : [httpPath, '/mcp'];
+
+  const shutdownGate = createShutdownGate(shutdownHandler, mcpPaths);
+
   const app = express();
+  // #632: once a shutdown starts, every new request gets 503 and its connection is closed, so no
+  // request starts after its session is gone. Mounted first to cover every route; the requests it
+  // admits are counted so the shutdown waits for them.
+  app.use(shutdownGate.middleware);
+  // #612: DNS rebinding protection, mounted first so it covers every route (/health,
+  // /metrics, /.well-known/* and OPTIONS included). It reads req.headers.host only,
+  // never X-Forwarded-Host or req.hostname, so a proxy header cannot bypass it.
+  // #615: the host this server prints as its own URL is accepted too (open mode only).
+  let advertisedHost: string | undefined;
+  try { advertisedHost = advertisedUrl ? new URL(advertisedUrl).hostname : undefined; } catch {
+    logger.warn(`[HTTP] Advertised URL ${advertisedUrl} does not parse; its host is not accepted. Check MCP_BRIDGE_PUBLIC_HOST (a bare host or IP, no scheme or port).`);
+  }
+  // MCP_BRIDGE_PUBLIC_HOST=https://nas.lan parses to the hostname "https": say so rather than
+  // accept it silently. A scheme or path always carries a "/"; a port already fails the parse.
+  const publicHost = process.env.MCP_BRIDGE_PUBLIC_HOST?.trim().toLowerCase();
+  if (advertisedHost && publicHost?.includes('/')) {
+    logger.warn(`[HTTP] MCP_BRIDGE_PUBLIC_HOST (${publicHost}) did not parse to a host name (got ${advertisedHost}). Set a bare host or IP, no scheme or port.`);
+  }
+  const allowedHosts = resolveAllowedHosts({ openMode, allowedHosts: config.MCP_ALLOWED_HOSTS, bindHost, advertisedHost });
+  if (allowedHosts) {
+    const rejectHost = (req: Request, reason: 'host' | 'origin', value: string) =>
+      logger.warn('[HTTP] Rejected request: hostname not allowed (DNS rebinding protection, #612)', {
+        header: reason, hostname: value.slice(0, 253), path: req.path,
+      });
+    const sdkHostCheck = hostHeaderValidation(allowedHosts);
+    app.use((req, res, next) => {
+      let passed = false;
+      sdkHostCheck(req, res, () => { passed = true; });
+      if (passed) { next(); return; }
+      // The SDK middleware is synchronous: it already answered 403.
+      let hostname = String(req.headers.host ?? '');
+      try { hostname = new URL(`http://${hostname}`).hostname; } catch { /* log the raw value */ }
+      rejectHost(req, 'host', hostname);
+    });
+    if (openMode) {
+      // The SDK checks Host only. In open mode a browser Origin must also be an allowed
+      // hostname; an absent Origin (non-browser clients) passes. Comparing Origin to Host
+      // would not help: under rebinding both carry the attacker's name. /.well-known/* is
+      // exempt because the metadata router serves it with open CORS for public reads.
+      app.use((req, res, next) => {
+        const origin = req.headers.origin;
+        if (origin === undefined || req.path.startsWith('/.well-known/')) { next(); return; }
+        let hostname: string | null = null;
+        try { hostname = origin === 'null' ? null : new URL(origin).hostname; } catch { hostname = null; }
+        if (hostname !== null && allowedHosts.includes(hostname)) { next(); return; }
+        rejectHost(req, 'origin', hostname ?? 'null');
+        res.status(403).json({ jsonrpc: '2.0', error: { code: -32000, message: `Invalid Origin: ${hostname ?? 'null'}` }, id: null });
+      });
+    }
+    if (openMode && config.MCP_ALLOWED_HOSTS.length === 0 && (bindHost === '0.0.0.0' || bindHost === '::')) {
+      logger.info(`[HTTP] Accepting Host ${allowedHosts.join(', ')} only (DNS rebinding protection, #612). Reach this server by another name? Add it to MCP_ALLOWED_HOSTS.`);
+    }
+  }
   // Explicit body-size cap (#168). An oversized payload is rejected with HTTP 413
   // rather than buffered unbounded. Tunable via MCP_HTTP_BODY_LIMIT (default 512kb).
-  app.use(express.json({ limit: config.MCP_HTTP_BODY_LIMIT }));
+  // GHSA-27r3-jxmh-p828 (#633): body-parser below 2.4.0 can crash the process on trailing
+  // bytes after a compressed body. No MCP client sends compressed request bodies, so
+  // `inflate: false` refuses them with 415 before any decompression stream exists. Kept after
+  // body-parser 2.4.0 too: decompression is attack surface no client uses. `inflate` stays after
+  // `limit`, which the #168 source test anchors on.
+  app.use(express.json({ limit: config.MCP_HTTP_BODY_LIMIT, inflate: false }));
   const scheme = config.MCP_ENABLE_HTTPS ? 'https' : 'http';
 
+  // Exact Origin allowlist. Only when MCP_ALLOWED_ORIGINS is set, so the #612
+  // open-mode host check stays the policy when the variable is empty. Mounted
+  // before bearer and OIDC: an untrusted browser Origin gets 403, not 401.
+  // A missing Origin (stdio bridges and other non-browser clients) is allowed.
   const allowedOrigins = config.MCP_ALLOWED_ORIGINS.trim()
     ? parseAllowedOrigins(config.MCP_ALLOWED_ORIGINS)
-    : deriveAllowedOrigins({
-        advertisedUrl,
-        publicHost: process.env.MCP_BRIDGE_PUBLIC_HOST,
-        publicScheme: process.env.MCP_BRIDGE_PUBLIC_SCHEME || scheme,
-        port,
-      });
-  logger.info(`[ORIGIN] Allowed origins: ${allowedOrigins.join(', ')}`);
+    : [];
+  if (allowedOrigins.length > 0) {
+    logger.info(`[ORIGIN] Allowed origins: ${allowedOrigins.join(', ')}`);
+    const originGuard: express.RequestHandler = (req, res, next) => {
+      const origin = req.get('origin');
+      if (origin && !isAllowedOrigin(origin, allowedOrigins)) {
+        logger.warn('[ORIGIN] Rejected Origin', { origin: origin.slice(0, 200) });
+        res.status(403).json({
+          error: 'invalid_origin',
+          error_description: 'The request Origin is not allowed for this MCP endpoint.',
+        });
+        return;
+      }
+      next();
+    };
+    app.use(mcpPaths, originGuard);
+  }
 
-  // MCP 2025-11-25 requires invalid Origin headers to receive 403. Put this
-  // before bearer/OIDC authentication so an untrusted browser origin cannot
-  // probe the auth stack and get a misleading 401 instead.
-  const originGuard = (req: Request, res: Response, next: () => void) => {
-    const origin = req.get('origin');
-    if (origin && !isAllowedOrigin(origin, allowedOrigins)) {
-      logger.warn(`[ORIGIN] Rejected Origin ${origin}`);
-      res.status(403).json({
-        error: 'invalid_origin',
-        error_description: 'The request Origin is not allowed for this MCP endpoint.',
-      });
-      return;
-    }
-    next();
-  };
-  app.use([httpPath, '/mcp'], originGuard);
-
-  // --- OIDC / mcp-auth (CF-5) ---
+  // --- OIDC bearer auth (CF-5; built in since #634) ---
   // When AUTH_PROVIDER=oidc, validate JWTs and enforce budget ACL.
   // When AUTH_PROVIDER=none (default), the existing static Bearer token check applies.
   let mcpAuth: ReturnType<typeof createMcpAuth> = null;
   if (config.AUTH_PROVIDER === 'oidc') {
-    mcpAuth = createMcpAuth();   // throws if OIDC_ISSUER / OIDC_RESOURCE missing
+    mcpAuth = createMcpAuth();   // throws if OIDC_ISSUER / OIDC_RESOURCE missing or malformed (#461)
+    // #461: advisories only (the validator inside createMcpAuth already refused anything
+    // fatal). Compared against the ADVERTISED path, not the listen path: OIDC_RESOURCE is
+    // the public URL, and a reverse proxy may rewrite the path in between.
+    for (const w of oidcResourceStartupWarnings({ resource: config.OIDC_RESOURCE, advertisedUrl, httpPath })) logger.warn(w);
     if (mcpAuth) {
+      // #473: clients that skip the path-specific RFC 9728 discovery URL (e.g. Google Gemini)
+      // fetch /.well-known/oauth-protected-resource at the root. When OIDC_RESOURCE has a path,
+      // rewrite those requests onto the path-specific route so the router serves the identical
+      // document and CORS headers in-process. The target is fixed at startup from
+      // OIDC_RESOURCE, never taken from the request; the match rule is isRootMetadataRequest.
+      // Mounted inside `if (mcpAuth)` and before the router, so `none` mode never gets it and
+      // clients reach it without a token.
+      const metadataTarget = config.OIDC_RESOURCE ? resourceMetadataPath(config.OIDC_RESOURCE) : null;
+      if (metadataTarget) {
+        app.use((req, _res, next) => {
+          if (isRootMetadataRequest(req.method, req.path)) req.url = rootMetadataRewriteUrl(req.url, metadataTarget);
+          next();
+        });
+      }
       // Serve RFC 8707 Protected Resource Metadata (/.well-known/oauth-protected-resource/...)
       app.use(mcpAuth.protectedResourceMetadataRouter());
       // Protect ALL httpPath routes with JWT validation + budget ACL
-      const requiredScopes = config.OIDC_SCOPES
-        ? config.OIDC_SCOPES.split(',').map((s) => s.trim()).filter(Boolean)
-        : [];
+      const requiredScopes = parseScopeList(config.OIDC_SCOPES);
 
       // #245: the strict, closed audience allowlist (OIDC_RESOURCE plus any
       // explicitly configured OIDC_ACCEPTED_AUDIENCES). jose treats the array as
@@ -131,9 +287,9 @@ export async function startHttpServer(
         );
       }
 
-      // Custom jose-based JWT verifier that bypasses mcp-auth's strict PKCE/discovery
-      // validation that fails when the IdP (e.g. Casdoor v2.13) doesn't advertise
-      // code_challenge_methods_supported in its discovery document.
+      // Our own jose-based JWT verifier. It predates #634: mcp-auth's built-in verifier ran a
+      // strict PKCE/discovery validation that failed when the IdP (e.g. Casdoor before v2.316.1)
+      // did not advertise code_challenge_methods_supported in its discovery document.
       // #244: resolve the JWKS URI from the issuer's OpenID discovery document
       // instead of a hardcoded `${OIDC_ISSUER}/.well-known/jwks` (which 404s for
       // most IdPs). discoverJwksUri fetches discovery once at startup and fails
@@ -143,11 +299,17 @@ export async function startHttpServer(
       // #254: opt-in cross-origin JWKS trusted hosts (e.g. Google serves keys from
       // www.googleapis.com). Parsed fail-fast here at the composition root and
       // threaded as a parameter; empty (the default) keeps same-origin-only.
-      const { jwksUri, metadata: oidcMetadata } = await discoverOidcMetadata(
-        config.OIDC_ISSUER,
-        config.OIDC_ALLOW_INSECURE_ISSUER,
-        buildTrustedJwksHosts(config.OIDC_JWKS_TRUSTED_HOSTS),
-      );
+      // #462: ONE decision on where the keys come from. With OIDC_JWKS_URI set the URL
+      // is validated (same rules as a discovered jwks_uri, plus no query or fragment)
+      // and NOTHING is fetched, so `oidcMetadata` is null: there is no discovery
+      // document to publish or re-serve, and this block does not branch on the knob.
+      const { jwksUri, metadata: oidcMetadata } = await resolveJwksSource({
+        issuer: config.OIDC_ISSUER,
+        allowInsecure: config.OIDC_ALLOW_INSECURE_ISSUER,
+        trustedHosts: buildTrustedJwksHosts(config.OIDC_JWKS_TRUSTED_HOSTS),
+        directJwksUri: config.OIDC_JWKS_URI,
+      });
+      if (oidcMetadata !== null) {
       // #346: publish the startup-validated document so the ACL's UserInfo path can
       // reuse it instead of re-fetching discovery on the authorization path with a
       // different (empty) trusted-hosts list.
@@ -169,6 +331,7 @@ export async function startHttpServer(
       app.get('/.well-known/oauth-authorization-server', (_req, res) => {
         res.json(oidcMetadata);
       });
+      }
       const jwks = createRemoteJWKSet(new URL(jwksUri));
       const customJwtVerify = async (token: string) => {
         // Enforce the audience claim (#160, OWASP A07). Without it, any
@@ -181,10 +344,12 @@ export async function startHttpServer(
         // or out-of-set aud.
         //
         // #244: map a jose verification failure (expired, malformed, wrong aud,
-        // bad signature) to MCPAuthTokenVerificationError so mcp-auth's bearer
-        // handler returns a clean 401 with a WWW-Authenticate header instead of
-        // re-throwing the raw jose error as a 500. Pass only the jose error as
-        // the cause (never the raw token), so no token material leaks.
+        // bad signature) to TokenVerificationError so the bearer
+        // middleware (src/auth/bearer.ts) returns a clean 401 with a WWW-Authenticate header instead of
+        // re-throwing the raw jose error as a 500. #463: pass a STRIPPED cause
+        // (code, claim, reason only), never the jose error itself: outside
+        // production showErrorDetails serialises the cause into the 401 body, and
+        // jose's claim errors carry the decoded token as an own property.
         let payload: Awaited<ReturnType<typeof jwtVerify>>['payload'];
         try {
           ({ payload } = await jwtVerify(token, jwks, {
@@ -194,14 +359,14 @@ export async function startHttpServer(
             audience: acceptedAudiences,
           }));
         } catch (err) {
-          throw new MCPAuthTokenVerificationError('invalid_token', err instanceof Error ? err : undefined);
+          throw new TokenVerificationError('invalid_token', stripJoseCause(err));
         }
         // #244: require a usable `sub`. authenticateRequest (#163) and budget-acl
         // key authorization on req.auth.subject, so a token with no string `sub`
         // cannot be mapped to a principal. Reject it here as an invalid token (a
         // clean 401) rather than letting it through to a downstream subject check.
         if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
-          throw new MCPAuthTokenVerificationError('invalid_token');
+          throw new TokenVerificationError('invalid_token');
         }
         const rawAud = payload.aud;
         const audience = Array.isArray(rawAud) ? rawAud : (rawAud ? [rawAud] : []);
@@ -209,7 +374,7 @@ export async function startHttpServer(
         return {
           token,
           // #244: populate subject from the JWT `sub` claim (guaranteed a non-empty
-          // string by the check above). mcp-auth sets req.auth to exactly this
+          // string by the check above). The bearer middleware sets req.auth to exactly this
           // object, and authenticateRequest (#163) plus budget-acl.ts key off
           // req.auth.subject; without it OIDC mode rejects every request.
           subject: payload.sub,
@@ -222,41 +387,28 @@ export async function startHttpServer(
         };
       };
 
-      const bearerAuth = mcpAuth.bearerAuth(customJwtVerify, {
-        resource: config.OIDC_RESOURCE,
-        // Audience (aud=clientId) is enforced inside customJwtVerify via jose's
-        // jwtVerify audience option (#160), not here.
-        requiredScopes,
-        showErrorDetails: process.env.NODE_ENV !== 'production',
-      });
-
-      // mcp-auth 0.2.0 emits resource_metadata but does not yet include the
-      // optional scope challenge parameter recommended by MCP 2025-11-25.
-      // Patch only response header writes, leaving its verification/error
-      // handling unchanged and avoiding token material in our own logs.
-      const bearerAuthWithScope = requiredScopes.length === 0
-        ? bearerAuth
-        : async (req: Request, res: Response, next: () => void) => {
-            const originalSetHeader = res.setHeader.bind(res);
-            res.setHeader = ((name: string | symbol, value: unknown) => {
-              if (String(name).toLowerCase() === 'www-authenticate' && typeof value === 'string') {
-                value = appendBearerScope(value, requiredScopes);
-              }
-              return originalSetHeader(name as string, value as string | number | readonly string[]);
-            }) as typeof res.setHeader;
-            try {
-              await bearerAuth(req, res, next);
-            } finally {
-              res.setHeader = originalSetHeader as typeof res.setHeader;
-            }
-          };
-
+      // #462: with OIDC_TOKEN_SOURCE=cf-access-jwt-assertion the signed JWT Cloudflare
+      // forwards in that header is promoted into `Authorization` BEFORE bearerAuth
+      // reads it, and the opaque client bearer is discarded. With the default source
+      // this middleware is the identity function. Never log headers on this path.
       app.use(
-        [httpPath, '/mcp'],
-        bearerAuthWithScope,
+        mcpPaths,
+        createAssertionPromotionMiddleware(config.OIDC_TOKEN_SOURCE),
+        mcpAuth.bearerAuth(customJwtVerify, {
+          resource: config.OIDC_RESOURCE,
+          // Audience (aud=clientId) is enforced inside customJwtVerify via jose's
+          // jwtVerify audience option (#160), not here.
+          requiredScopes,
+          showErrorDetails: process.env.NODE_ENV !== 'production',
+        }),
         budgetAclMiddleware as express.RequestHandler,
       );
-      logger.info(`[OIDC] JWT authentication enabled. Issuer: ${config.OIDC_ISSUER}`);
+      logger.info(`[OIDC] JWT authentication enabled. Issuer: ${logSafeOrigin(config.OIDC_ISSUER ?? '')}`);
+      // #462 audit line: which header carries the JWT and where the keys come from.
+      logger.info('[OIDC] token source and JWKS mode', {
+        tokenSource: config.OIDC_TOKEN_SOURCE,
+        jwksMode: config.OIDC_JWKS_URI ? `direct: ${jwksUri}` : 'discovered',
+      });
     }
   }
 
@@ -270,8 +422,15 @@ export async function startHttpServer(
   // loser would silently get the generic 404, restoring this bug at random.
   const INIT_FAILURE_TTL_MS = 60_000;
   const INIT_FAILURE_MAX = 1000;
-  const sessionInitFailures = new Map<string, { cause: InitFailureCause; sentence: string; at: number }>();
-  const rememberInitFailure = (sid: string, err: unknown): void => {
+  // #550: the record carries the principal that initiated the session (the same value
+  // recordSessionOwner stores on success) and is served only to that principal. A failed
+  // init records no owner in session-owners.ts, and the POST cause branch runs before the
+  // ownership guard, so without this ANY authenticated principal presenting the id got
+  // the cause reply for 60 s, which contradicts the unknown-id equivalence #529 gives
+  // initialized sessions. Under a static bearer or no auth every caller is the same
+  // principal, so those deployments keep the #438 behaviour unchanged.
+  const sessionInitFailures = new Map<string, { cause: InitFailureCause; sentence: string; at: number; owner: string | undefined }>();
+  const rememberInitFailure = (sid: string, err: unknown, owner: string | undefined): void => {
     const now = Date.now();
     for (const [k, v] of sessionInitFailures) {
       if (now - v.at > INIT_FAILURE_TTL_MS) sessionInitFailures.delete(k);
@@ -283,13 +442,19 @@ export async function startHttpServer(
       if (oldest === undefined) break;
       sessionInitFailures.delete(oldest);
     }
-    sessionInitFailures.set(sid, { ...classifyInitFailure(err), at: now });
+    sessionInitFailures.set(sid, { ...classifyInitFailure(err), at: now, owner });
   };
-  /** Peek. Never deletes. Returns undefined once the TTL has elapsed. */
-  const peekInitFailure = (sid: string): { cause: InitFailureCause; sentence: string } | undefined => {
+  /**
+   * Peek. Never deletes. Returns undefined once the TTL has elapsed, and (#550) for a
+   * principal other than the one that initiated the session: the caller then falls
+   * through to the reply an unknown id gets, and the record is neither consumed nor
+   * extended. Strict equality, like sessionOwnerMatches.
+   */
+  const peekInitFailure = (sid: string, principal: string | undefined): { cause: InitFailureCause; sentence: string } | undefined => {
     const rec = sessionInitFailures.get(sid);
     if (!rec) return undefined;
     if (Date.now() - rec.at > INIT_FAILURE_TTL_MS) return undefined;
+    if (rec.owner !== principal) return undefined;
     return { cause: rec.cause, sentence: rec.sentence };
   };
 
@@ -305,6 +470,7 @@ export async function startHttpServer(
     schema:
       (toolSchemas && toolSchemas[name]) ||
       (actualToolsManager as unknown as { getToolSchema?: (n: string) => unknown })?.getToolSchema?.(name),
+    outputSchema: Object.hasOwn(outputSchemas, name) ? outputSchemas[name] : undefined,
   });
 
   // Session liveness and idle timing are owned solely by the connection pool
@@ -314,24 +480,35 @@ export async function startHttpServer(
   // the matching transport in the same window. This is what keeps the two
   // tables from drifting: no "alive in httpServer, dead in the pool" state, and
   // no transport object left behind for a session the client abandoned.
-  connectionPool.onSessionEvicted((sessionId: string) => {
+  // #530: the pool also reaps a session it has no entry for (an infra-error drop
+  // recycles the entry without evicting the transport) once it goes one idle
+  // window without a served request, with reason `orphaned`; same teardown. The
+  // body is synchronous on purpose: the pool walks its registrations in one pass.
+  connectionPool.onSessionEvicted(teardownSession);
+  // #564: a session's selected budget lives as long as its transport. A selection
+  // committed after teardown (a switch in flight across it) is dropped by the adapter.
+  setSessionLivenessCheck((id) => transports.has(id));
+  function teardownSession(sessionId: string, reason: EvictionReason): void {
     const transport = transports.get(sessionId);
     if (transport) {
       try {
         (transport as unknown as { close?: () => void }).close?.();
       } catch (err) {
-        logger.debug(`[SESSION] Error closing transport for evicted session ${sessionId} (ignoring): ${err}`);
+        logger.debug(`[SESSION] Error closing transport for ${reason} session ${sessionId} (ignoring): ${err}`);
       }
     }
     transports.delete(sessionId);
     sessionInitPromises.delete(sessionId);
-    logger.info(`[SESSION] Transport torn down for evicted session: ${sessionId}`);
-  });
+    forgetSessionOwner(sessionId);
+    clearSessionBudgetState(sessionId);
+    connectionPool.forgetSession(sessionId);
+    logger.info(`[SESSION] Transport torn down for ${reason} session: ${sessionId}`);
+  }
 
   // Authentication middleware
   const authenticateRequest = (req: Request, res: Response): boolean => {
     // OIDC mode: verify the request principal directly rather than inferring auth
-    // from configuration (#163, OWASP A07). The mcp-auth bearerAuth() middleware
+    // from configuration (#163, OWASP A07). The bearerAuth() middleware (src/auth/bearer.ts)
     // populates req.auth.subject on a verified request; if it is absent the
     // request was NOT authenticated (middleware skipped/unmounted/null-auth), so
     // we must reject instead of trusting that "config says OIDC".
@@ -343,9 +520,11 @@ export async function startHttpServer(
       return false;
     }
 
-    // Legacy static Bearer token mode (default).
-    // If MCP_SSE_AUTHORIZATION is not configured, allow all requests
-    if (!config.MCP_SSE_AUTHORIZATION) {
+    // Static Bearer token mode (default): MCP_SSE_AUTHORIZATION and/or MCP_STATIC_TOKENS
+    // (#572). Only when NEITHER is configured is every request allowed. Static tokens are
+    // authentication, so MCP_ALLOW_UNAUTHENTICATED (a posture opt-out for the no-auth
+    // case) does not relax this.
+    if (openMode) {
       return true;
     }
 
@@ -364,24 +543,24 @@ export async function startHttpServer(
       return false;
     }
 
-    const token = match[1];
-    const expected = config.MCP_SSE_AUTHORIZATION;
+    // Constant-time comparison to defeat timing oracles (#157): matchBearerToken
+    // compares SHA-256 digests with timingSafeEqual against every configured token,
+    // static and legacy, with no early exit (#572).
+    const hit = matchBearerToken(match[1], bearerEntries);
 
-    // Constant-time comparison to defeat timing oracles (#157).
-    // Length-equality short-circuit precedes timingSafeEqual because the
-    // function requires equal-length buffers. Token length is observable
-    // via response timing regardless; the secret bytes are not.
-    const tokenBuf = Buffer.from(token, 'utf8');
-    const expectedBuf = Buffer.from(expected, 'utf8');
-    const equal =
-      tokenBuf.length === expectedBuf.length && timingSafeEqual(tokenBuf, expectedBuf);
-
-    if (!equal) {
+    if (!hit) {
       logger.warn(`[HTTP] Unauthorized request from ${req.ip || req.connection.remoteAddress}: Invalid token`);
       res.status(401).json({ error: 'Unauthorized: Invalid token' });
       return false;
     }
 
+    // A static principal carries its resolved allow-list into the requestContext.run
+    // calls below, where the adapter's ACL chokepoints read it. The legacy token sets
+    // neither field: principal 'static-bearer', unrestricted, exactly as before #572.
+    if (hit.allowedBudgets) {
+      (req as Request & { staticPrincipal?: string }).staticPrincipal = hit.principal;
+      (req as Request & { allowedBudgets?: string[] }).allowedBudgets = [...hit.allowedBudgets];
+    }
     return true;
   };
 
@@ -390,25 +569,23 @@ export async function startHttpServer(
     // ensure capabilities.tools is an object mapping tool name -> {}
     const capabilitiesObj = capabilities && Object.keys(capabilities).length
       ? capabilities
-      : { tools: toolsList.reduce((acc: Record<string, object>, n: string) => { acc[n] = {}; return acc; }, {}) };
+      : { tools: toolsList.reduce((acc: Record<string, object>, n: string) => { acc[n] = {}; return acc; }, {}), prompts: {} };
 
-  const serverOptions: Record<string, unknown> = {
-      // Provide instructions and capabilities so the SDK initialize response is correct
-      instructions: serverInstructions || "Welcome to the Actual MCP server.",
-      serverInstructions: { instructions: serverInstructions || "Welcome to the Actual MCP server." },
+    // Only the two ServerOptions the MCP spec defines (#560). tools/list is served by the
+    // request handler, not by these options; the SDK ignored the extra keys this once passed.
+    const serverOptions = {
+      instructions,
       capabilities: capabilitiesObj,
-      implementedTools: toolsList,
-      // Include tools array explicitly so initialize result contains tools: string[]
-      tools: toolsList,
     };
 
     const server = new Server(
       {
-        name: serverDescription || "actual-mcp-server",
+        name: SERVER_NAME,
         version: version || "0.1.0",
       },
       serverOptions
     );
+    attachTransportErrorLogger(server, 'http');
 
     // List tools handler
     server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -418,6 +595,8 @@ export async function startHttpServer(
       logger.debug(`[TOOLS LIST] Returning ${tools.length} tools`);
       return { tools };
     });
+
+    registerPromptHandlers(server, offeredPrompts);
 
     // Call tool handler -> proxy to mcp.executeTool or to actualToolsManager
     // Note: sessionId is available via requestContext.getStore() for tools that need it
@@ -430,19 +609,15 @@ export async function startHttpServer(
         throw new Error('Tool name must be a string');
       }
       const name = rawName;
-      logger.debug(`[TOOL CALL] ${name} args=${JSON.stringify(args)}`);
+      // Tool name only: arguments are budget data and never reach the logs (#556).
+      logger.debug(`[TOOL CALL] ${name}`);
       // Prefer ActualMCPConnection executor if provided
       if (typeof (mcp as unknown as { executeTool?: Function }).executeTool === 'function') {
-        const result = await (mcp as unknown as { executeTool?: (n: string, a?: unknown) => Promise<unknown> }).executeTool!(name, args ?? {});
-        return {
-          content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }],
-        };
+        // #642: shared framing; the verdict reaches here so structuredContent is not dropped.
+        return await executeAndFrame(mcp, name, args ?? {});
       }
-      // fallback: attempt actualToolsManager
-      if (actualToolsManager && typeof (actualToolsManager as unknown as { invoke?: Function }).invoke === 'function') {
-        const r = await (actualToolsManager as unknown as { invoke?: (n: string, a?: unknown) => Promise<unknown> }).invoke!(name, args ?? {});
-        return { content: [{ type: 'text', text: JSON.stringify(r) }] };
-      }
+      // There is deliberately no second dispatch path here (#483): actualToolsManager has
+      // no `invoke`, and every call must go through callTool, which refuses unpublished tools.
       throw new Error(`Tool executor not available for ${name}`);
     });
 
@@ -451,7 +626,7 @@ export async function startHttpServer(
 
   // Middleware to inject Accept header for LobeChat compatibility
   // Must be before the route handler
-  app.use([httpPath, '/mcp'], (req: Request, _res: Response, next: () => void) => {
+  app.use(mcpPaths, (req: Request, _res: Response, next: () => void) => {
     const accept = req.get('Accept');
     logger.debug(`[ACCEPT HEADER MIDDLEWARE] Original: ${accept || 'undefined'}`);
     // Fix Accept header if it's missing, */* , or doesn't include BOTH required types
@@ -475,7 +650,7 @@ export async function startHttpServer(
   });
 
   // Unified POST handler. Create new server/transport only on initialize (no session id).
-  app.post([httpPath, '/mcp'], async (req: Request, res: Response) => {
+  app.post(mcpPaths, async (req: Request, res: Response) => {
     // Authenticate the request
     if (!authenticateRequest(req, res)) {
       return;
@@ -513,8 +688,34 @@ export async function startHttpServer(
           return;
         }
 
-        // Check if we can accept a new session (concurrent limit)
-        if (!canAcceptNewSession()) {
+        // Check if we can accept a new session (concurrent limit). #581: the session id is chosen
+        // HERE and its slot reserved synchronously under it, before anything awaits. Checking a
+        // count and reserving later (at login) admitted every initialize that arrived while
+        // earlier ones were still logging in.
+        // #577: the per-principal cap is checked in the same synchronous call, after the global one.
+        const sid = randomUUID();
+        const admission = admitSession(sid, capPrincipal(req));
+        if (!admission.admitted && admission.scope === 'principal') {
+          const timeoutMinutes = getConnectionState().idleTimeoutMinutes || 2;
+          // Only the caller's own cap and count: nothing here is derived from another principal,
+          // and the log line carries no principal and no session id.
+          logger.warn('[SESSION] Rejecting new session: per-principal cap reached', { cap: admission.cap, count: admission.count });
+          res.status(503).json({
+            jsonrpc: '2.0',
+            id: payload?.id ?? null,
+            error: {
+              code: -32000,
+              message: `Max sessions per principal (${admission.cap}) reached. Yours: ${admission.count}. Please close one of your sessions or wait for idle sessions to time out (${timeoutMinutes} minutes).`,
+              data: {
+                maxSessionsPerPrincipal: admission.cap,
+                yourSessions: admission.count,
+                idleTimeoutMinutes: timeoutMinutes,
+              },
+            },
+          });
+          return;
+        }
+        if (!admission.admitted) {
           const state = getConnectionState();
           const stats = state.connectionPool;
           const timeoutMinutes = state.idleTimeoutMinutes || 2;
@@ -529,7 +730,8 @@ export async function startHttpServer(
               data: {
                 maxConcurrent: stats?.maxConcurrent,
                 activeSessions: stats?.activeSessions,
-                availableSlots: (stats?.maxConcurrent ?? 0) - (stats?.activeSessions ?? 0),
+                pendingReservations: stats?.pendingReservations,
+                availableSlots: Math.max(0, (stats?.maxConcurrent ?? 0) - (stats?.activeSessions ?? 0) - (stats?.pendingReservations ?? 0)),
                 idleTimeoutMinutes: timeoutMinutes
               }
             },
@@ -537,77 +739,113 @@ export async function startHttpServer(
           return;
         }
 
-        logger.debug('[SESSION] Creating new MCP server + transport for initialize');
-        const { server } = createServerInstance();
-
-        // Create a promise to track session initialization completion
-        let resolveInit: (() => void) | undefined;
-        let rejectInit: ((err: unknown) => void) | undefined;
-        const initPromise = new Promise<void>((resolve, reject) => {
-          resolveInit = resolve;
-          rejectInit = reject;
-        });
-        // Always-on safety net: if no concurrent code path is awaiting initPromise
-        // when rejectInit fires (e.g. session init fails before any tools/call
-        // arrives), the rejection would otherwise hit process.on('unhandledRejection')
-        // and exit the server. The original error is already logged inside the
-        // onsessioninitialized catch block below: we deliberately do NOT re-log here
-        // to avoid duplicate noise and any risk of leaking credentials.
-        initPromise.catch(() => {});
-
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          enableJsonResponse: true,
-          allowedOrigins,
-          enableDnsRebindingProtection: true,
-          onsessioninitialized: async (sid: string) => {
-            logger.debug(`Session initialized: ${sid}`);
-            // Store the promise before starting initialization
-            sessionInitPromises.set(sid, initPromise);
-            // Initialize connection pool for this session
-            try {
-              await connectToActualForSession(sid);
-              // Only register the transport if the pool connection succeeded.
-              // The pool stamped lastActivity when it created the entry, so it
-              // is already the source of truth for this session's idle clock.
-              transports.set(sid, transport);
-              logger.info(`[SESSION] Actual connection initialized for session: ${sid}`);
-              resolveInit?.();
-            } catch (err) {
-              logger.error(`[SESSION] Failed to initialize Actual for session ${sid}:`, err);
-              // Don't add failed sessions to transports map - they won't be usable anyway
-              // This prevents accumulation of dead sessions
-              // #438: remember WHY. The transport is still deliberately not registered,
-              // so the dead-session protection above is unchanged; without this the
-              // cause is known here and discarded, and the client's next request gets
-              // a bare "Session not found" that says nothing about a schema mismatch,
-              // a bad password or an unreachable server.
-              rememberInitFailure(sid, err);
-              rejectInit?.(err);
-            } finally {
-              // Clean up the promise after a short delay to allow pending requests to complete
-              setTimeout(() => sessionInitPromises.delete(sid), 1000);
-            }
-          },
-        });
-
-        // connect transport then handle request (matching working example)
-        await server.connect(transport);
+        // #581: ONE try/finally from the reservation to the answer. The SDK answers 406 (Accept),
+        // 400 (bad JSON), an invalid JSON-RPC body and an already-initialized transport WITHOUT
+        // calling onsessioninitialized, and `server.connect` can throw; none of those reach the
+        // pool, and neither the idle sweep nor the #530 orphan sweep can see a slot that has no
+        // entry and no registration. This finally is the only thing that can give it back. The
+        // SDK awaits onsessioninitialized inside handleRequest, so here the session either
+        // registered (its reservation was handed over to the pool entry) or never will.
         try {
-          // Run in AsyncLocalStorage context so tools can access sessionId
-          // and the adapter can enforce per-request budget ACL (#156).
-          const allowedBudgetsInit = (req as Request & { allowedBudgets?: string[] }).allowedBudgets;
-          const requestId = resolveRequestId(req.get('x-correlation-id'));
-          await requestContext.run({ sessionId: undefined, requestId, allowedBudgets: allowedBudgetsInit, principal: resolvePrincipal(req) }, async () => {
-            await transport.handleRequest(req, res, req.body);
+          logger.debug('[SESSION] Creating new MCP server + transport for initialize');
+          const { server } = createServerInstance();
+
+          // Create a promise to track session initialization completion
+          let resolveInit: (() => void) | undefined;
+          let rejectInit: ((err: unknown) => void) | undefined;
+          const initPromise = new Promise<void>((resolve, reject) => {
+            resolveInit = resolve;
+            rejectInit = reject;
           });
-        } catch (err: unknown) {
-          logger.error('Transport.handleRequest failed during initialize: %o', err);
-          const e = err as Error | { stack?: unknown } | undefined;
-          if (e && typeof e.stack === 'string') logger.error(e.stack);
-          throw err;
+          // Always-on safety net: if no concurrent code path is awaiting initPromise
+          // when rejectInit fires (e.g. session init fails before any tools/call
+          // arrives), the rejection would otherwise hit process.on('unhandledRejection')
+          // and exit the server. The original error is already logged inside the
+          // onsessioninitialized catch block below: we deliberately do NOT re-log here
+          // to avoid duplicate noise and any risk of leaking credentials.
+          initPromise.catch(() => {});
+
+          // The session belongs to the principal that initialized it. Resolved here,
+          // from this request, so the owner can never come from a later request.
+          const sessionOwner = resolvePrincipal(req);
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => sid,
+            enableJsonResponse: true,
+            // Same list as the Express guard. The SDK skips a missing Origin and,
+            // with no allowedHosts, does not reject the Host header.
+            ...(allowedOrigins.length > 0
+              ? { allowedOrigins: [...allowedOrigins], enableDnsRebindingProtection: true }
+              : {}),
+            // #563: the SDK awaits this on a valid DELETE, BEFORE it answers 200, so the pool
+            // slot is free by the time the client hears the session ended. It waits for the api
+            // mutex (#392), so another session's call in flight finishes first. Without evict:
+            // the DELETE route tears the session down itself after the 200.
+            onsessionclosed: async (sid: string) => {
+              if (isConnectionPoolEnabled()) await connectionPool.shutdownConnection(sid);
+            },
+            onsessioninitialized: async (sid: string) => {
+              logger.debug(`Session initialized: ${sid}`);
+              // Store the promise before starting initialization
+              sessionInitPromises.set(sid, initPromise);
+              // Initialize connection pool for this session
+              try {
+                // #571: open on the session's own budget (a restored #189 preference may live on
+                // another server), not on the default one.
+                const budget = initialBudgetForSession(sid);
+                await connectToActualForSession(sid, {
+                  serverUrl: budget.serverUrl,
+                  password: budget.password || '',
+                  syncId: budget.syncId,
+                  encryptionPassword: budget.encryptionPassword,
+                });
+                // Only register the transport if the pool connection succeeded.
+                // The pool stamped lastActivity when it created the entry, so it
+                // is already the source of truth for this session's idle clock.
+                recordSessionOwner(sid, sessionOwner);
+                transports.set(sid, transport);
+                // #530: let the pool time this session even after its entry is recycled.
+                // Pooling off (USE_CONNECTION_POOL=false) has no sweep, so nothing to register.
+                if (isConnectionPoolEnabled()) connectionPool.registerSession(sid);
+                logger.info(`[SESSION] Actual connection initialized for session: ${sid}`);
+                resolveInit?.();
+              } catch (err) {
+                logger.error(`[SESSION] Failed to initialize Actual for session ${sid}:`, err);
+                // Don't add failed sessions to transports map - they won't be usable anyway
+                // This prevents accumulation of dead sessions
+                // #438: remember WHY. The transport is still deliberately not registered,
+                // so the dead-session protection above is unchanged; without this the
+                // cause is known here and discarded, and the client's next request gets
+                // a bare "Session not found" that says nothing about a schema mismatch,
+                // a bad password or an unreachable server.
+                rememberInitFailure(sid, err, sessionOwner);
+                rejectInit?.(err);
+              } finally {
+                // Clean up the promise after a short delay to allow pending requests to complete
+                setTimeout(() => sessionInitPromises.delete(sid), 1000);
+              }
+            },
+          });
+
+          // connect transport then handle request (matching working example)
+          await server.connect(transport);
+          try {
+            // Run in AsyncLocalStorage context so tools can access sessionId
+            // and the adapter can enforce per-request budget ACL (#156).
+            const allowedBudgetsInit = (req as Request & { allowedBudgets?: string[] }).allowedBudgets;
+            const requestId = resolveRequestId(req.get('x-correlation-id'));
+            await requestContext.run({ sessionId: undefined, requestId, allowedBudgets: allowedBudgetsInit, principal: resolvePrincipal(req) }, async () => {
+              await transport.handleRequest(req, res, req.body);
+            });
+          } catch (err: unknown) {
+            logger.error('Transport.handleRequest failed during initialize: %o', err);
+            const e = err as Error | { stack?: unknown } | undefined;
+            if (e && typeof e.stack === 'string') logger.error(e.stack);
+            throw err;
+          }
+          return;
+        } finally {
+          if (!transports.has(sid)) releaseAdmission(sid);
         }
-        return;
       }
 
       // sessionId present -> reuse. Transport presence is the liveness signal:
@@ -653,7 +891,7 @@ export async function startHttpServer(
           // enum-only contract through the very hole left open there.
           let knownFailure: { cause: InitFailureCause; sentence: string } | undefined;
           try {
-            knownFailure = peekInitFailure(sessionId);
+            knownFailure = peekInitFailure(sessionId, resolvePrincipal(req));
           } catch {
             knownFailure = undefined;
           }
@@ -713,8 +951,44 @@ export async function startHttpServer(
         }
       }
       
-      // Refresh the pool's idle clock for this session (single source of truth, #167).
-      connectionPool.touch(sessionId);
+      // A session is usable only by the principal that created it. Another
+      // principal gets exactly the "Session not found" answer an unknown id gets,
+      // so the response does not confirm that the id exists. That includes the
+      // tools/list discovery fallback above: answering it with a 404 here while
+      // an unknown id gets the tool list would itself confirm the id is live.
+      if (!sessionOwnerMatches(sessionId, resolvePrincipal(req))) {
+        logger.warn(`[SESSION] Refused a request for session ${sessionId} from a principal that does not own it (method: ${method})`);
+        if (method === 'tools/list') {
+          res.json({
+            jsonrpc: '2.0',
+            id: payload?.id ?? null,
+            result: { tools: buildToolListEntries(toolsList, resolveToolMeta) },
+          });
+          return;
+        }
+        res.status(404).json({
+          jsonrpc: '2.0',
+          id: payload?.id ?? null,
+          error: {
+            code: -32001,
+            message: 'Session not found. Please re-initialize by calling initialize without mcp-session-id header.'
+          },
+        });
+        return;
+      }
+
+      // Refresh the pool's idle clock for this session (single source of truth, #167) and
+      // count the request in flight (#530): the orphan sweep must not reap a session whose
+      // own request is still running. The END marker is the response's completion, not a
+      // finally block: with enableJsonResponse `handleRequest` can resolve before the body
+      // is written. `stream.finished` rather than `res.once('close')`: a client that gave
+      // up during the init wait above has ALREADY closed the response, its `close` event
+      // fired before this line ran, and a listener attached now would never run, leaving
+      // the count at one for good (review round 2). `finished` calls back for an
+      // already-closed response too, and once, whether the response completed, errored
+      // or the client went away.
+      connectionPool.beginRequest(sessionId);
+      finished(res, () => connectionPool.endRequest(sessionId));
 
       // Run in AsyncLocalStorage context so tools and the adapter can access
       // sessionId (pool branch, #134) and allowedBudgets (ACL enforcement, #156).
@@ -754,7 +1028,7 @@ export async function startHttpServer(
   });
 
   // GET for SSE connect (reuse transport)
-app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
+  app.get(mcpPaths, async (req: Request, res: Response) => {
     // #447: the SAME gate the POST route uses. Until now this route never called
     // it outside the OIDC branch, so in the default static-bearer posture a GET on
     // the MCP path was unauthenticated while a POST on the identical path was not.
@@ -771,7 +1045,17 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
       res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'No session id' }, id: null });
       return;
     }
-    connectionPool.touch(sessionId); // Refresh the pool's idle clock (#167)
+    // Same ownership rule as the POST route. A refusal reads like an unknown
+    // session. The `transports.has` guard is load bearing: a session whose init
+    // FAILED never had an owner recorded, and under OIDC or a static bearer every
+    // caller has a principal, so without it that session would be refused here
+    // instead of reaching the #438 cause report below. That report is owner-bound
+    // on its own since #550 (the peek takes the principal).
+    if (transports.has(sessionId) && !sessionOwnerMatches(sessionId, resolvePrincipal(req))) {
+      logger.warn(`[SESSION] Refused a GET for session ${sessionId} from a principal that does not own it`);
+      res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Transport not ready' }, id: null });
+      return;
+    }
     const transport = transports.get(sessionId);
     if (!transport) {
       // #438: same cause, this route's own status and code. The classifier owns no
@@ -792,7 +1076,7 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
       // NODE_ENV is not production.
       let knownFailure: { cause: InitFailureCause; sentence: string } | undefined;
       try {
-        knownFailure = peekInitFailure(sessionId);
+        knownFailure = peekInitFailure(sessionId, resolvePrincipal(req));
       } catch {
         knownFailure = undefined;
       }
@@ -808,7 +1092,75 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
       });
       return;
     }
+    // #529: the idle clock is refreshed only for a session this route will serve,
+    // after the ownership check and the transport lookup, in the same order as
+    // POST. Touching before the lookup let a request that was about to be
+    // answered "Transport not ready" (a pool entry whose transport is gone, or
+    // one still initializing) keep that session alive.
+    connectionPool.touch(sessionId); // Refresh the pool's idle clock (#167)
     await transport.handleRequest(req, res);
+  });
+
+  // #563: DELETE ends the session (MCP spec 2025-11-25, Session Management rule 5).
+  // Same gate, missing-id answer and ownership rule as POST; the SDK then validates
+  // MCP-Protocol-Version, runs onsessionclosed (which frees the pool slot, see the
+  // transport options), answers 200 and closes its transport. Only after a 200 do we
+  // tear the session down ourselves: a 400 for an unsupported version leaves the
+  // session open, as the SDK does. teardownSession is called directly rather than
+  // through the pool's eviction listener because the listener never fires with the
+  // pool disabled or with the entry already dropped (#530), which would leave the
+  // transport, owner and budget selection behind. The pool entry is shut down
+  // WITHOUT evict so the teardown runs once, logged as `closed`.
+  const sessionNotFound = { jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Session not found. Please re-initialize by calling initialize without mcp-session-id header.' } };
+  app.delete(mcpPaths, async (req: Request, res: Response) => {
+    if (!authenticateRequest(req, res)) {
+      return;
+    }
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId) {
+      res.status(400).json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Bad Request: Mcp-Session-Id header is required' } });
+      return;
+    }
+    try {
+      let transport = transports.get(sessionId);
+      const initPromise = transport ? undefined : sessionInitPromises.get(sessionId);
+      if (initPromise) {
+        // A failed init is answered like an unknown id; its #438 record is peek-only and stays.
+        await initPromise.catch(() => undefined);
+        transport = transports.get(sessionId);
+      }
+      // A non-owner gets the unknown-id answer byte for byte (#529), so the reply never
+      // confirms that the id exists.
+      if (!transport || !sessionOwnerMatches(sessionId, resolvePrincipal(req))) {
+        if (transport) logger.warn(`[SESSION] Refused a DELETE for session ${sessionId} from a principal that does not own it`);
+        res.status(404).json(sessionNotFound);
+        return;
+      }
+      const allowedBudgets = (req as Request & { allowedBudgets?: string[] }).allowedBudgets;
+      const requestId = resolveRequestId(req.get('x-correlation-id'));
+      await requestContext.run({ sessionId, requestId, allowedBudgets, principal: resolvePrincipal(req) }, async () => {
+        await transport.handleRequest(req, res);
+      });
+      if (res.statusCode !== 200) return;
+      teardownSession(sessionId, 'closed');
+    } catch (err: unknown) {
+      logger.error(`[SESSION] DELETE for session ${sessionId} failed`, errorLogFields(err));
+      if (!res.headersSent) {
+        res.status(500).json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error. The server logged the cause.' } });
+      }
+    }
+  });
+
+  // #563: every other method on the MCP path gets a JSON-RPC 405 with the Allow header
+  // RFC 9110 15.5.6 requires, instead of Express's HTML 404. HEAD is served by the GET
+  // route; OPTIONS answers 204 with the same Allow list.
+  app.all(mcpPaths, (req: Request, res: Response) => {
+    res.setHeader('Allow', 'GET, POST, DELETE');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    res.status(405).json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Method not allowed.' } });
   });
 
   // Quick GET server-info probe used by our test harness (testMcpClient.ts, the
@@ -823,8 +1175,7 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
   const serverIp = process.env.MCP_BRIDGE_PUBLIC_HOST || getLocalIp();
   const mcpInfo = () => ({
     description: serverDescription || "Actual MCP server",
-    instructions: serverInstructions || "Welcome to the Actual MCP server.",
-    serverInstructions: { instructions: serverInstructions || "Welcome to the Actual MCP server." },
+    instructions,
     capabilities: capabilities && Object.keys(capabilities).length ? capabilities : { tools: toolsList.reduce((a: Record<string, object>, n: string) => ({ ...a, [n]: {} }), {}) },
     tools: toolsList,
     advertisedUrl: advertisedUrl || `${scheme}://${serverIp}:${port}${httpPath}`,
@@ -832,6 +1183,9 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
   app.get('/mcp-info', (_req, res) => { res.json(mcpInfo()); });
   app.get('/mcp-info/http', (_req, res) => { res.json(mcpInfo()); });
 
+  // /health is unauthenticated, so it reports counts only. Session ids are bearer
+  // material for the transport and must never appear here; getConnectionState
+  // returns the pool's aggregate figures without the per-session list.
   app.get('/health', (_req, res) => {
     const state = getConnectionState();
     const poolStats = state.connectionPool || null;
@@ -850,9 +1204,18 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
       res.status(204).end();
       return;
     }
-    res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+    // #543: the charset is spelled out because res.send appends it, and express 5.3.0
+    // appends it AFTER version=0.0.4 where 5.2.1 put it before. Stated in full, the header
+    // is passed through unchanged on both, so scrapers see the same value.
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8; version=0.0.4');
     res.send(txt);
   });
+
+  // #543: the FINAL layer, mounted globally (express.json above is global). Without it an
+  // error reaches Express's default handler, which from express 5.3.0 logs the whole error
+  // object, raw request body included, and under NODE_ENV=development renders the stack.
+  // Keep this the last app.use: anything registered after it is never reached on error.
+  app.use(createHttpErrorHandler({ mcpPath: mcpPaths }));
 
   // config validation (#169) guarantees both paths are set when HTTPS is on, so
   // the non-null assertions are safe. Wrap the reads so a missing/unreadable
@@ -874,16 +1237,22 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
     }
   }
 
-  const listener = (tlsOptions ? https.createServer(tlsOptions, app) : app).listen(port, bindHost, () => {
+  const listener = (tlsOptions ? https.createServer(tlsOptions, app) : app).listen(port, bindHost, (err?: Error) => {
+    // #623: Express 5's app.listen also registers this callback as the server's 'error'
+    // handler, so a taken port (EADDRINUSE) lands HERE with the error. Without this rethrow it
+    // logged "listening", emitted sys_startup, and the process drained out with exit 0. The
+    // rethrow reaches the uncaughtException handler (sys_crash, exit 1), the same path the
+    // https.createServer branch takes, which has no error listener at all.
+    if (err) throw err;
     const advertised = advertisedUrl || `${scheme}://${serverIp}:${port}${httpPath}`;
     // #239: when bound to a specific (non all-interfaces) host the server is NOT on
     // loopback, so point the health hint at the actual bind host instead of localhost.
     const healthHost = (!bindHost || bindHost === '0.0.0.0' || bindHost === '::') ? 'localhost' : bindHost;
-    console.info(`MCP Streamable HTTP Server listening on ${port}`);
-    console.info(`📨 MCP endpoint: ${advertised}`);
-    console.info(`❤️ Health check: ${scheme}://${healthHost}:${port}/health`);
+    const health = `${scheme}://${healthHost}:${port}/health`;
+    // #625: one structured record through the module logger instead of three console.info lines.
+    httpLog.info(`MCP Streamable HTTP Server listening on ${port}; MCP endpoint: ${advertised} (health: ${health})`, { port, endpoint: advertised, health });
     if (config.AUTH_PROVIDER === 'oidc') {
-      logger.info(`🔒 OIDC authentication enabled (JWT Bearer token required; issuer: ${config.OIDC_ISSUER})`);
+      logger.info(`🔒 OIDC authentication enabled (JWT Bearer token required; issuer: ${logSafeOrigin(config.OIDC_ISSUER ?? '')})`);
       // #345: name the userNames the ACL can match, once, at boot. Deliberately
       // fire-and-forget INSIDE the listen callback: the server is already
       // accepting connections, so a slow or unreachable Actual delays nothing,
@@ -891,17 +1260,33 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
       if (config.AUTH_BUDGET_ACL_SOURCE === 'actual') {
         void runAclPreflight();
       }
-    } else if (config.MCP_SSE_AUTHORIZATION) {
-      logger.info(`🔒 HTTP authentication enabled (static Bearer token required)`);
+    } else if (bearerEntries.length > 0) {
+      // #572: principal names and budget COUNTS only; budget names are personal data.
+      const principals = staticPrincipals.map((e) => `${e.principal} (${e.allowedBudgets!.length} budget(s))`).join(', ');
+      logger.info(
+        `🔒 HTTP authentication enabled (Bearer token required)` +
+          (principals ? `; static principals: ${principals}` : '') +
+          (config.MCP_SSE_AUTHORIZATION ? `; MCP_SSE_AUTHORIZATION also accepted (unrestricted)` : ''),
+      );
     } else {
-      logger.warn(`⚠️  HTTP authentication disabled (no MCP_SSE_AUTHORIZATION or OIDC configured)`);
+      logger.warn(`⚠️  HTTP authentication disabled (no MCP_SSE_AUTHORIZATION, MCP_STATIC_TOKENS or OIDC configured)`);
+    }
+    // #623: keepAliveTimeout is assigned below, synchronously after listen() returns, so it is
+    // already set when this callback fires. A throw from the record must never take down a
+    // server that is already accepting connections.
+    if (onListening) {
+      try {
+        onListening({ port, scheme, keepAliveMs: listener.keepAliveTimeout });
+      } catch (err) {
+        logger.warn('sys_startup record failed', { error: err instanceof Error ? err.name : 'unknown' });
+      }
     }
   });
 
   // Configure keep-alive to maintain persistent connections
-  listener.keepAliveTimeout = 65000; // 65 seconds (slightly higher than typical client timeout)
-  listener.headersTimeout = 66000;   // 66 seconds (must be higher than keepAliveTimeout)
-  logger.info(`⏱️  HTTP keep-alive enabled (timeout: ${listener.keepAliveTimeout}ms)`);
+  // #623: the value is reported in the sys_startup record (limits.keepAliveMs), not its own line.
+  listener.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS; // slightly higher than typical client timeout
+  listener.headersTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS + 1000; // must be higher than keepAliveTimeout
 
   // Cleanup on server shutdown
   const cleanup = async () => {
@@ -919,8 +1304,12 @@ app.get([httpPath, '/mcp'], async (req: Request, res: Response) => {
     await shutdownActual();
   };
 
-  process.on('SIGTERM', cleanup);
-  process.on('SIGINT', cleanup);
+  // #632: see src/server/shutdown.ts for the order and why. `cleanup` itself stays exit-free for
+  // in-process callers; only the signal path exits.
+  const shutdown = (signal: NodeJS.Signals) => { void shutdownHandler.shutdown(signal); };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 
   return { app, listener, cleanup };
 }

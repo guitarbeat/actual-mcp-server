@@ -1,0 +1,166 @@
+// tests/unit/tools_list_size_budget.test.js
+//
+// #486: a size budget for tools/list. Every client pays for the full list on every message, so
+// a tool that grows (or a new tool) should be a visible, deliberate decision rather than a
+// slow erosion of the savings made by trimming the heaviest schemas.
+//
+// The list is built the way the server does: buildToolListEntries with z.toJSONSchema over
+// getPublishedToolNames(), the list src/index.ts hands to both transports (toolsets 'all'), measured as Buffer.byteLength(JSON.stringify(entries)).
+// The check is a pure function; this file also runs it on fixtures so the guard itself is
+// proven able to fail (a padded description, and a total ceiling 1 byte too low).
+//
+// Run: node tests/unit/tools_list_size_budget.test.js   (needs `npm run build` first)
+
+import assert from 'assert';
+
+process.env.ACTUAL_SERVER_URL ??= 'http://localhost:5006';
+process.env.ACTUAL_PASSWORD ??= 'dummy';
+process.env.ACTUAL_BUDGET_SYNC_ID ??= '00000000-0000-0000-0000-000000000000';
+for (const k of ['MCP_TOOLSETS', 'MCP_TOOLS', 'MCP_READ_ONLY', 'MCP_TOOL_SURFACE']) delete process.env[k];
+
+// Raising either ceiling is a deliberate edit. Change the number AND replace the reason below
+// in the same commit; a reviewer should be able to see why the list got heavier.
+//   Total: 101,827 bytes after the #486 trim (83 tools), plus about 5% headroom; raised for
+//   #479 (actual_schedules_dates, the 85th tool) from 106,900 at 108,317 bytes, plus about 5%.
+//   Per tool: the heaviest entry after the #486 trim was 3,327 bytes (actual_rules_create_batch).
+//   Raised for #639 (parameter descriptions, a Glama TDQS input) from 3,600: the nested
+//   descriptions on the schedule amount range and recur patterns added 254 bytes to
+//   actual_schedules_update, now 3,824 bytes, plus about 2%. The #639 total is 111,333 bytes
+//   (2,546 added), under the unchanged total ceiling.
+//   Total raised for #641 (a display `title` on every tool, a Glama TDQS input) from 113,700:
+//   85 titles added 2,469 bytes, so the list is 113,802 bytes, plus about 2%.
+//   #642 (outputSchema on two tools) added 1,326 bytes, so the list is 115,128 bytes and the
+//   heaviest entry 3,850: both still under the ceilings, so neither was raised.
+//   Total raised for #640 (the 10 lowest TDQS descriptions rewritten) from 116,100: the
+//   rewrites added 2,997 bytes net (the ticket caps them at 3,000), so the list is 118,125
+//   bytes, plus about 2%. The heaviest entry is unchanged, so the per-tool ceiling is too.
+const TOTAL_CEILING = 120500;
+const PER_TOOL_CEILING = 3900;
+// The ceiling for the compact tools COMBINED (what the `compact` surface lists; the design
+// record plans 15). The per-tool ceiling above applies to each compact entry unchanged. The
+// `all` surface lists both, so its budget is the sum of the two ceilings, never a third number.
+// #672 (get_context, list_entities) measured 6210 bytes, so the ceiling is that plus about 10%.
+// #673 (search_transactions, summarize_transactions) raised the four-tool total to 13558 bytes (each
+// new tool stays under the per-tool ceiling), so the ceiling is now that plus about 10%.
+// #674 (list_budget_months, run_query) raised the six-tool total to 16863 bytes, so the ceiling is that plus about 10%.
+// #675 (manage_transactions, 3858 bytes as measured here) raised the seven-tool total to 20809 bytes, so the ceiling is that plus about 10%.
+// #676 (manage_accounts 2972, manage_categories 2000, manage_payees 1931 bytes) raised the ten-tool total to 27700 bytes, so the ceiling is that plus about 10%.
+// #676 (manage_tags, 1229 bytes) raised the eleven-tool total to 28930 bytes, so the ceiling is that plus about 10%.
+// #677 (manage_rules 3308, manage_schedules 2294 bytes) raised the thirteen-tool total to 34563 bytes, so the ceiling is that plus about 10%.
+// #678 (manage_budget_months, manage_budget_files) completed the fifteen-tool compact surface at 40681 bytes, so the ceiling is that plus about 10%.
+// #679 (set_note routing sentences in manage_accounts, manage_categories, manage_payees) grew the fifteen-tool total from 40681 to 41000 bytes (319 more), so the ceiling rose by the same 319, from 44800 to 45119.
+// Each later compact ticket raises it by its own measured size, stated here.
+const COMPACT_TOTAL_CEILING = 45119;
+
+const sizeOf = (value) => Buffer.byteLength(JSON.stringify(value));
+
+/** Pure: returns the list of violations (empty when within budget). */
+function checkBudget(entries, totalCeiling, perToolCeiling) {
+  const problems = [];
+  const hint = 'Raising a ceiling is a deliberate edit to tests/unit/tools_list_size_budget.test.js, with a comment stating why.';
+  const total = sizeOf(entries);
+  if (total > totalCeiling) {
+    problems.push(`tools/list total is ${total} bytes, over the total ceiling of ${totalCeiling}. ${hint}`);
+  }
+  for (const entry of entries) {
+    const size = sizeOf(entry);
+    if (size > perToolCeiling) {
+      problems.push(`${entry.name} is ${size} bytes, over the per-tool ceiling of ${perToolCeiling}. ${hint}`);
+    }
+  }
+  return problems;
+}
+
+let passed = 0;
+let failed = 0;
+async function check(label, fn) {
+  try { await fn(); console.log(`  ok: ${label}`); passed++; }
+  catch (err) { console.error(`  FAIL: ${label} -> ${err.message}`); failed++; }
+}
+
+console.log('\n[#486] tools/list size budget');
+
+const { buildToolListEntries } = await import('../../dist/src/lib/tool-list-entry.js');
+const { outputJsonSchema } = await import('../../dist/src/lib/tool-output.js');
+const manager = (await import('../../dist/src/actualToolsManager.js')).default;
+const { z } = await import('zod');
+const { getCanonicalCount } = await import('../../scripts/tool-count.mjs');
+
+await manager.initialize({ toolsets: 'all', tools: '', readOnly: false });
+const registered = manager.getToolNames();
+const names = manager.getPublishedToolNames();
+const entries = buildToolListEntries(names, (name) => {
+  const tool = manager.getTool(name);
+  // #642: the published list carries the output schema of a covered tool, so it is measured.
+  return { description: tool.description, schema: tool.inputSchema ? z.toJSONSchema(tool.inputSchema) : undefined, outputSchema: outputJsonSchema(tool) };
+});
+const realTotal = sizeOf(entries);
+console.log(`  measured: total ${realTotal} bytes, heaviest ${Math.max(...entries.map(sizeOf))} bytes`);
+
+await check('the measured list is the full registry (published === registered === IMPLEMENTED_TOOLS)', () => {
+  const canonical = getCanonicalCount();
+  const counts = `published ${names.length}, registered ${registered.length}, IMPLEMENTED_TOOLS ${canonical}`;
+  assert.ok(names.length === canonical && registered.length === canonical, counts);
+  assert.strictEqual(entries.length, names.length, counts);
+});
+
+await check('the real list is within the total and per-tool ceilings', () => {
+  const problems = checkBudget(entries, TOTAL_CEILING, PER_TOOL_CEILING);
+  assert.deepStrictEqual(problems, []);
+});
+
+await check('a clone with one description padded by 5120 bytes is reported, naming the tool and the per-tool ceiling', () => {
+  const clone = JSON.parse(JSON.stringify(entries));
+  const target = clone[0];
+  target.description += 'x'.repeat(5120);
+  const problems = checkBudget(clone, Number.MAX_SAFE_INTEGER, PER_TOOL_CEILING);
+  assert.strictEqual(problems.length, 1);
+  assert.ok(problems[0].includes(target.name), problems[0]);
+  assert.ok(problems[0].includes(`per-tool ceiling of ${PER_TOOL_CEILING}`), problems[0]);
+  assert.ok(problems[0].includes('deliberate edit'), problems[0]);
+});
+
+await check('a total ceiling 1 byte under the real total fails, naming the total and the ceiling', () => {
+  const problems = checkBudget(entries, realTotal - 1, Number.MAX_SAFE_INTEGER);
+  assert.strictEqual(problems.length, 1);
+  assert.ok(problems[0].includes(`${realTotal} bytes`), problems[0]);
+  assert.ok(problems[0].includes(`total ceiling of ${realTotal - 1}`), problems[0]);
+  assert.ok(problems[0].includes('deliberate edit'), problems[0]);
+});
+
+await check('a total ceiling exactly at the real total passes', () => {
+  assert.deepStrictEqual(checkBudget(entries, realTotal, Number.MAX_SAFE_INTEGER), []);
+});
+
+// ---- #671: the compact surface and the `all` surface ----
+
+const { COMPACT_TOOLS } = await import('../../dist/src/compact/registry.js');
+const { buildCompactTool } = await import('../../dist/src/compact/dispatch.js');
+const compactMeta = (spec) => {
+  const tool = buildCompactTool(spec, { callOperation: async () => undefined });
+  return { name: spec.name, description: tool.description, schema: z.toJSONSchema(tool.inputSchema) };
+};
+const compactEntries = buildToolListEntries(COMPACT_TOOLS.map((c) => c.name), (name) => compactMeta(COMPACT_TOOLS.find((c) => c.name === name)));
+const compactTotal = sizeOf(compactEntries);
+console.log(`  measured: compact ${compactEntries.length} tools, ${compactTotal} bytes; all-surface ${realTotal + compactTotal} bytes`);
+
+await check('the compact tools are within the compact total and the per-tool ceiling', () => {
+  assert.deepStrictEqual(checkBudget(compactEntries, COMPACT_TOTAL_CEILING, PER_TOOL_CEILING), []);
+});
+
+await check('the all surface (legacy plus compact) is within the sum of the two total ceilings', () => {
+  assert.deepStrictEqual(checkBudget([...entries, ...compactEntries], TOTAL_CEILING + COMPACT_TOTAL_CEILING, PER_TOOL_CEILING), []);
+});
+
+await check('NEGATIVE: a compact entry padded past the per-tool ceiling, and a compact total 1 byte low, are both reported', () => {
+  const fixture = [{ name: 'actual_fixture', description: 'x'.repeat(PER_TOOL_CEILING + 1), inputSchema: {}, annotations: {} }];
+  const tooBig = checkBudget(fixture, COMPACT_TOTAL_CEILING, PER_TOOL_CEILING);
+  assert.strictEqual(tooBig.length, 1);
+  assert.ok(tooBig[0].includes('actual_fixture') && tooBig[0].includes('per-tool ceiling'), tooBig[0]);
+  const low = checkBudget(fixture, sizeOf(fixture) - 1, Number.MAX_SAFE_INTEGER);
+  assert.strictEqual(low.length, 1);
+  assert.ok(low[0].includes('total ceiling'), low[0]);
+});
+
+console.log(`\n${passed} passed, ${failed} failed`);
+process.exit(failed > 0 ? 1 : 0);

@@ -1,0 +1,593 @@
+# New Tool Checklist
+
+**Project:** Actual MCP Server  
+**Purpose:** Step-by-step checklist for every new MCP tool added to the project  
+**Last Updated:** 2026-06-07
+
+Use this file every time a new tool is added. Print or open it alongside your editor and tick each box before committing. The checklist is ordered so that each step builds on the previous one.
+
+---
+
+## ⚡ Quick Reference (all checkboxes in one place)
+
+> **This list is now ENFORCED, not just documented.** `tests/unit/new_tool_completeness.test.js`
+> (in the blocking `test:unit-js` chain) asserts that every tool in `IMPLEMENTED_TOOLS` reaches
+> the tools reference (`docs/reference/tools.md`), the E2E spec, a `tests/manual/tests/*.js` module and a
+> `tests/manual-prompt/prompt-*.txt` file, and that its own source file and index export exist.
+> A tool that skips one of those fails the build with the name of the missing surface.
+>
+> If a tool legitimately cannot reach a surface, add it to that test's `EXCEPTIONS` map WITH A
+> REASON. The guard fails on an exception that has gone stale, so the list cannot decay into a
+> blanket opt-out. Pre-existing gaps are tracked in #451, not silently accepted.
+
+### Implementation
+- [ ] Tool file created: `src/tools/<domain>_<action>.ts`
+- [ ] Exported from `src/tools/index.ts`
+- [ ] Added to `IMPLEMENTED_TOOLS` in `src/actualToolsManager.ts`
+- [ ] **Added to the toolsets** (#603): Add the tool to exactly one `TOOLSETS` array in `src/lib/toolsets.ts`, and to `WRITE_CAPABLE` if it writes; then `npm run build && npm run docs:gen`. `tests/unit/toolsets.test.js` ("every registered tool belongs to exactly one toolset") fails if you skip it, and `docs:check` reports the README tools-summary block stale.
+- [ ] **Classified in `src/lib/tool-annotations.ts`** (#379): put it in exactly one of `READ_ONLY`, `DESTRUCTIVE` or `ADDITIVE`, and if it writes, decide idempotence. `npm run build && node tests/unit/tool_annotations.test.js` FAILS if you skip this (the guard reads `dist/`, so build first), and it checks the read-only claim against the adapter call graph
+- [ ] **Titled in `src/lib/tool-titles.ts`** (#641): add a sentence-case display title of 2 to 5 words, unique, with no leading "Actual", whose first word is a read verb (Get, List, Search...) exactly when the tool is read-only. `npm run build && node tests/unit/tool_titles.test.js` FAILS naming the tool if you skip this
+- [ ] Adapter function(s) exist (or created) in `src/lib/actual-adapter.ts`
+- [ ] **Optional: output schema** (#642): only when the tool's result is a JSON object (never an array), set `outputSchema` to a top-level `z.object({...}).loose()` (a root union, a `z.record` at any depth, and a closed object at any depth are refused by `tests/unit/tool_output_schema.test.js`; model alternative result shapes as optional or nullable properties of one object), describe every field, then add a `structuredContent` assertion (`mcp.raw`) to the E2E spec and re-measure `tests/unit/tools_list_size_budget.test.js`. `createTool()` wraps its result as `{ result }`, so the schema describes that wrapper. Leave it unset for every other tool
+- [ ] **Prompts that name the tool** (#660): a prompt in `src/prompts/` that names a new tool is added with that tool. Renaming or removing a tool must update every prompt's `requiredTools`, or the prompt silently disappears from `prompts/list` (it is offered only when every named tool is published).
+- [ ] `npm run build` passes with zero errors
+
+### Unit Tests
+- [ ] Input example added to `tests/unit/generated_tools.smoke.test.js` (required fields + stub response)
+- [ ] **Output shape asserted** in smoke test: tool added to `resultWrappers[]`, `successTools[]`, or a custom `if (n === '...')` block with `shapeErr()`
+- [ ] Negative-path / schema validation in `tests/unit/schema_validation.test.js` (if schema is complex)
+- [ ] **Error message quality**: for each applicable Zod-layer scenario (wrong date format, unknown field, missing required field, wrong type, invalid enum, out-of-range), assert the error message is actionable, not just that it throws
+- [ ] `npm run test:unit-js` passes
+
+### Manual Integration Tests (JS scripts)
+- [ ] Test block added to the appropriate `tests/manual/tests/*.js` module
+- [ ] **Positive test**: call with valid input, assert required output fields are present with correct types and values
+- [ ] **Read-back verification**: after every create/update, call the corresponding `_get` or `_list` tool and assert the entity exists with the values you supplied
+- [ ] **Optional fields**: each optional input that changes output is exercised in at least one positive call, and the response is asserted to reflect it
+- [ ] **Negative test**: call with a name / ID that does not exist; assert error is returned AND that the response contains useful context (e.g., list of available values). If the tool silently accepts the bad input (no error returned), record a `// GAP(error-messages): actual_<tool> with bad input: [observed behavior]` comment in the test file instead of asserting, and log a `⚠` warning line.
+- [ ] **Error scenario coverage**: for each API-layer scenario (invalid/non-existent ID, conflicting fields, duplicate/already-exists, dependency not found) that applies to this tool, add a negative-path block asserting the error message is actionable (not generic). Use `// GAP(error-messages):` comments for any silent failures discovered.
+- [ ] `tests/manual/README.md` test-module table updated if a new file was added
+- [ ] `npm run test:integration:full` passes against a real server
+
+### AI / LLM Prompt Test
+- [ ] New tool added to the correct prompt file in `tests/manual-prompt/` (see Step 6 for which file)
+- [ ] Phase header tool count updated in that prompt file
+- [ ] `tests/manual-prompt/README.md` Phase Overview table total updated
+- [ ] Both a positive scenario and a not-found/negative scenario described in the prompt instructions
+
+### E2E Tests
+- [ ] Tool's happy-path call added to `tests/e2e/docker-all-tools.e2e.spec.ts`, and confirmed collected with `npx playwright test --list --config tests/e2e/playwright.config.docker.ts` (#366: the old `tests/e2e/suites/` path never executed)
+- [ ] `EXPECTED_TOOL_COUNT` default bumped in `tests/manual/tests/sanity.js` (the only place that asserts an exact tool count)
+- [ ] `describe('Docker E2E - ALL <N> TOOLS', ...)` block-name count updated in `tests/e2e/docker-all-tools.e2e.spec.ts` (cosmetic label only; the spec does not assert a count, and `mcp-client.playwright.spec.ts` only checks `tools.length > 0`)
+- [ ] `npm run test:e2e` passes
+
+### Documentation
+- [ ] `docs/reference/tools.md`: new tool row added in its domain table, then `npm run build && npm run docs:gen` (regenerates the README tools-summary block)
+- [ ] `docs/explanation/architecture.md`: tool listed in domain section (if relevant)
+- [ ] `docs/development/testing-and-reliability.md`: test file entries updated if new test module added
+- [ ] `npm run docs:sync` run to batch-update all **Tool Count:** markers
+
+### Final Validation
+- [ ] `npm run build` ✅
+- [ ] `npm run test:adapter` ✅
+- [ ] `npm run test:unit-js` ✅
+- [ ] `npm run verify-tools` ✅ (confirms tool name matches registered name)
+- [ ] `tests/unit/tools_list_size_budget.test.js` passes. A new tool adds to the published `tools/list`; if it pushes the total over `TOTAL_CEILING`, raise that constant in the same commit with a comment stating why (keep the tool description and schema terse first). A single tool over `PER_TOOL_CEILING` should be trimmed, not allowed
+- [ ] `npm audit --audit-level=moderate` ✅
+- [ ] Commit message uses `feat(tools): add <tool_name>` format
+
+---
+
+## 📋 Detailed Guide
+
+### Step 1: Create the tool file
+
+**Location**: `src/tools/<domain>_<action>.ts`
+
+**Naming convention**: `actual_{domain}_{action}` in lower snake_case, never camelCase (#652: the six camelCase budget tools were renamed; `tests/unit/tool_name_case.test.js` fails on a new one). Use the exact same name for:
+- The file name (`<domain>_<action>.ts`)
+- The `name` field inside the tool definition
+- The entry in `IMPLEMENTED_TOOLS`
+
+**Template**:
+```typescript
+import { z } from 'zod';
+import type { ToolDefinition } from '../../types/tool.d.js';
+import adapter from '../lib/actual-adapter.js';
+import { CommonSchemas } from '../lib/schemas/common.js';
+
+const InputSchema = z.object({
+  // Use CommonSchemas for shared types: accountId, amountCents, date, etc.
+  name: z.string().describe('Human-readable name to look up'),
+  type: z.enum(['accounts', 'categories', 'payees']).describe('Entity type'),
+});
+
+const tool: ToolDefinition = {
+  name: 'actual_example_tool',
+  description: 'One-line description. Amount in cents (negative=expense). Dates: YYYY-MM-DD.',
+  inputSchema: InputSchema,
+  call: async (args: unknown) => {
+    const input = InputSchema.parse(args);
+    return await adapter.someMethod(input);
+  },
+};
+
+export default tool;
+```
+
+> **Preferred for new tools:** use `createTool()` from `src/lib/toolFactory.ts` instead of a raw `ToolDefinition`. It wires up error handling, logging, and per-tool observability counters automatically. The legacy template above still works and matches most existing tools, but prefer the factory for anything new. See the "Tool Structure Pattern" section in CLAUDE.md.
+
+**Checklist for the tool file**:
+- Amounts always in **cents** (integer), never decimal dollars
+- Dates always `YYYY-MM-DD`
+- UUIDs validated with `UUID_PATTERN` from `src/lib/constants.ts` when needed
+- Error messages are user-facing; make them actionable
+- Never log the tool's arguments or result, at any level (#556): they are the user's budget data. `callTool` already logs a content-free record per call
+- When a lookup returns no results, include a list of available values in the error response (see Negative Test section below)
+
+---
+
+### Step 2: Register the tool
+
+**Export** from `src/tools/index.ts`:
+```typescript
+export { default as example_tool } from './example_tool.js';
+```
+
+**Register** in `src/actualToolsManager.ts` by adding the tool name to `IMPLEMENTED_TOOLS`:
+```typescript
+const IMPLEMENTED_TOOLS = [
+  // ...existing tools...
+  'actual_example_tool',  // ← add here, alphabetical within domain
+];
+```
+
+**Toolset**: Add the tool to exactly one `TOOLSETS` array in `src/lib/toolsets.ts`, and to `WRITE_CAPABLE` if it writes; then `npm run build && npm run docs:gen`. `tests/unit/toolsets.test.js` ("every registered tool belongs to exactly one toolset") fails if you skip it, and `docs:check` reports the README tools-summary block stale.
+
+Verify with:
+```bash
+npm run verify-tools
+```
+
+---
+
+### Step 2b: Classify the tool for clients (#379)
+
+Add the tool to the right sets in `src/lib/tool-annotations.ts`. This is what the server
+PUBLISHES to clients as MCP annotations, so a model can tell a read from a delete before
+calling it.
+
+- [ ] If it changes nothing at all, add it to `READ_ONLY`. Claim this only when you are
+      certain: a wrong `readOnlyHint: true` is worse than no annotation, because clients
+      use it to decide what needs confirming.
+- [ ] If it writes, decide two things. Is it **destructive** (removes or replaces data:
+      the `*_delete` family, `payees_merge`, `budgets_import`, and `accounts_close`, which
+      REMOVES a zero-transaction account)? Is it **idempotent** (does calling it twice with
+      the same arguments leave the same state)? Creates are not idempotent;
+      `budgets_hold_for_next_month` is not either, because upstream ADDS to the buffer.
+- [ ] `openWorldHint` is handled for you: everything is a closed world except
+      `actual_bank_sync`. Only touch `OPEN_WORLD` if your tool reaches a third-party service.
+- [ ] Run `npm run build && node tests/unit/tool_annotations.test.js`. The guard reads the
+      compiled table from `dist/`, so an unbuilt tree validates the PREVIOUS classification.
+      It derives read-versus-write from the adapter call graph and will tell you if your
+      classification disagrees with your code.
+
+**Do not make any code in `src/` branch on an annotation.** The MCP spec says clients must
+treat annotations as untrusted, so they can never carry an authorisation or safety decision.
+Keep those in `budget-acl.ts` and the adapter guards.
+
+Then give the tool a display title in `src/lib/tool-titles.ts` (#641). Clients show it
+instead of `actual_x_y`, and Glama's quality score reads it.
+
+- [ ] Sentence case, 2 to 5 words, no leading "Actual", not used by any other tool.
+- [ ] The first word is a read verb (Get, List, Search, Summarize...) if and only if the
+      tool is in `READ_ONLY`.
+- [ ] Run `npm run build && node tests/unit/tool_titles.test.js`.
+
+---
+
+### Step 3: Add or extend adapter methods
+
+If the tool calls an Actual API method that is not yet wrapped in `src/lib/actual-adapter.ts`, add a new exported function following the `withActualApi` / `withConcurrency` / `retry` pattern:
+
+```typescript
+export async function exampleMethod(input: unknown): Promise<unknown> {
+  return withActualApi(async () => {
+    return withConcurrency(() =>
+      retry(() => rawExampleMethod(input) as Promise<unknown>, { retries: 2, backoffMs: 200 })
+    );
+  });
+}
+```
+
+Then export the function from the adapter's default export object at the bottom of `actual-adapter.ts`.
+
+---
+
+### Step 4: Write unit tests
+
+#### 4a. Smoke test in `tests/unit/generated_tools.smoke.test.js`
+
+This file monkeypatches the adapter with predefined stub responses and runs every registered tool with a minimal valid input. It asserts both that the tool does not throw **and** that the response shape matches what the tool documents.
+
+**The file has no test framework, and `assert` is not imported. Use the file's own `shapeErr()` helper inside `if (n === '...')` blocks, or add the tool to one of the existing membership arrays.**
+
+1. **Add a `stubResponses` entry** if the tool calls an adapter method not already listed:
+   ```javascript
+   // In the stubResponses map at the top of the file:
+   exampleMethod: { id: 'example-id-001', name: 'Example' },
+   ```
+   Without a stub entry the adapter returns `undefined`, which will cause shape assertions to fail with a confusing error.
+
+2. **Add a required-fields input example** if the tool has non-trivial required fields:
+   ```javascript
+   if (name.includes('example_tool')) {
+     inputExample.name = 'SomeExistingName';
+     inputExample.type = 'accounts';
+   }
+   ```
+
+3. **Assert the output shape** using one of these approaches; pick whichever fits:
+
+   | Return type | Approach |
+   |-------------|----------|
+   | Returns `{ result: ... }` wrapper | Add tool name to `resultWrappers[]` array |
+   | Returns `{ success: true }` | Add tool name to `successTools[]` array |
+   | Unique shape (custom fields) | Add `if (n === 'example_tool') { ... }` block with `shapeErr()` |
+
+   ```javascript
+   // Option A: add to the relevant array (preferred when response matches existing pattern):
+   const resultWrappers = ['accounts_list', /* ... */ 'example_tool'];
+
+   // Option B: custom block for unique shapes:
+   if (n === 'example_tool') {
+     if (typeof res?.id !== 'string') shapeErr('expected id string');
+     if (typeof res?.name !== 'string') shapeErr('expected name string');
+   }
+   ```
+
+   The minimum assertion by return type:
+
+   | Return type | What to assert |
+   |-------------|----------------|
+   | Single entity create | `typeof res?.id === 'string'` |
+   | List | `Array.isArray(res?.result)` or `Array.isArray(res?.items)` |
+   | Count + list | `typeof res?.count === 'number'` and array field present |
+   | Mutation (update/delete) | `res?.success === true` → add to `successTools[]` |
+   | Summary/total | `typeof res?.totalAmount === 'number'` |
+
+#### 4b. Negative / schema validation in `tests/unit/schema_validation.test.js`
+
+Add negative-path tests for **any schema that has:**
+- Enums (wrong value should fail)
+- UUID fields (non-UUID string should fail)
+- Numeric ranges (out-of-range should fail)
+- Required fields (missing should fail)
+
+```javascript
+it('actual_example_tool rejects invalid type', () => {
+  assert.throws(
+    () => InputSchema.parse({ type: 'invalid', name: 'foo' }),
+    /invalid_enum_value/,
+  );
+});
+```
+
+**Error message quality (Zod-layer scenarios, apply where relevant):**
+
+For each scenario below that applies to this tool's schema, add a dedicated `it()` block asserting **both** that the error is thrown **and** that the message is actionable:
+
+| # | Scenario | Applies if tool has… | What to assert |
+|---|----------|---------------------|----------------|
+| 1 | **Wrong date format** | any `date` field | message contains `YYYY-MM-DD` and the received value |
+| 2 | **Unknown / disallowed field** | strict schema (no passthrough) | message contains `Unknown field` or lists allowed fields |
+| 4 | **Missing required field** | any required field | message names the missing field |
+| 5 | **Wrong type** | `amount`, `limit`, or numeric field | message contains `integer` or `cents` |
+| 6 | **Invalid enum value** | any `z.enum(...)` field | message lists allowed values |
+| 10 | **Value out of range** | `limit`, amount constraints | message contains `positive` or the valid range |
+
+Scenarios 3, 7, 8, 9 are caught at API response time; cover those in Step 5b instead.
+
+> If you add a **new** file under `tests/unit/` (rather than extending `generated_tools.smoke.test.js` or `schema_validation.test.js`), append `&& node tests/unit/<your_file>.test.js` to the `test:unit-js` script in `package.json`. That script is an explicit chain, not a glob, so an unregistered file never runs.
+
+Run with:
+```bash
+npm run test:unit-js
+```
+
+---
+
+### Step 5: Write manual integration tests
+
+Manual tests run against a **real, live Actual Budget instance** over HTTP. They live in `tests/manual/tests/`.
+
+> **Code quality reminder**: Before writing or editing any file under `tests/manual/`, read the **Technical Guidelines** section in [`tests/manual/README.md`](../../tests/manual/README.md). Key rules that are easy to miss:
+> - Hard limit of **400 lines per file** (evaluate a split before reaching 300)
+> - Each test file exports exactly **one primary function** `fooTests(client, context)`
+> - Always use `client.callTool()`; never call `fetch()` directly
+> - Wrap checks in `try/catch`; log `✓` / `❌` / `⚠` but only rethrow fatal errors
+> - Re-fetch and assert after every create/update (**read-back verification**)
+> - New entities must follow the `MCP-{Type}-{timestamp}` naming pattern so `cleanup` can find them
+> - Never add shared mutable state outside the `context` object
+
+Choose the right module based on the tool's domain:
+
+| Domain | File |
+|--------|------|
+| Server info, version, SQL, sessions | `sanity.js` or `advanced.js` |
+| Accounts | `account.js` |
+| Categories / Category Groups | `category.js` / `category-group.js` |
+| Payees | `payee.js` |
+| Rules | `rules.js` |
+| Transactions | `transaction.js` |
+| Budgets | `budget.js` |
+| Lookup helpers, bank sync, advanced queries | `advanced.js` |
+
+#### 5a. Positive test
+
+Call the tool with a **valid** input drawn from data already present in the budget (use `client.callTool()` on a known entity first to get its name/id).
+
+**Output-field assertions; "expected shape" means:**
+
+| Field type | Assert |
+|------------|--------|
+| `id` | non-empty string (UUID format preferred) |
+| `amount` | integer, not decimal (`Number.isInteger(res.amount)`) |
+| `date` | string matching `/^\d{4}-\d{2}-\d{2}$/` |
+| `name` | matches the value you supplied |
+| list result | `Array.isArray(res) && res.length >= 0` |
+| optional field supplied | field present in response with the value you set |
+| optional field omitted | field absent, `null`, or `undefined` |
+
+```javascript
+// Positive: resolve an account by its real name
+try {
+  const accts = await client.callTool("actual_accounts_list", {});
+  const first = Array.isArray(accts) && accts.length > 0 ? accts[0] : null;
+  if (first?.name) {
+    const res = await client.callTool("actual_example_tool", { type: 'accounts', name: first.name });
+    if (res?.id === first.id) {
+      console.log(`  ✓ example_tool [accounts]: "${first.name}" → ${res.id}`);
+    } else {
+      console.log(`  ❌ example_tool [accounts]: expected ${first.id}, got ${JSON.stringify(res).slice(0,120)}`);
+    }
+  } else {
+    console.log("  ℹ example_tool: no accounts found, skipped");
+  }
+} catch (err) {
+  console.log("  ❌ example_tool:", err.message);
+}
+```
+
+**Read-back verification (mandatory for create/update tools):**
+
+After any call that writes data, immediately call the corresponding `_get` or `_list` tool and assert the entity persists with the values you supplied. This catches tools that report success but do not actually write:
+
+```javascript
+// Read-back: verify the entity persisted with correct field values
+try {
+  const created = await client.callTool("actual_accounts_create", { name: accountName, type: 'checking' });
+  const accounts = await client.callTool("actual_accounts_list", {});
+  const found = accounts.find(a => a.id === created?.id);
+  if (found?.name === accountName && found?.type === 'checking') {
+    console.log(`  ✓ accounts_create [read-back]: persisted with correct name and type`);
+  } else {
+    console.log(`  ❌ accounts_create [read-back]: entity not found or fields wrong after create: ${JSON.stringify(found).slice(0,120)}`);
+  }
+} catch (err) {
+  console.log("  ❌ accounts_create [read-back]:", err.message);
+}
+```
+
+**Optional-input field coverage:**
+
+For each optional input that meaningfully changes the response (e.g. `note`, `cleared`, `category_id`): include one positive call with the field supplied and assert it appears in the result; include one positive call without it and assert the tool still succeeds and the field is absent or `null`.
+
+#### 5b. Negative test (mandatory for lookup/search tools)
+
+Call the tool with a **name or ID that is guaranteed not to exist**. Assert:
+1. The tool returns an error (not a crash)
+2. The error message (or response body) includes a list of **available** values, so the AI can self-correct
+
+**Error scenario coverage (API-layer scenarios, apply where relevant):**
+
+For each scenario below that applies to this tool's API behaviour, add a matching negative-path block:
+
+| # | Scenario | Applies if tool… | What to assert |
+|---|----------|-----------------|----------------|
+| 3 | **Invalid / non-existent ID** | accepts a UUID and looks it up | error contains `not found` AND names a list tool (e.g. `actual_accounts_list`) |
+| 7 | **Conflicting fields** | can close/delete/mutate state | error explains the conflict and suggests a remedy |
+| 8 | **Duplicate / already-exists** | creates a named entity | error mentions the existing entity's ID or suggests `_update` tool |
+| 9 | **Dependency not found** | accepts a foreign-key ID (e.g. `group_id`, `category_id`) | error names the missing dependency and a list tool |
+
+Scenarios 1, 2, 4, 5, 6, 10 are caught at Zod parse time; cover those in Step 4b instead.
+
+Use a sentinel name like `"__nonexistent_MCP_test_value__"` which can never collide with real data:
+
+```javascript
+// Negative: name that does not exist; response must include available list
+try {
+  const res = await client.callTool("actual_example_tool", {
+    type: 'accounts',
+    name: '__nonexistent_MCP_test_value__',
+  });
+  const text = JSON.stringify(res);
+  if (text.includes('not found') || text.includes('available') || res?.error) {
+    console.log(`  ✓ example_tool [negative]: correctly returned not-found (with context)`);
+  } else {
+    // Tool silently accepted bad input; record a GAP comment and log a warning
+    // GAP(error-messages): actual_example_tool with non-existent name silently returns [observed value]
+    console.log(`  ⚠ example_tool [negative]: accepted non-existent name without error: ${text.slice(0,200)}`);
+    console.log(`  // GAP(error-messages): actual_example_tool bad name accepted silently`);
+  }
+} catch (err) {
+  // If tool throws cleanly with a descriptive message, that also counts
+  if (err.message.includes('not found') || err.message.includes('available')) {
+    console.log(`  ✓ example_tool [negative]: threw with useful message`);
+  } else {
+    console.log(`  ❌ example_tool [negative]: error message not helpful: ${err.message}`);
+  }
+}
+```
+
+> **Design expectation**: Tools that look up by name (e.g., `actual_get_id_by_name`, `actual_categories_get`, `actual_payees_get`) should return a `not_found` response that lists available values. This allows an AI to immediately retry without needing a separate list call. Example response shape:
+> ```json
+> {
+>   "error": "No account named '__nonexistent_MCP_test_value__' found.",
+>   "available": ["Checking", "Savings", "Credit Card"]
+> }
+> ```
+
+#### 5c. Update `tests/manual/README.md`
+
+If you added a **new test module file**, add it to the "Directory Layout" table. If you added tests to an existing file, update its description comment.
+
+---
+
+### Step 6: Update the AI prompt test
+
+**Folder**: `tests/manual-prompt/` holds three sequentially-pasted prompt files.
+See [`tests/manual-prompt/README.md`](../../tests/manual-prompt/README.md) for usage.
+
+**Which file to edit** (based on domain):
+
+| Domain | File |
+|--------|------|
+| Server info, read-only lists, `actual_get_id_by_name` | `prompt-1-smoke.txt` (Phase 1) |
+| Accounts, Categories, Payees, Rules, Transactions, Schedules | `prompt-2-core.txt` (Phases 2 to 6b) |
+| Budgets, Summaries, Query, Session Management, Cleanup | `prompt-3-advanced.txt` (Phases 7 to 12) |
+
+1. **Find the correct phase** in the right prompt file (by domain; see table above)
+2. **Add a positive scenario** describing what the AI should call and what constitutes a pass
+3. **Add a negative scenario** explicitly instructing the AI to test not-found / invalid inputs:
+   ```
+   - actual_example_tool, test positive + negative:
+     * Positive: pick first account name from actual_accounts_list → call actual_example_tool
+       with type='accounts' and that name → verify returned id matches account id (✓ pass)
+     * Negative: call actual_example_tool with type='accounts' and
+       name='__nonexistent_MCP_test_value__' → verify response contains 'not found' or
+       an 'available' list (✓ pass); if response contains no error context → ✗ fail
+   ```
+4. **Update the phase header tool count** in the prompt file: `Phase N: Domain (X tools)` → `Phase N: Domain (X+1 tools)`
+5. **Update `tests/manual-prompt/README.md`** Phase Overview table: increment the count for the affected phase row and the Total row
+
+---
+
+### Step 7: Update documentation files
+
+#### Tool counts: batch update with `docs:sync`
+
+Run `npm run docs:sync` to update all `**Tool Count:**` markers across `README.md`, the top-level `docs/*.md` files (not nested ones), and `.github/copilot-instructions.md` in one pass. Do not edit these counts manually. A numeric marker anywhere else would never be updated, so `npm run docs:check` fails on one (#602).
+
+Then run `npm run tool-count -- --fix` to update the PROSE total-count literals that `docs:sync` does not touch: the "all N tools" phrasings, the Docker Hub short description (`docker/description/short.md`), `src/lib/constants.ts`, the `EXPECTED_TOOL_COUNT` defaults, and the test-doc totals. This script keys off `IMPLEMENTED_TOOLS` (the same canonical source as `verify-tools`), and rewrites only allowlisted TOTAL anchors, so it never corrupts a per-domain subset count like `### Categories (4 tools)`. `npm run tool-count` (check mode) is enforced in CI via `tests/unit/tool_count_sync.test.js`, so a stale total will fail the build; running `--fix` here keeps the build green.
+
+#### `docs/reference/tools.md`
+- Add a row for the new tool in its domain table (tool name, description, caveats), then run `npm run build && npm run docs:gen` to regenerate the README tools-summary block
+
+#### `docs/explanation/architecture.md`
+- Add the tool to the domain section table if the domain section lists tools explicitly
+
+#### Planned-work tracking (GitHub issues)
+- If this tool closes a planned-capability issue, reference it in the commit (`(#N)`) so the release step closes it. The roadmap file does not list tickets, so it needs no edit; a new issue goes into a phase by setting its milestone (see `docs/roadmap.md`).
+- Every issue should carry an **area** label and a **priority** label (`P0` to `P3`, plus `icebox` for not-yet-committed ideas). Apply the priority on triage so the backlog is filterable.
+
+#### `docs/development/testing-and-reliability.md`
+- If you added a new test module file to `tests/manual/tests/`, add it to the test-file table
+
+---
+
+### Step 8: Final validation
+
+Run the full pre-commit suite:
+
+```bash
+npm run build                    # Zero TypeScript errors
+npm run test:adapter             # Adapter smoke tests
+npm run test:unit-js             # Unit tests (includes schema_validation)
+npm run verify-tools             # All IMPLEMENTED_TOOLS resolve correctly
+npm audit --audit-level=moderate # No new vulnerabilities
+```
+
+Optional (requires Docker + real Actual Budget):
+```bash
+npm run test:integration:full    # Full live integration test suite
+npm run test:e2e                 # Playwright MCP protocol tests
+```
+
+---
+
+### Step 9: Commit
+
+```bash
+git add .
+git commit -m "feat(tools): add actual_<tool_name>
+
+- <one-line description of what the tool does>
+- Adapter method: adapter.<methodName>()
+- Tests: unit smoke + negative path in tests/unit/
+- Manual tests: positive + negative in tests/manual/tests/<module>.js
+- Prompt: tests/manual-prompt/prompt-{1|2|3}-*.txt Phase N updated + README total updated
+- Docs: docs/reference/tools.md row added; docs:sync run
+- Total tools: N → N+1 (XX% API coverage)"
+```
+
+---
+
+## 🔴 Negative Test Reference
+
+The table below summarises the negative test patterns for existing tools that already implemented **available list** responses. Use these as reference when implementing the same pattern for new lookup/search tools.
+
+| Tool | Not-Found Response Pattern |
+|------|---------------------------|
+| `actual_get_id_by_name` | `{ error: "No <type> named '<name>' found.", available: ["Name1", "Name2", ...] }` |
+| `actual_accounts_get_balance` | ⚠ **GAP**: silently returns `{ balance: 0 }` for any non-existent id (expected: not-found error) |
+| `actual_query_run` | `{ error: "Unknown field '<field>'" }` with field suggestions |
+
+When implementing a new lookup tool, the `call` function should:
+1. Try to find the entity by name/id
+2. If not found, fetch the full list
+3. Return `{ error: "Not found", available: list.map(e => e.name) }`; **never** just `null` or an empty object
+
+---
+
+## Compact flow
+
+The default surface is `compact`: 15 tools over 85 operations (the prose says "15 tools over 85 operations"; the anchored literals stay 85, #680 R6, so `npm run tool-count -- --fix` leaves no diff). Design record: [../explanation/compact-tool-surface.md](../explanation/compact-tool-surface.md). Steps 1 to 9 above still apply to the legacy tool; the compact layer adds the following. The prompt files in `tests/manual-prompt/` name compact tools and selector values, not `actual_*` names, so read Step 6 with that substitution.
+
+### (a) A new operation on an existing compact tool
+
+1. Add the legacy tool as today: `src/tools/<name>.ts` with `createTool()`, the export in `src/tools/index.ts`, `IMPLEMENTED_TOOLS`, and `src/lib/toolsets.ts` (`TOOLSETS`, plus `WRITE_CAPABLE` if it writes). It stays registered, hidden under `compact`, until #682.
+2. Add an action row or route with its `legacy` mapping in `src/compact/tools/<tool>.ts`, and list the action in that tool's description.
+3. Run `node tests/unit/compact_mapping_parity.test.js`; it must be green.
+4. Add a compact E2E row to `tests/e2e/docker-all-tools.e2e.spec.ts` with its negative, a call in a `tests/manual/tests/*.js` module, and a prompt scenario naming the tool and its selector value on one line (for example `manage_tags, action: "create"`). The completeness guard (`tests/unit/new_tool_completeness.test.js`) enforces all three.
+5. If `tests/unit/tools_list_size_budget.test.js` fails, raise `COMPACT_TOTAL_CEILING` by the measured growth, with a comment saying why.
+6. Update `docs/reference/tools.md`, run `npm run build && npm run docs:gen`, run `npm run tool-count`, and update the mapping table in section 7 of the design record.
+
+### (b) A new compact tool
+
+Forbidden unless another compact tool is merged or retired in the same change (decision 3, the 15-tool ceiling; a 16th tool would cost the Glama Tool Count score). When it is allowed, also touch `src/compact/registry.ts`, add a title in `src/lib/tool-titles.ts`, and update section 8 of the design record.
+
+---
+
+## 📎 Files to Touch: Summary Table
+
+| File | What to change |
+|------|---------------|
+| `src/tools/<domain>_<action>.ts` | **Create** the tool definition + Zod schema |
+| `src/tools/index.ts` | **Add** export line |
+| `src/actualToolsManager.ts` | **Add** tool name to `IMPLEMENTED_TOOLS` |
+| `src/lib/toolsets.ts` | **Add** the tool to exactly one `TOOLSETS` array (and `WRITE_CAPABLE` if it writes), then run `npm run build && npm run docs:gen` (#603) |
+| `src/lib/actual-adapter.ts` | **Add** adapter method if new API call needed |
+| `tests/unit/generated_tools.smoke.test.js` | **Add** stub response to `stubResponses` map (if new adapter method); add input example; add to `resultWrappers[]`, `successTools[]`, or custom `if (n === '...')` shape assertion |
+| `tests/unit/schema_validation.test.js` | **Add** negative schema tests for complex schemas |
+| `tests/e2e/docker-all-tools.e2e.spec.ts` | **Add** happy-path call for the new tool (the only E2E file that runs) |
+| `tests/manual/tests/sanity.js` | **Update** `EXPECTED_TOOL_COUNT` default (the only exact-count gate) |
+| `tests/e2e/docker-all-tools.e2e.spec.ts` | **Update** the `describe(...)` block-name count label (cosmetic) |
+| `tests/manual/tests/<module>.js` | **Add** positive + negative test block |
+| `tests/manual/README.md` | **Update** module table if new file added |
+| `tests/manual-prompt/prompt-{1\|2\|3}-*.txt` | **Add** tool to the correct phase; update phase count |
+| `tests/manual-prompt/README.md` | **Update** Phase Overview table total |
+| `docs/reference/tools.md` | **Add** tool table row in its domain section, then run `npm run build && npm run docs:gen` |
+| `docs/explanation/architecture.md` | **Update** domain table if applicable |
+| `docs/development/testing-and-reliability.md` | **Update** if new test module added |
+| `README.md`, `docs/*.md`, `.github/copilot-instructions.md` | **Run** `npm run docs:sync` to batch-update all **Tool Count:** markers (docker/description/* carry no marker; update by hand) |

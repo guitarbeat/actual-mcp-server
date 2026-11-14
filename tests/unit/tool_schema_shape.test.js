@@ -38,10 +38,18 @@ process.env.ACTUAL_PASSWORD       = process.env.ACTUAL_PASSWORD       ?? 'stub-p
 const ALLOWLIST = new Set([
   'actual_rules_create.actions.items.value',
   'actual_rules_create.actions.items.options',
+  'actual_rules_create_batch.rules.items.actions.items.value',
+  'actual_rules_create_batch.rules.items.actions.items.options',
   'actual_rules_create_or_update.actions.items.value',
   'actual_rules_create_or_update.actions.items.options',
   'actual_rules_update.fields.actions.items.value',
   'actual_rules_update.fields.actions.items.options',
+  // #676: compact manage_transactions update_batch. `fields` is `z.looseObject({})` with no named
+  // properties (the legacy FieldsSchema validates the real keys downstream, and the compact
+  // description points at the update action's field list), so it publishes a pure open object
+  // `{ type: 'object', additionalProperties: {} }`. A client can still construct it: it is a
+  // plain map of Actual transaction fields.
+  'manage_transactions.updates.items.fields.additionalProperties',
 ]);
 
 let failures = 0;
@@ -223,8 +231,14 @@ function findShapeless(toolName, published) {
   // ── The guard: every published tool schema must be fully shaped (modulo the allowlist) ──
   console.log('\n[#224] every tool publishes a fully-shaped input schema');
   const mod = await import('../../dist/src/tools/index.js');
-  const tools = Object.values(mod).filter((t) => t && t.name && t.inputSchema);
-  ok(tools.length > 0, `collected ${tools.length} tools with an inputSchema`);
+  const legacyTools = Object.values(mod).filter((t) => t && t.name && t.inputSchema);
+  ok(legacyTools.length > 0, `collected ${legacyTools.length} tools with an inputSchema`);
+  // #676: the compact registry is a second source of published input schemas.
+  const { COMPACT_TOOLS } = await import('../../dist/src/compact/registry.js');
+  const { buildCompactTool } = await import('../../dist/src/compact/dispatch.js');
+  const compactTools = COMPACT_TOOLS.map((spec) => buildCompactTool(spec, { callOperation: async () => undefined }));
+  ok(compactTools.length > 0, `collected ${compactTools.length} compact tools with an inputSchema`);
+  const tools = [...legacyTools, ...compactTools];
 
   const offending = [];
   for (const tool of tools) {
@@ -254,6 +268,12 @@ function findShapeless(toolName, published) {
       'the RecurConfig branch is typed (frequency/endMode present), not an open {}', JSON.stringify(recur));
     ok(recur && recur.additionalProperties !== true && !(recur.additionalProperties && Object.keys(recur.additionalProperties).length === 0 && !recur.properties),
       'the RecurConfig branch is not a shapeless open object');
+    // #478: patterns published, endMode optional, and the object closed (it used to strip
+    // unknown keys, which silently dropped patterns).
+    ok(recur && recur.properties && recur.properties.patterns && recur.properties.patterns.type === 'array',
+      'the RecurConfig branch publishes patterns (#478)', JSON.stringify(recur && recur.properties));
+    ok(recur && !(recur.required || []).includes('endMode'), 'endMode is not required (#478)', JSON.stringify(recur && recur.required));
+    ok(recur && recur.additionalProperties === false, 'the RecurConfig branch is closed: additionalProperties false (#478)');
   }
 
   console.log('');

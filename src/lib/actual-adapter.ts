@@ -43,8 +43,8 @@ const {
   updateCategoryGroup: rawUpdateCategoryGroup,
   deleteCategoryGroup: rawDeleteCategoryGroup,
   mergePayees: rawMergePayees,
+  mergeTransactions: rawMergeTransactions,
   getPayeeRules: rawGetPayeeRules,
-  batchBudgetUpdates: rawBatchBudgetUpdates,
   holdBudgetForNextMonth: rawHoldBudgetForNextMonth,
   resetBudgetHold: rawResetBudgetHold,
   runQuery: rawRunQuery,
@@ -53,6 +53,7 @@ const {
   getIDByName: rawGetIDByName,
   getServerVersion: rawGetServerVersion,
   getSchedules: rawGetSchedules,
+  getScheduleDates: rawGetScheduleDates,
   createSchedule: rawCreateSchedule,
   updateSchedule: rawUpdateSchedule,
   deleteSchedule: rawDeleteSchedule,
@@ -76,17 +77,18 @@ import observability from '../observability.js';
 import { retry, isRetryableError, isRateLimitError } from './retry.js';
 import { withOpTimeout } from './opTimeout.js';
 import { markInitFailure } from './init-failure.js';
-import { NotFoundRefusal, OutOfRangeRefusal, constraintErrorMsg } from './errors.js';
+import { NotFoundRefusal, OutOfRangeRefusal, constraintErrorMsg, errorLogFields, isPreflightRefusal } from './errors.js';
+import { amountOpMismatch } from './schemas/schedule-amount.js';
 import { findMatchingRule, type RuleCondition } from './rule-matching.js';
-import { initializeActualApi } from './actual-init-config.js';
 import logger from '../logger.js';
 import { checkServerVersionOnce } from './server-version-guard.js';
 import config from '../config.js';
-import { parseBudgetRegistry, type BudgetConfig } from './budget-registry.js';
+import { formatBudgetRegistrySummary, logSafeOrigin, parseBudgetRegistry, summarizeBudgetRegistry, type BudgetConfig, type BudgetRegistrySummary } from './budget-registry.js';
 import { getPreferredBudgetSyncId, setPreferredBudgetSyncId, pickAllowedPreferredBudget } from './budget-preference-store.js';
 import { requestContext } from './requestContext.js';
 import { connectionPool } from './ActualConnectionPool.js';
-import { isApiInitialized, setApiInitialized, getLoadedBudgetSyncId, awaitAbandonedBudgetLoad, hasPendingBudgetLoad } from './apiState.js';
+import { isApiInitialized, setApiInitialized, getLoadedBudgetSyncId, awaitAbandonedBudgetLoad, hasPendingBudgetLoad, isApiLoggedInTo, setLoginsSpanServers } from './apiState.js';
+import { initApiLoggedIn } from './apiLogin.js';
 import { withApiLock } from './apiLock.js';
 import { loadBudgetTracked, importBudgetTracked } from './budgetLoader.js';
 
@@ -101,10 +103,17 @@ const budgetRegistry = parseBudgetRegistry(process.env, {
   encryptionPassword: config.ACTUAL_BUDGET_PASSWORD,
 });
 
-logger.info(
-  `[ADAPTER] Budget registry: ${budgetRegistry.size} budget(s) — ` +
-  [...budgetRegistry.values()].map(b => `"${b.name}" (${b.serverUrl})`).join(', '),
+setLoginsSpanServers(
+  new Set([...budgetRegistry.values()].map((b) => JSON.stringify([b.serverUrl, b.password || '']))).size > 1,
 );
+
+// #621: counts and schemes only; budget names and server hosts stay out of the startup log.
+logger.info(`[ADAPTER] ${formatBudgetRegistrySummary(budgetRegistry)}`);
+
+/** #623: the registry's counts and schemes for the startup record. Reads config only, never Actual. */
+export function getBudgetRegistrySummary(): BudgetRegistrySummary {
+  return summarizeBudgetRegistry(budgetRegistry);
+}
 
 /**
  * Per-session active budget. Map from sessionId to lowercased budget key
@@ -120,11 +129,40 @@ logger.info(
  * stdio mode, startup health checks) fall back to the env-default budget
  * (first entry in budgetRegistry).
  *
- * Lifecycle: entries are removed on session close via session_close.ts and
- * implicitly when connectionPool.shutdownConnection runs (switchBudget calls
- * it to drop the stale pool entry bound to the previous syncId).
+ * Lifecycle (#564): entries are released on EVERY session end. The HTTP
+ * transport's teardownSession (idle eviction, the #530 orphan sweep, a client
+ * DELETE) calls clearSessionBudgetState, and actual_session_close does too (it
+ * also covers stdio). connectionPool.shutdownConnection does NOT release them:
+ * switchBudget calls it to drop the stale pool entry and must keep the selection.
+ *
+ * Every write goes through setSessionBudget, which skips a session the transport
+ * layer no longer holds, so a switch or a #189 restore that was in flight across
+ * the teardown cannot re-create the entry after it was released.
  */
 const sessionBudgetState = new Map<string, string>();
+
+/**
+ * #564: is this session still held by its transport? The HTTP server registers
+ * `transports.has`; the default (stdio, unit tests, scripts) treats every session
+ * as live, which is the behaviour before #564.
+ */
+let isSessionLive: (sessionId: string) => boolean = () => true;
+
+/** #563: why a queued write whose session ended before it ran was refused. */
+const SESSION_ENDED_BEFORE_WRITE =
+  'The session ended before this write ran, so it was not applied. Start a new session and retry.';
+
+export function setSessionLivenessCheck(check: (sessionId: string) => boolean): void {
+  isSessionLive = check;
+}
+
+function setSessionBudget(sessionId: string, key: string): void {
+  if (!isSessionLive(sessionId)) {
+    logger.debug(`[ADAPTER] Session ${sessionId} ended before its budget selection was committed; not recording it`);
+    return;
+  }
+  sessionBudgetState.set(sessionId, key);
+}
 
 function getActiveBudgetConfig(): BudgetConfig {
   // _resolveSessionId is declared below; function declarations hoist so this
@@ -150,11 +188,46 @@ function getActiveBudgetConfig(): BudgetConfig {
       [...budgetRegistry.values()],
     );
     if (restored) {
-      sessionBudgetState.set(sessionId, restored.name.toLowerCase());
+      setSessionBudget(sessionId, restored.name.toLowerCase());
       return restored;
     }
   }
-  return [...budgetRegistry.values()][0];
+  // #572: a restricted caller with no selection and no restorable preference starts
+  // on its FIRST PERMITTED budget in registry order (the order the operator controls
+  // and every listing shows; the allow-list is a set), instead of the default it may
+  // not use. Keyed on the list, not the auth mode, so OIDC restricted principals get
+  // it too: before #572 one whose list excluded the default got "Budget ACL:" on every
+  // call until it switched. With no restricting list, or nothing in the registry
+  // permitted, this is the default as before, and _enforceBudgetAcl then refuses.
+  // Not memoised: a later switch writes the session slot, and the next call
+  // recomputes the same answer from the same list.
+  const values = [...budgetRegistry.values()];
+  const restricting = restrictingAllowList(store?.allowedBudgets);
+  if (restricting) {
+    const permitted = values.find((b) => restricting.includes(b.syncId));
+    if (permitted) return permitted;
+  }
+  return values[0];
+}
+
+/**
+ * #571: the budget a NEW session should open on, resolved before its session id is live.
+ *
+ * httpServer opens the pool connection from `onsessioninitialized`, which runs inside the
+ * initialize request's context: principal and ACL are there, the session id is not yet. Without
+ * the id, getActiveBudgetConfig cannot restore the #189 preference, so the connection logged in
+ * to the DEFAULT server and downloaded the default budget even when the session's budget lives
+ * on another server, and the session's first call then asked the default server for it.
+ *
+ * Runs getActiveBudgetConfig with the id added to the CURRENT context, so the ACL and principal
+ * of the initialize request still decide. Its memoisation goes through setSessionBudget, which
+ * the isSessionLive guard keeps from recording a session that already ended.
+ *
+ * Shape credit: @jospaquim (PR #569).
+ */
+export function initialBudgetForSession(sessionId: string): BudgetConfig {
+  const store = requestContext.getStore() ?? {};
+  return requestContext.run({ ...store, sessionId }, () => getActiveBudgetConfig());
 }
 
 /**
@@ -225,7 +298,10 @@ async function ensureLoadedBudgetMatchesSession(): Promise<void> {
 
   const wanted = getActiveBudgetConfig();
   const loaded = getLoadedBudgetSyncId();
-  if (loaded === wanted.syncId) return;
+  // #571: the sync id alone is not a match. The same sync id can exist on two servers (a budget
+  // copied between them), and a match against the wrong server would run this session's
+  // operation on the other server's copy.
+  if (loaded === wanted.syncId && isApiLoggedInTo(loginOf(wanted))) return;
 
   // Deliberately a WARN: reaching here means two sessions are on different budgets and this
   // one would otherwise have operated on the other's data.
@@ -239,7 +315,11 @@ async function ensureLoadedBudgetMatchesSession(): Promise<void> {
   // per operation, a drain can now change budgets MID-BATCH, and the single trailing api.sync()
   // covers only the last one. Without this, an earlier session's write is applied locally and
   // silently waits for the next load of that budget to propagate, which an ephemeral data dir
-  // would lose entirely.
+  // would lose entirely. Runs on a cross-login re-selection too, while the old login is still
+  // current: initApiLoggedIn's close deliberately does not sync (see there for the out-of-sync
+  // failure a syncing close caused at session open), so this is the only sync the outgoing budget
+  // gets. It is still a sync of a copy that may be stale if another process wrote the data dir:
+  // #575 tracks that hazard, which every sync here and after writes shares.
   if (loaded) {
     try {
       await withOpTimeout(() => (api as unknown as { sync: () => Promise<unknown> }).sync(), 'sync');
@@ -251,7 +331,47 @@ async function ensureLoadedBudgetMatchesSession(): Promise<void> {
     }
   }
 
-  await loadBudgetTracked(wanted.syncId, wanted.encryptionPassword);
+  await loadBudgetOnItsServer(wanted);
+}
+
+function loginOf(budget: BudgetConfig): { serverUrl: string; password: string } {
+  return { serverUrl: budget.serverUrl, password: budget.password || '' };
+}
+
+/**
+ * #571: load a budget over a login to the server that HOLDS it. MUST be called inside the api lock.
+ *
+ * Every re-selection over a live singleton goes through here (the #390 precondition, which the
+ * kept-alive stdio singleton of #419 reaches too, and switchBudget's same-auth fast path). Both
+ * used to download over whatever login the singleton already had, which is right on a single
+ * server and wrong as soon as another session has logged the singleton in to a different one:
+ * reproduced live as a session on server X failing every call with "Budget not found" for as
+ * long as a session on server Y was active.
+ *
+ * Same server: no new login, so the #127 auth burst #134 removed does not come back.
+ *
+ * Different or unknown server: log in to the budget's own server with the budget's own password
+ * through initApiLoggedIn, which first clears the records and closes the outgoing budget WITHOUT
+ * syncing it, then download. The #390 precondition syncs the outgoing budget before calling here;
+ * switchBudget's same-auth fast path does not, so a pending change there syncs at that budget's
+ * next load.
+ *
+ * Failure: initApiLoggedIn clears the loaded-budget and login records before anything else, so
+ * any failure leaves both unknown, the next operation of ANY session re-selects, and the error
+ * reaches the caller as an ordinary tool error. The live flag is deliberately NOT cleared:
+ * clearing it would send every session through the legacy per-operation init (the #127 burst)
+ * until a new session happened to open, while the cleared records already force the one re-login
+ * that recovery needs.
+ *
+ * Never takes the api lock itself: the lock is not reentrant and every caller already holds it.
+ */
+async function loadBudgetOnItsServer(budget: BudgetConfig): Promise<void> {
+  const login = loginOf(budget);
+  if (!isApiLoggedInTo(login)) {
+    logger.info(`[ADAPTER] logging the api in to ${logSafeOrigin(budget.serverUrl)} before loading "${budget.name}"`);
+    await withAuthRetry(() => initApiLoggedIn(config.MCP_BRIDGE_DATA_DIR, login, 'init'));
+  }
+  await loadBudgetTracked(budget.syncId, budget.encryptionPassword);
 }
 
 
@@ -399,6 +519,46 @@ function _shouldDropPoolOnError(err: unknown): boolean {
 }
 
 /**
+ * The ONE rule for batch paths that catch per item (updateTransactionBatch, createRulesBatch,
+ * setBudgetBatch). INFRASTRUCTURE ERRORS STOP THE BATCH: when `_shouldDropPoolOnError` matches,
+ * this throws and the remaining items are never sent; otherwise it returns and the caller
+ * records the per-item failure and continues. Rate limits are not pool-drop errors, so they
+ * stay per item.
+ *
+ * The original error text is kept inside the message so `isRetryableError` (message-only) still
+ * classifies the wrapper, and `{ cause }` keeps the original error. The throw surfaces as a
+ * whole-call failure out of queueWriteOperation, which on the LEGACY path sets
+ * drainForceFullShutdown (full teardown). On the POOLED path the entry is dropped only if the
+ * drain's following `api.sync()` also fails with a pool-drop error. The trailing sync still runs
+ * on both paths and pushes the applied items, which is why the message tells the caller to read
+ * back instead of claiming a committed state.
+ *
+ * Per item this is realistically reached only by `out of memory` / `ENOMEM`: the raw update
+ * calls are LOCAL writes and the upstream sync is debounced, so a network error surfaces at the
+ * trailing sync rather than here (#521 premise). Do not re-litigate that; the guard is a
+ * defensive consistency rule shared by all three batch paths.
+ */
+function abortBatchOnInfrastructureError(
+  error: unknown,
+  ctx: {
+    label: string; // 'Transaction' | 'Rules' | 'Budget'
+    appliedCount: number;
+    total: number; // the caller's whole batch size
+    applied: string; // comma-joined ids or indices already applied ('' renders as 'none')
+    extra?: string; // appended inside the parentheses after '; '
+    message: string; // the original error text
+    readBackTool: string;
+  },
+): void {
+  if (!_shouldDropPoolOnError(error)) return;
+  throw new Error(
+    `${ctx.label} batch aborted after ${ctx.appliedCount} of ${ctx.total} items (applied: ${ctx.applied || 'none'}${ctx.extra ? '; ' + ctx.extra : ''}): ${ctx.message}. ` +
+      `Read back with ${ctx.readBackTool} before retrying.`,
+    { cause: error },
+  );
+}
+
+/**
  * Enforce per-request budget ACL before any pool branching or lock acquisition.
  *
  * Issue #156: the documented isolation model (CF-5 OIDC + AUTH_BUDGET_ACL)
@@ -419,37 +579,20 @@ function _shouldDropPoolOnError(err: unknown): boolean {
  * Claude Desktop / Claude Code compatibility.
  */
 function _enforceBudgetAcl(toolName?: string): void {
-  const store = requestContext.getStore();
-  const sessionId = store?.sessionId;
-  const allowedBudgets = store?.allowedBudgets;
+  const sessionId = requestContext.getStore()?.sessionId;
 
   // Trusted-local short-circuit. stdio and startup health checks run with no
-  // sessionId; in non-OIDC modes those are by-construction trusted (single
-  // user, local process). The ACL only applies when an authenticated multi-
-  // user context is in play (AUTH_PROVIDER === 'oidc').
-  if (!sessionId && config.AUTH_PROVIDER !== 'oidc') {
+  // sessionId AND no allow-list; in non-OIDC modes those are by-construction
+  // trusted (single user, local process). #572: a context that CARRIES a list is
+  // always checked, session or not (the HTTP initialize context has a static
+  // principal's list and no session id yet), so the skip is narrowed to contexts
+  // with no list.
+  if (!sessionId && config.AUTH_PROVIDER !== 'oidc' && !requestContext.getStore()?.allowedBudgets) {
     return;
   }
 
-  // OIDC + no allowedBudgets in context: the request slipped past the
-  // middleware. Defence-in-depth: refuse rather than fail open.
-  if (config.AUTH_PROVIDER === 'oidc' && !allowedBudgets) {
-    logger.warn(
-      JSON.stringify({
-        event: 'acl_denied',
-        reason: 'no_allowed_budgets_in_context',
-        sessionId: sessionId ?? null,
-        tool: toolName ?? null,
-      }),
-    );
-    throw new Error(
-      'Budget ACL: no allowedBudgets in request context. ' +
-        'This request bypassed the budget-acl middleware. Refusing for safety. See #156.',
-    );
-  }
-
-  // No restriction.
-  if (!allowedBudgets || allowedBudgets.includes('*')) return;
+  const allowedBudgets = restrictedAllowedBudgets(toolName);
+  if (!allowedBudgets) return;
 
   const target = getActiveBudgetConfig();
   if (!allowedBudgets.includes(target.syncId)) {
@@ -463,10 +606,65 @@ function _enforceBudgetAcl(toolName?: string): void {
         tool: toolName ?? null,
       }),
     );
+    // #570: the name and syncId stay in the log above, never in the caller-facing
+    // text. With no selection the active budget is the registry's first entry, so
+    // naming it told a principal allowed only another budget what the default was.
     throw new Error(
-      `Budget ACL: budget "${target.name}" (${target.syncId}) is not in this session's allowedBudgets.`,
+      "Budget ACL: the active budget is not in this session's allowedBudgets. " +
+        'Call actual_budgets_list_available and switch to a permitted budget.',
     );
   }
+}
+
+/**
+ * The request's budget allow-list when the caller is RESTRICTED, else `undefined` (#570).
+ *
+ * Shared by `_enforceBudgetAcl` (the active budget) and the paths that check nothing
+ * about the active budget: the two listings, the import and the switch's not-found
+ * list. One decision, so the two kinds of check cannot drift apart.
+ *
+ *   - `AUTH_PROVIDER=oidc` with no `allowedBudgets` in context: the request slipped
+ *     past the middleware, so throw (fail closed), with an `acl_denied` warn.
+ *   - a list containing `"*"`, or no list outside OIDC (bearer, no-auth, stdio, CLI,
+ *     startup): unrestricted.
+ *   - otherwise: the list.
+ *
+ * Keyed on the request's allow-list, not on AUTH_PROVIDER, so any auth mode that
+ * attaches a list is restricted by it.
+ */
+function restrictedAllowedBudgets(toolName?: string): string[] | undefined {
+  const store = requestContext.getStore();
+  const allowedBudgets = store?.allowedBudgets;
+
+  if (config.AUTH_PROVIDER === 'oidc' && !allowedBudgets) {
+    logger.warn(
+      JSON.stringify({
+        event: 'acl_denied',
+        reason: 'no_allowed_budgets_in_context',
+        sessionId: store?.sessionId ?? null,
+        tool: toolName ?? null,
+      }),
+    );
+    throw new Error(
+      'Budget ACL: no allowedBudgets in request context. ' +
+        'This request bypassed the budget-acl middleware. Refusing for safety. See #156.',
+    );
+  }
+
+  return restrictingAllowList(allowedBudgets);
+}
+
+/**
+ * #572: THE allow-list predicate: the list when it restricts, else `undefined`.
+ * A missing list and a list containing `"*"` do not restrict. An EMPTY list does:
+ * it is the deny state (budget-acl.ts gives [] to a principal with no access), so it
+ * restricts to nothing. Used by restrictedAllowedBudgets, switchBudget, the
+ * _enforceBudgetAcl skip and the getActiveBudgetConfig fallback, so they cannot
+ * disagree about who is restricted.
+ */
+function restrictingAllowList(allowedBudgets: string[] | undefined): string[] | undefined {
+  if (!allowedBudgets || allowedBudgets.includes('*')) return undefined;
+  return allowedBudgets;
 }
 
 /**
@@ -769,7 +967,7 @@ async function initActualApiForOperation(): Promise<void> {
     const budget = getActiveBudgetConfig();
     const DATA_DIR = config.MCP_BRIDGE_DATA_DIR;
 
-    logger.debug(`[ADAPTER] Initializing Actual API for operation (budget: "${budget.name}", server: ${budget.serverUrl})`);
+    logger.debug(`[ADAPTER] Initializing Actual API for operation (budget: "${budget.name}", server: ${logSafeOrigin(budget.serverUrl)})`);
 
     // Wrap api.init in auth-rate-limit retry so a transient too-many-requests
     // doesn't surface to the caller (and doesn't trigger #132's crash path).
@@ -778,10 +976,7 @@ async function initActualApiForOperation(): Promise<void> {
     // withAuthRetry does not retry it. Wrapping per-attempt (not the whole retry
     // loop) means legitimate #127 auth-rate-limit backoff (up to ~25s) is not
     // counted against ACTUAL_OP_TIMEOUT_MS.
-    await withAuthRetry(() => withOpTimeout(
-      () => initializeActualApi(DATA_DIR, budget.serverUrl, budget.password),
-      'init',
-    ));
+    await withAuthRetry(() => initApiLoggedIn(DATA_DIR, loginOf(budget), 'init'));
 
     logger.debug('[ADAPTER] Downloading budget');
 
@@ -868,7 +1063,7 @@ async function shutdownActualApi(opts?: { forceFullShutdown?: boolean }): Promis
   }
 }
 
-import { BANK_SYNC_SETTLE_MS, WRITE_SESSION_DELAY_MS } from './constants.js';
+import { SCHEDULE_DATES_CAP, SPLIT_VERIFY_INTERVAL_MS, SPLIT_VERIFY_TIMEOUT_MS, WRITE_SESSION_DELAY_MS } from './constants.js';
 
 // Concurrency limiter extracted to ./actual-adapter/concurrency.ts (#166).
 // Imported for internal use (every method wraps its raw call in withConcurrency)
@@ -1300,6 +1495,17 @@ async function processWriteQueue() {
             ));
             continue;
           }
+          // #563: the session ended (a client DELETE, an eviction) after this write was queued.
+          // Teardown released its budget selection (#564), so its store would now resolve to the
+          // default budget, one the session never chose and its principal may not be allowed.
+          // Refuse instead. Outside the try on purpose, like the fail-fast above: the write never
+          // ran, so it must not reach the pool-drop classification. A plain Error, not a typed
+          // refusal: those mean the caller's input was wrong, and this one is not (gate round 2,
+          // tool-author lens). The check is repeated just before the operation runs, below.
+          if (entry.sessionId && !isSessionLive(entry.sessionId)) {
+            reject(new Error(SESSION_ENDED_BEFORE_WRITE));
+            continue;
+          }
           try {
             // #390 round 2: run each op in the context it was ENQUEUED in.
             //
@@ -1344,6 +1550,17 @@ async function processWriteQueue() {
                 throw waitErr;
               }
               await ensureLoadedBudgetMatchesSession();
+              // #563 round 3: the check above ran before the awaits in this block. Holding the
+              // api lock does not hold teardown off: with the pool disabled nothing in teardown
+              // takes the lock, so the session can end (and its budget selection be released)
+              // while this op waits on an abandoned load, and the precondition would then have
+              // loaded the default budget. Re-check last, immediately before the write, with nothing
+              // awaited in between. Accepted: a session that ended during the wait may cost one
+              // wasted default-budget load, which is harmless because the write is still refused.
+              // The error matches no pool-drop pattern, so the catch below only logs and rejects it.
+              if (entry.sessionId && !isSessionLive(entry.sessionId)) {
+                throw new Error(SESSION_ENDED_BEFORE_WRITE);
+              }
               // #407: an operation may carry its OWN bound. Only a budget import does today, and
               // it needs one: the import is legitimately long, and bounding it at the general
               // operation timeout abandons it while every other session is already waiting on it
@@ -1360,7 +1577,9 @@ async function processWriteQueue() {
             });
             resolve(result);
           } catch (error) {
-            logger.error('[WRITE QUEUE] Operation failed:', error);
+            // Class and log-safe text only (#559): a refusal names the id the caller sent
+            // (which can be a name, #388), and upstream text can quote the written values.
+            logger.error('[WRITE QUEUE] Operation failed', errorLogFields(error));
             // #419: remember an infrastructure-level failure so the batch-end
             // shutdown self-heals (see drainForceFullShutdown above).
             if (_shouldDropPoolOnError(error)) drainForceFullShutdown = true;
@@ -1600,6 +1819,17 @@ function queueWriteOperation<T>(
     writeQueue.push(entry);
     scheduleWriteQueueDrain();
   });
+}
+
+/**
+ * #632: resolve once no write is queued or draining. The shutdown path awaits this before it
+ * closes sessions, so a write still inside its WRITE_SESSION_DELAY_MS window is sent rather than
+ * cut by the exit. Unbounded on purpose: the caller's shutdown deadline is the bound.
+ */
+export async function awaitWritesIdle(pollMs = 25): Promise<void> {
+  while (writeQueue.length > 0 || isProcessingWrites) {
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
 }
 
 /** #278 test hook: batches dispatched by processWriteQueue. Pins the coalescing property. */
@@ -1870,7 +2100,8 @@ export async function createCategory(category: components['schemas']['Category']
       const raw = await withConcurrency(() => retry(() => rawCreateCategory(category) as Promise<string | { id?: string }>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
       return normalizeToId(raw);
     } catch (error) {
-      logger.error('[CREATE CATEGORY] Error creating category:', error);
+      // Upstream's message quotes the category name (#559), so the log gets the class only.
+      logger.error('[CREATE CATEGORY] Error creating category', errorLogFields(error));
       // Re-throw the error with proper context
       if (error instanceof Error) {
         throw error;
@@ -1885,6 +2116,118 @@ export async function getPayees(): Promise<components['schemas']['Payee'][]> {
   return withActualApi(async () => {
     observability.incrementToolCall('actual.payees.get').catch(() => {});
     return await withConcurrency(() => retry(() => rawGetPayees() as Promise<components['schemas']['Payee'][]>, { retries: 2, backoffMs: 200 }));
+  });
+}
+
+export interface ContextOptions {
+  includeAccounts?: boolean;
+  includeCategories?: boolean;
+  includePayees?: boolean;
+  includeClosed?: boolean;
+  payeeLimit?: number;
+}
+
+/**
+ * A section that was not requested is ABSENT rather than an empty list, so "not asked" cannot be
+ * read as "empty budget". `payeesTruncated` and `payeeTotal` are present exactly when payees were
+ * requested; `hint` only when the payee list was cut. Upstream entity fields keep upstream spelling.
+ */
+export interface ContextResult {
+  accounts?: Array<{ id: string; name: string; offbudget: boolean; closed: boolean }>;
+  categoryGroups?: Array<{
+    id: string;
+    name: string;
+    is_income: boolean;
+    hidden: boolean;
+    categories: Array<{ id: string; name: string; hidden: boolean }>;
+  }>;
+  payees?: Array<{ id: string; name: string; transfer_acct: string | null }>;
+  payeesTruncated?: boolean;
+  payeeTotal?: number;
+  hint?: string;
+}
+
+/**
+ * #484: accounts, category groups and payees in ONE withActualApi session, so one api lock cycle
+ * and one consistent snapshot. The reads are raw and sequential: an `adapter.get*` call here would
+ * nest a session inside this one and deadlock until ACTUAL_OP_TIMEOUT_MS, and Promise.all would buy
+ * nothing because every call serialises on the one api singleton anyway.
+ */
+export async function getContext(options?: ContextOptions): Promise<ContextResult> {
+  return withActualApi(async () => {
+    observability.incrementToolCall('actual.context.get').catch(() => {});
+    const includeAccounts = options?.includeAccounts ?? true;
+    const includeCategories = options?.includeCategories ?? true;
+    const includePayees = options?.includePayees ?? true;
+    const includeClosed = options?.includeClosed ?? false;
+    const payeeLimit = options?.payeeLimit ?? 500;
+    const result: ContextResult = {};
+
+    // Payees need the account listing even when accounts were not requested: upstream getPayees()
+    // drops the transfer payees of DELETED accounts but not of CLOSED ones, so hiding closed
+    // accounts means hiding their transfer payees here too.
+    const closedIds = new Set<string>();
+    if (includeAccounts || (includePayees && !includeClosed)) {
+      const rawAccounts = await withConcurrency(() =>
+        retry(() => rawGetAccounts() as Promise<Array<Record<string, unknown>>>, { retries: 2, backoffMs: 200 })
+      );
+      const all = Array.isArray(rawAccounts) ? rawAccounts : [];
+      for (const a of all) if (a.closed) closedIds.add(String(a.id));
+      if (includeAccounts) {
+        result.accounts = all
+          .filter((a) => includeClosed || !a.closed)
+          .map((a) => ({
+            id: String(a.id),
+            name: String(a.name ?? ''),
+            offbudget: Boolean(a.offbudget),
+            closed: Boolean(a.closed),
+          }));
+      }
+    }
+
+    if (includeCategories) {
+      // No options: upstream then returns hidden groups and categories too, flagged by `hidden`.
+      const rawGroups = await withConcurrency(() =>
+        retry(() => rawGetCategoryGroups() as Promise<Array<Record<string, unknown>>>, { retries: 2, backoffMs: 200 })
+      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      result.categoryGroups = (Array.isArray(rawGroups) ? rawGroups : []).map((g: any) => ({
+        id: String(g.id),
+        name: String(g.name ?? ''),
+        is_income: Boolean(g.is_income),
+        hidden: Boolean(g.hidden),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        categories: (Array.isArray(g.categories) ? g.categories : []).map((c: any) => ({
+          id: String(c.id),
+          name: String(c.name ?? ''),
+          hidden: Boolean(c.hidden),
+        })),
+      }));
+    }
+
+    if (includePayees) {
+      const rawPayees = await withConcurrency(() =>
+        retry(() => rawGetPayees() as Promise<Array<Record<string, unknown>>>, { retries: 2, backoffMs: 200 })
+      );
+      // Name order, case-insensitive, id as the tie-break, so the cut is deterministic. Transfer
+      // payees count toward the cap. Recency is not an option: payees carry no last-used field.
+      const list = (Array.isArray(rawPayees) ? rawPayees : [])
+        .map((p) => ({
+          id: String(p.id),
+          name: String(p.name ?? ''),
+          transfer_acct: p.transfer_acct != null ? String(p.transfer_acct) : null,
+        }))
+        .filter((p) => includeClosed || p.transfer_acct === null || !closedIds.has(p.transfer_acct))
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      result.payees = list.slice(0, payeeLimit);
+      result.payeesTruncated = list.length > payeeLimit;
+      result.payeeTotal = list.length;
+      if (result.payeesTruncated) {
+        result.hint = `Showing ${result.payees.length} of ${list.length} payees. Use actual_entities_search or actual_get_id_by_name to find the rest.`;
+      }
+    }
+
+    return result;
   });
 }
 /**
@@ -1989,7 +2332,7 @@ export async function setBudgetAmount(month: string | undefined, categoryId: str
     );
     const exists = (categories as any[]).some((c: any) => c.id === categoryId);
     if (!exists) {
-      // #377: MUST be a typed refusal. `budgets_setAmount` is one of the two tools whose
+      // #377: MUST be a typed refusal. `budgets_set_amount` is one of the two tools whose
       // published contract is the SHAPE (#89: an unknown category returns
       // { success: false, error }, it does not throw), and the tool decides that by type
       // now. Leaving this as a bare Error silently undid #89, and the unit test did not
@@ -2014,7 +2357,7 @@ export async function setBudgetAmount(month: string | undefined, categoryId: str
     if (Array.isArray(months) && months.length > 0 && !months.includes(String(month))) {
       throw new OutOfRangeRefusal(
         `Month "${month}" is outside this budget's range, which runs from ${months[0]} to ` +
-          `${months[months.length - 1]}. Use actual_budgets_getMonths to see the months you can budget to.`,
+          `${months[months.length - 1]}. Use actual_budgets_get_months to see the months you can budget to.`,
         String(month),
       );
     }
@@ -2024,26 +2367,46 @@ export async function setBudgetAmount(month: string | undefined, categoryId: str
   }, { preservesListings: ['accounts', 'categories', 'categoryGroups', 'payees'] });
 }
 
-/**
- * Atomic budget transfer between two categories within a single month.
- *
- * Reads the current budget amounts, validates source-side sufficient funds,
- * and writes both adjustments inside ONE `queueWriteOperation` cycle. This
- * is the structural fix for issue #141: the previous tool body did three
- * separate lock cycles (read + write + write) which could hang for the
- * full Playwright timeout when the upstream server's mutator queue stalled
- * between cycles.
- *
- * Both writes run inside `rawBatchBudgetUpdates` so the upstream Actual
- * Budget server treats them as one transaction, guaranteeing no partial
- * transfer is observable from the server's perspective.
- */
 export interface TransferBudgetResult {
   transferred: number;
   fromCategory: { id: string; previousAmount: number; newAmount: number };
   toCategory: { id: string; previousAmount: number; newAmount: number };
 }
 
+/**
+ * Budget transfer between two categories within a single month.
+ *
+ * Reads the current budget amounts, validates source-side sufficient funds,
+ * and writes both adjustments inside ONE `queueWriteOperation` cycle. This
+ * is the structural fix for issue #141: the previous tool body did three
+ * separate lock cycles (read + write + write) which could hang for the
+ * full Playwright timeout when the upstream server's mutator queue stalled
+ * between cycles. The month read and the funds check run before either write.
+ *
+ * NOT atomic and no rollback (#518). The two writes are separate raw calls,
+ * each awaited on its own: outside a batch bracket upstream applies each
+ * write (`_sendMessages` then `applyMessages`) before the call returns and
+ * rethrows an apply failure to us (read from the shipped upstream source, not
+ * verified here by a read-back), so an apply failure is returned rather than
+ * detached. If the second write fails or is not attempted, the first stays
+ * applied and the thrown error says so (see below).
+ *
+ * COOPERATIVE DEADLINE between the two writes, for the same reason as
+ * `setBudgetBatch`: `withOpTimeout` cannot cancel this callback, so without the
+ * check an abandoned callback would still make the second write after the
+ * caller was told the operation timed out.
+ *
+ * WHY NO `batchBudgetUpdates` BRACKET (#539). Upstream `api/batch-budget-start`
+ * runs `batchMessages` un-awaited and `api/batch-budget-end` returns before the
+ * queued messages are applied, so an apply failure under the bracket is a
+ * rejection on a promise nobody holds: it reaches the `unhandledRejection`
+ * handler and exits the server, after the tool already reported success. The
+ * bracket did apply both writes in one sqlite transaction, so dropping it trades
+ * that all-or-nothing apply for a partial transfer that is REPORTED; upstream
+ * has no awaited bracket that keeps both. Do not reintroduce it (a unit test
+ * guards this). The upstream trace is the `actual_budgets_transfer` and
+ * `actual_budget_updates_batch` rows of `docs/audit/write-effect-audit.md`.
+ */
 export async function transferBudgetAmount(
   month: string,
   fromCategoryId: string,
@@ -2055,6 +2418,9 @@ export async function transferBudgetAmount(
     // Inside processWriteQueue we already hold the api mutex in apiLock.ts and the api is
     // initialised. Call raw functions only: adapter wrappers would re-enter
     // queueWriteOperation / withActualApi and defeat the single-cycle goal.
+    // The deadline clock starts here, before the read, because withOpTimeout times the whole
+    // callback: starting it at the first write would let a slow read hide (#539 review round 2).
+    const startedAt = Date.now();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const budgetMonth: any = await rawGetBudgetMonth(month);
     if (!budgetMonth?.categoryGroups) {
@@ -2074,10 +2440,37 @@ export async function transferBudgetAmount(
       throw new Error(`Insufficient budget in source category. Available: ${prevFrom}, Requested: ${amount}`);
     }
 
-    await rawBatchBudgetUpdates(async () => {
-      await rawSetBudgetAmount(month, fromCategoryId, prevFrom - amount);
-      await rawSetBudgetAmount(month, toCategoryId, prevTo + amount);
-    });
+    // No retry on either write: a replayed amount write after a partial apply is not safe to
+    // reason about, and the client re-reads instead.
+    await withConcurrency(() => rawSetBudgetAmount(month, fromCategoryId, prevFrom - amount) as Promise<void>);
+    const sourceDone = `Partial transfer: the source category ${fromCategoryId} was set from ${prevFrom} to ${prevFrom - amount}`;
+    const readBack = 'Read back with actual_budgets_get_month before retrying.';
+    const deadlineMs = config.ACTUAL_OP_TIMEOUT_MS > 0 ? config.ACTUAL_OP_TIMEOUT_MS * BUDGET_BATCH_DEADLINE_FRACTION : 0;
+    if (deadlineMs > 0 && Date.now() - startedAt > deadlineMs) {
+      throw new Error(
+        `${sourceDone}, but the target category ${toCategoryId} was not attempted (${BUDGET_BATCH_DEADLINE_ERROR}), ` +
+          `so it is unchanged at ${prevTo}. ${readBack}`,
+      );
+    }
+    try {
+      await withConcurrency(() => rawSetBudgetAmount(month, toCategoryId, prevTo + amount) as Promise<void>);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // A transient error (infrastructure or a rate limit) says nothing about whether the write
+      // landed, so only a deterministic (domain) rejection may claim the target is unchanged.
+      // #544: this is isRetryableError, not _shouldDropPoolOnError: a rate limit keeps the pool
+      // but its outcome is just as unknown. The pool-drop decision itself is untouched.
+      const target = isRetryableError(error)
+        ? `its outcome is unknown (it was ${prevTo})`
+        : `it is unchanged at ${prevTo}`;
+      // The original text stays INSIDE the message: isRetryableError classifies by message only
+      // and never reads `cause`, and the write queue's self-heal (_shouldDropPoolOnError) depends
+      // on that classification. Same reason as abortBatchOnInfrastructureError.
+      throw new Error(
+        `${sourceDone}, but setting the target category ${toCategoryId} failed, so ${target}: ${msg}. ${readBack}`,
+        { cause: error },
+      );
+    }
 
     return {
       transferred: amount,
@@ -2152,15 +2545,21 @@ export async function deleteAccount(id: string): Promise<void> {
     await withConcurrency(() => retry(() => rawDeleteAccount(id) as Promise<void>, { retries: 0, backoffMs: 200 }));
   });
 }
-export async function updateTransaction(id: string, fields: Partial<components['schemas']['Transaction']> | unknown): Promise<void> {
+export async function updateTransaction(
+  id: string,
+  fields: Partial<components['schemas']['Transaction']> | unknown
+): Promise<{ split?: { parent: string; children: string[] } }> {
   observability.incrementToolCall('actual.transactions.update').catch(() => {});
   // Use write queue to batch concurrent updates in a single budget session
   return queueWriteOperation(async () => {
+    // #494: the drain's op timeout starts when this callback starts, so the split poll's cap
+    // below is measured from here, not from the end of the write (same origin as #538's startedAt).
+    const opStartedAt = Date.now();
     // Pre-flight existence check (#212): the raw API silently no-ops on a missing id,
     // so an update that changed nothing would otherwise be reported as success. A
     // targeted ActualQL query by id keeps this cheap (indexed lookup). #305 extends
     // the select to is_parent + amount so the split guards below can run off the
-    // same read (single source; no second out-of-queue read).
+    // same read (single source; no second out-of-queue read); #489 adds is_child.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { q } = (await import('@actual-app/api')) as any;
     const rows = await withConcurrency(() =>
@@ -2172,44 +2571,117 @@ export async function updateTransaction(id: string, fields: Partial<components['
         // regular transactions, split parents, and split children as flat rows, so
         // the existence + is_parent + amount read is correct for every kind.
         const res = (await rawRunQuery(
-          q('transactions').options({ splits: 'all' }).filter({ id }).select(['id', 'is_parent', 'amount'])
-        )) as { data?: Array<{ id: string; is_parent?: boolean; amount?: number }> };
+          q('transactions').options({ splits: 'all' }).filter({ id }).select(['id', 'is_parent', 'is_child', 'amount', 'category'])
+        )) as { data?: Array<{ id: string; is_parent?: boolean; is_child?: boolean; amount?: number; category?: string | null }> };
         return Array.isArray(res?.data) ? res.data : [];
       }, { retries: 2, backoffMs: 200 })
     );
     if (rows.length === 0) {
-      throw new Error(`Transaction "${id}" not found. Use actual_transactions_get to list transactions.`);
+      // #489: a typed refusal (nothing was written), wording kept byte-identical to what callers saw.
+      throw new NotFoundRefusal('Transaction', id, 'actual_transactions_get', undefined,
+        `Transaction "${id}" not found. Use actual_transactions_get to list transactions.`);
     }
 
-    // #305: split-edit guards, BEFORE the raw write. Two rules:
-    //   (a) subtransactions may only edit a transaction that is ALREADY a split;
-    //       converting a plain transaction into a split via updateTransaction is
-    //       broken in @actual-app/api 26.7.0 (it strands orphan children), so it
-    //       is rejected here rather than silently corrupting data.
-    //   (b) child amounts must sum to the effective parent amount. The API does
-    //       not enforce this; the ground truth is the caller's new `amount` if
-    //       supplied, else the stored amount read above.
-    const subs = (fields as { subtransactions?: ReadonlyArray<{ amount: number }> })?.subtransactions;
+    // Split guards, BEFORE the raw write:
+    //   (a) a CHILD cannot itself be split: upstream nests one level only.
+    //   (b) child amounts must sum to the effective parent amount. The API does not
+    //       enforce this; the ground truth is the caller's new `amount` if supplied,
+    //       else the stored amount read above.
+    // #489 lifted #305's third rule, which refused a PLAIN target: "converting a plain
+    // transaction into a split via updateTransaction is broken in 26.7.0 (it strands orphan
+    // children)". That is no longer true. Upstream #8207 (`shared/transactions.ts`) converts in
+    // place through makeChild, and a live probe at 26.9.0 confirmed it persists across a fresh
+    // download with the SAME id and `imported_id`, and keeps a transfer balanced by replacing the
+    // single counterpart with one per child. Reusing that path is why #489 is not a create plus
+    // delete: raw `addTransactions` does not run transfers while `deleteTransaction` does, so the
+    // orchestration deleted a transfer's counterpart, and it re-ran rules on the new parent.
+    const subs = (fields as { subtransactions?: ReadonlyArray<{ amount: number; category?: string | null }> })?.subtransactions;
+    const row = rows[0];
+    const converting = Boolean(subs) && row.is_parent !== true;
     if (subs) {
-      const row = rows[0];
-      if (row.is_parent !== true) {
-        throw new Error(
-          `Transaction "${id}" is not a split. Converting a plain transaction into a split is not supported here; create the split with actual_transactions_create instead.`
+      if (row.is_child === true) {
+        throw new OutOfRangeRefusal(
+          `Transaction "${id}" is a split child and cannot itself be split. Edit its parent's subtransactions with actual_transactions_update instead.`,
+          id
         );
       }
       const providedAmount = (fields as { amount?: number | null }).amount;
       const parentAmount = providedAmount != null ? providedAmount : row.amount;
       const sum = subtransactionsSum(subs);
       if (sum !== parentAmount) {
-        throw new Error(
-          `Subtransactions must sum to the parent amount. Expected ${parentAmount}, got ${sum}.`
+        throw new OutOfRangeRefusal(
+          `Subtransactions must sum to the parent amount. Expected ${parentAmount}, got ${sum}.`,
+          String(sum)
         );
       }
     }
 
-    await withConcurrency(() => retry(() => rawUpdateTransaction(id, fields) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    // #489: a converted parent keeps its old category upstream (the update path nulls a parent's
+    // category only when `account` is in the diff), while the Actual UI shows a split parent with
+    // none. Clear it in the SAME write, and hand its category to every child that names none, so
+    // the children still inherit it exactly as upstream's makeChild would have done.
+    let payload = fields;
+    if (converting) {
+      const f = fields as { category?: string | null; subtransactions: ReadonlyArray<{ category?: string | null }> };
+      const inherited = 'category' in f ? f.category : (row.category ?? null);
+      payload = {
+        ...f,
+        category: null,
+        subtransactions: f.subtransactions.map((c) => ('category' in c ? c : { ...c, category: inherited })),
+      };
+    }
+    await withConcurrency(() => retry(() => rawUpdateTransaction(id, payload) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    if (!converting) return {};
+
+    // #489: verify AFTER the write. Upstream resolves before the conversion lands (see
+    // SPLIT_VERIFY_TIMEOUT_MS), so success is only claimed once the parent reads as a split
+    // with every requested child. Polling here, inside the drain, also guarantees the change is
+    // local before the drain's api.sync(). A retry after a timeout is safe: the row is then a
+    // split, so a second call EDITS its children rather than creating anything new.
+    // #494: the poll must end before the op timeout does, or the caller sees "timed out" (which
+    // invites a retry) while this callback keeps reading in the background. Cap it at HALF the op
+    // timeout, counted from op start; 0 disables the op timeout, so the poll keeps its own bound.
+    // Do not cap at opStartedAt + boundMs: that term would also shorten the poll at the default.
+    const expected = subs!.length;
+    const T = config.ACTUAL_OP_TIMEOUT_MS;
+    const deadline = T > 0
+      ? Math.min(Date.now() + SPLIT_VERIFY_TIMEOUT_MS, opStartedAt + Math.floor(T / 2))
+      : Date.now() + SPLIT_VERIFY_TIMEOUT_MS;
+    const boundMs = T > 0 ? Math.min(SPLIT_VERIFY_TIMEOUT_MS, Math.floor(T / 2)) : SPLIT_VERIFY_TIMEOUT_MS;
+    for (;;) {
+      const res = (await rawRunQuery(
+        q('transactions').options({ splits: 'all' })
+          .filter({ $or: [{ id }, { parent_id: id }] })
+          .select(['id', 'is_parent', 'parent_id'])
+      )) as { data?: Array<{ id: string; is_parent?: boolean; parent_id?: string | null }> };
+      const data = Array.isArray(res?.data) ? res.data : [];
+      const parent = data.find((r) => r.id === id);
+      const children = data.filter((r) => r.parent_id === id).map((r) => r.id);
+      if (parent?.is_parent === true && children.length === expected) {
+        return { split: { parent: id, children } };
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Transaction "${id}" was sent to be split into ${expected} parts, but the split was not visible after ${boundMs}ms (found ${children.length} children), so the outcome is unknown. ` +
+          'Read it back with actual_transactions_get before retrying: if it is already a split, a retry edits its children rather than duplicating them.'
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, SPLIT_VERIFY_INTERVAL_MS));
+    }
   });
 }
+/**
+ * Update many transactions in ONE write cycle, with a verdict per item. NOT atomic.
+ *
+ * COOPERATIVE DEADLINE (#538): same 0.75 fraction of ACTUAL_OP_TIMEOUT_MS as `createRulesBatch`
+ * and `setBudgetBatch`, because `withOpTimeout` cannot cancel this callback: without it a slow
+ * batch kept writing after its caller was told the operation timed out. The clock starts before
+ * the existence query, so a slow read counts. Items not reached go to `failed` with
+ * BUDGET_BATCH_DEADLINE_ERROR and were never sent upstream. A missing id keeps its not-found
+ * error even past the deadline: it was never going to be written, and "not attempted" would
+ * tell the client a retry could succeed. A raw update already in flight when the deadline
+ * passes can still overrun; the check runs between items.
+ */
 export async function updateTransactionBatch(
   updates: Array<{ id: string; fields: Partial<components['schemas']['Transaction']> | unknown }>
 ): Promise<{ succeeded: { id: string }[]; failed: { id: string; error: string }[] }> {
@@ -2218,6 +2690,7 @@ export async function updateTransactionBatch(
   // Sequential loop (not Promise.all) is intentional: concurrent rawUpdateTransaction calls
   // within one session can interleave withMutation CRDT messages unpredictably.
   return queueWriteOperation(async () => {
+    const startedAt = Date.now();
     // Nothing to do for an empty batch. The tool enforces min 1, but the adapter is a
     // public export, so guard here and avoid an empty-$oneof existence query.
     if (updates.length === 0) return { succeeded: [], failed: [] };
@@ -2242,9 +2715,14 @@ export async function updateTransactionBatch(
 
     const succeeded: { id: string }[] = [];
     const failed: { id: string; error: string }[] = [];
-    for (const { id, fields } of updates) {
+    const deadlineMs = config.ACTUAL_OP_TIMEOUT_MS > 0 ? config.ACTUAL_OP_TIMEOUT_MS * BUDGET_BATCH_DEADLINE_FRACTION : 0;
+    for (const [position, { id, fields }] of updates.entries()) {
       if (!existing.has(id)) {
         failed.push({ id, error: `Transaction "${id}" not found. Use actual_transactions_get to list transactions.` });
+        continue;
+      }
+      if (deadlineMs > 0 && Date.now() - startedAt > deadlineMs) {
+        failed.push({ id, error: BUDGET_BATCH_DEADLINE_ERROR });
         continue;
       }
       try {
@@ -2254,6 +2732,18 @@ export async function updateTransactionBatch(
         succeeded.push({ id });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        // Infrastructure errors stop the batch (see abortBatchOnInfrastructureError). The
+        // failing item's state is UNKNOWN (an ENOMEM can land after the local write ran);
+        // items after it were never sent.
+        abortBatchOnInfrastructureError(err, {
+          label: 'Transaction',
+          appliedCount: succeeded.length,
+          total: updates.length,
+          applied: succeeded.map((x) => x.id).join(', '),
+          extra: `failed before the abort: ${failed.map((x) => x.id).join(', ') || 'none'}; outcome unknown: ${id}; not attempted: ${updates.length - position - 1}`,
+          message,
+          readBackTool: 'actual_transactions_get',
+        });
         failed.push({ id, error: message });
       }
     }
@@ -2286,6 +2776,64 @@ export async function deleteTransaction(id: string): Promise<void> {
     // re-issue the delete against an already-removed record and surface a
     // confusing "not found" even though the first attempt succeeded.
     await withConcurrency(() => retry(() => rawDeleteTransaction(id) as Promise<void>, { retries: 0, backoffMs: 200 }));
+  });
+}
+/**
+ * #514: merge two transactions via upstream `mergeTransactions`. The PUBLIC api takes the plain
+ * string tuple and returns the id of the KEPT transaction; the `{ id }[]` form belongs to the
+ * internal handler and throws "Invalid field type [object Object]" here. Upstream picks which one
+ * survives (imported_id, then imported_payee, then earlier date, then the SECOND id) and deletes
+ * the other, so the dropped id is derived from the returned kept id.
+ *
+ * The guards below cover what upstream would refuse with a less useful message, or (a split child)
+ * only incidentally. Transfers to different accounts are left to upstream, whose message passes
+ * through unchanged. Everything runs in one queueWriteOperation, so a read-then-write guard stays
+ * in the adapter (never in the tool).
+ */
+export async function mergeTransactions(ids: [string, string]): Promise<{ keptId: string; deletedId: string }> {
+  observability.incrementToolCall('actual.transactions.merge').catch(() => {});
+  return queueWriteOperation(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { q } = (await import('@actual-app/api')) as any;
+    type Row = { id: string; account?: string; amount?: number; parent_id?: string | null; is_child?: boolean };
+    const rows = await withConcurrency(() =>
+      retry(async () => {
+        // `splits: 'all'` is REQUIRED (#305): the default query excludes split PARENT rows.
+        const res = (await rawRunQuery(
+          q('transactions').options({ splits: 'all' }).filter({ id: { $oneof: ids } }).select(['id', 'account', 'amount', 'parent_id', 'is_child'])
+        )) as { data?: Row[] };
+        return Array.isArray(res?.data) ? res.data : [];
+      }, { retries: 2, backoffMs: 200 })
+    );
+    const byId = new Map<string, Row>(rows.map((r) => [r.id, r]));
+    for (const id of ids) {
+      if (!byId.has(id)) throw new NotFoundRefusal('Transaction', id, 'actual_transactions_get');
+    }
+    const [first, second] = [byId.get(ids[0])!, byId.get(ids[1])!];
+    for (const t of [first, second]) {
+      if (t.is_child || (t.parent_id !== null && t.parent_id !== undefined)) {
+        throw new OutOfRangeRefusal(
+          `Cannot merge a split child transaction (${t.id}); merge the parent transactions instead. Use actual_transactions_get to find the parent.`,
+          t.id
+        );
+      }
+    }
+    if (first.account !== second.account) {
+      throw new OutOfRangeRefusal(
+        `Cannot merge transactions from different accounts: ${ids[0]} is in account ${first.account}, ${ids[1]} is in account ${second.account}. Nothing was changed.`,
+        String(second.account)
+      );
+    }
+    if (first.amount !== second.amount) {
+      throw new OutOfRangeRefusal(
+        `Cannot merge transactions with different amounts: ${ids[0]} is ${first.amount} cents, ${ids[1]} is ${second.amount} cents. Nothing was changed.`,
+        String(second.amount)
+      );
+    }
+    // Non-idempotent: do not retry (#165, #514). After a lost response the dropped id is gone, so
+    // a retry would be refused or act on the wrong pair.
+    const keptId = (await withConcurrency(() => retry(() => rawMergeTransactions(ids) as Promise<string>, { retries: 0, backoffMs: 200 }))) as string;
+    return { keptId, deletedId: keptId === ids[0] ? ids[1] : ids[0] };
   });
 }
 export async function updateCategory(id: string, fields: Partial<components['schemas']['Category']> | unknown): Promise<void> {
@@ -2358,6 +2906,15 @@ export async function updatePayee(id: string, fields: Partial<components['schema
       categoryValue = fieldsObj.category as string | null;
       const { category: _stripped, ...rest } = fieldsObj;
       directFields = rest;
+    }
+
+    // #522: an explicitly set category is checked BEFORE the direct-field write, so a refused
+    // category writes nothing at all (not even the name). null clears the rule and an absent key
+    // skips this. A hidden category passes (the listing includes it); a category GROUP id is
+    // refused as a missing Category. Same pipeline as the rule writes.
+    if (typeof categoryValue === 'string') {
+      const categoryRefs: RuleRef[] = [{ side: 'action', field: 'category', id: categoryValue }];
+      assertRuleReferencesExist(categoryRefs, await loadRuleReferenceListings(categoryRefs), RULE_REFUSAL_CHANGED);
     }
 
     // Update the payee's direct fields (name, transfer_acct, etc.)
@@ -2451,10 +3008,241 @@ export async function getRules(): Promise<unknown[]> {
     return Array.isArray(raw) ? raw : [];
   });
 }
+/** The entity kinds whose ids a rule can reference, with the field name and the listing that proves existence. */
+const RULE_REFERENCE_FIELDS = {
+  category: { entity: 'Category', listTool: 'actual_categories_get' },
+  payee: { entity: 'Payee', listTool: 'actual_payees_get' },
+  account: { entity: 'Account', listTool: 'actual_accounts_list' },
+} as const;
+type RuleReferenceField = keyof typeof RULE_REFERENCE_FIELDS;
+
+interface RuleReferenceListings {
+  category?: Set<string>;
+  payee?: Set<string>;
+  account?: Set<string>;
+}
+
+/** One id a rule points at, with the side of the rule it sits on (the diff on an update keys on the side). */
+interface RuleRef {
+  side: 'condition' | 'action';
+  field: RuleReferenceField;
+  id: string;
+}
+
+/**
+ * Condition operators whose value is an entity id (or an array of ids). `and` is upstream's
+ * INTERNAL op for `category` and `category_group` (shared/rules.ts `internalOps`), parsed like
+ * `oneOf`, so leaving it out would narrow what #485 already guarded. The text ops (`contains`,
+ * `matches`, `doesNotContain`) compare text and `onBudget` / `offBudget` carry no id: they are
+ * skipped and must never be refused.
+ */
+const RULE_ID_CONDITION_OPS: ReadonlySet<string> = new Set(['is', 'isNot', 'oneOf', 'notOneOf', 'and']);
+
+/** Refusal suffixes, one per write path, so no call site can inherit text that is false for it (#524 item 6). */
+const RULE_REFUSAL_CREATED = 'Nothing was created.';
+const RULE_REFUSAL_CHANGED = 'Nothing was changed.';
+const RULE_REFUSAL_BATCH_ITEM = 'This rule was not created.';
+
+/**
+ * Every id a rule points at. Null, undefined and non-string values are skipped (a null
+ * `set category` clears it). Conditions count only for an id operator (RULE_ID_CONDITION_OPS).
+ * Actions count only for `set`, and not when `options.template` is TRUTHY: upstream compiles a
+ * truthy template as Handlebars and does not use the value as an id (server/rules/action.ts,
+ * `if (options?.template)`), while an empty or absent template applies the plain value as the
+ * id. Do NOT test with `!== undefined` or `'template' in options`.
+ * The field filter uses `Object.hasOwn`, not `in`: a field named `toString` is on the prototype.
+ */
+function ruleReferences(rule: unknown): RuleRef[] {
+  const out: RuleRef[] = [];
+  const r = (rule ?? {}) as { conditions?: unknown; actions?: unknown };
+  const add = (side: RuleRef['side'], field: unknown, value: unknown) => {
+    if (typeof field !== 'string' || !Object.hasOwn(RULE_REFERENCE_FIELDS, field)) return;
+    const values = Array.isArray(value) ? value : [value];
+    for (const v of values) if (typeof v === 'string') out.push({ side, field: field as RuleReferenceField, id: v });
+  };
+  if (Array.isArray(r.conditions)) {
+    for (const c of r.conditions as Array<{ field?: unknown; op?: unknown; value?: unknown }>) {
+      if (typeof c?.op === 'string' && RULE_ID_CONDITION_OPS.has(c.op)) add('condition', c?.field, c?.value);
+    }
+  }
+  if (Array.isArray(r.actions)) {
+    for (const a of r.actions as Array<{ op?: unknown; field?: unknown; value?: unknown; options?: { template?: unknown } | null }>) {
+      if (a?.op === 'set' && !a?.options?.template) add('action', a?.field, a?.value);
+    }
+  }
+  return out;
+}
+
+const ruleRefKey = (ref: RuleRef): string => `${ref.side}|${ref.field}|${ref.id}`;
+
+/**
+ * Only the references `next` ADDS over `stored`. A dangling id already in the stored rule must
+ * not make an unrelated edit fail. The key includes the side: the same id newly added on the
+ * other side (condition to action) counts as new.
+ */
+function newRuleReferences(next: unknown, stored: unknown): RuleRef[] {
+  const had = new Set(ruleReferences(stored).map(ruleRefKey));
+  return ruleReferences(next).filter((ref) => !had.has(ruleRefKey(ref)));
+}
+
+/**
+ * #485: read the listings the given references need, once per kind, through the drain cache.
+ * Call INSIDE a queued op and BEFORE the first raw write. Only kinds that some reference needs
+ * are read, so an edit introducing no new reference reads no listing. The three listings are what upstream shows a user: categories (hidden included,
+ * group ids are not in it), payees (transfer payees included, tombstoned ones excluded here
+ * even if the listing returns them) and accounts (closed and off-budget accounts included, and
+ * both count as existing: a closed account is not a missing reference).
+ */
+async function loadRuleReferenceListings(refs: RuleRef[]): Promise<RuleReferenceListings> {
+  const need = new Set<RuleReferenceField>();
+  for (const ref of refs) need.add(ref.field);
+  const listings: RuleReferenceListings = {};
+  if (need.has('category')) {
+    const rows = await withConcurrency(() =>
+      retry(() => readDrainListing('categories', () => rawGetCategories() as Promise<Array<{ id?: string }>>), { retries: 2, backoffMs: 200 })
+    );
+    listings.category = new Set((Array.isArray(rows) ? rows : []).map((c) => String(c?.id)));
+  }
+  if (need.has('payee')) {
+    const rows = await withConcurrency(() =>
+      retry(() => readDrainListing('payees', () => rawGetPayees() as Promise<Array<{ id?: string; tombstone?: boolean }>>), { retries: 2, backoffMs: 200 })
+    );
+    listings.payee = new Set((Array.isArray(rows) ? rows : []).filter((p) => !p?.tombstone).map((p) => String(p?.id)));
+  }
+  if (need.has('account')) {
+    const rows = await withConcurrency(() =>
+      retry(() => readDrainListing('accounts', () => rawGetAccounts() as Promise<Array<{ id?: string }>>), { retries: 2, backoffMs: 200 })
+    );
+    listings.account = new Set((Array.isArray(rows) ? rows : []).map((a) => String(a?.id)));
+  }
+  return listings;
+}
+
+/**
+ * #485: refuse a rule that points at a category, payee or account that does not exist.
+ * Upstream `createRule` checks field, operator and nullability only, with no existence lookup
+ * of id values, so it stores a rule pointing at nothing. NOT exported: tests drive it through
+ * the adapter methods, and it lives in the adapter so no call site can skip it. `suffix` is
+ * REQUIRED (no default) so a new call site cannot inherit text that is false for it.
+ *
+ * The guard now covers every rule write: `createRule`, `createRulesBatch`, `updateRule`,
+ * `upsertRule` and `updatePayee`'s category. KNOWN GAPS that remain: `link-schedule` action
+ * values; `category_group` condition values (upstream `FIELD_INFO` types it `id`, but its value
+ * is a group id that appears in none of the three listings, #524 item 5); and, deliberately,
+ * text-pattern ops (`contains`, `matches`, `doesNotContain`) and actions with a truthy
+ * `options.template`.
+ */
+function assertRuleReferencesExist(refs: RuleRef[], listings: RuleReferenceListings, suffix: string): void {
+  for (const ref of refs) {
+    const known = listings[ref.field];
+    if (known && !known.has(ref.id)) {
+      const meta = RULE_REFERENCE_FIELDS[ref.field];
+      throw new NotFoundRefusal(meta.entity, ref.id, meta.listTool, suffix);
+    }
+  }
+}
+
+/** Error text for a failed upstream rule create. `APIError` is a PLAIN OBJECT {type, message, meta}; `ruleModel.validate` throws a real Error. */
+function ruleCreateErrorText(error: unknown): string {
+  const e = error as { message?: unknown; meta?: { conditionErrors?: unknown; actionErrors?: unknown } } | null;
+  const base = e && typeof e === 'object' && e.message ? String(e.message) : typeof error === 'string' ? error : 'Failed creating a new rule';
+  const positions: string[] = [];
+  const collect = (label: string, list: unknown) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((entry, i) => {
+      if (entry !== null && entry !== undefined) positions.push(`${label} ${i}: ${typeof entry === 'string' ? entry : 'invalid'}`);
+    });
+  };
+  if (e && typeof e === 'object' && e.meta) {
+    collect('condition', e.meta.conditionErrors);
+    collect('action', e.meta.actionErrors);
+  }
+  return positions.length > 0 ? `${base} (${positions.join('; ')})` : base;
+}
+
+export interface RuleBatchSucceeded { index: number; id: string }
+export interface RuleBatchFailed { index: number; error: string }
+export interface RuleBatchResult { succeeded: RuleBatchSucceeded[]; failed: RuleBatchFailed[] }
+
+/**
+ * #485: create many rules in ONE write cycle with a verdict per item. NOT atomic and no
+ * rollback: rules created before a failure stay created.
+ *
+ * `items` carry the caller's ORIGINAL indices (the tool drops items that fail its own
+ * validation before calling), `total` is the size of the caller's whole array and only feeds
+ * the abort message.
+ *
+ * TWO PHASES inside one `queueWriteOperation`:
+ *  1. Read the reference listings ONCE (before the first raw create), then decide a
+ *     NotFoundRefusal per item.
+ *  2. Raw creates for the items that passed, each with retries 0 (a retried create can store
+ *     the same rule twice if the first attempt landed), each caught per item. Only raw calls
+ *     run here: an `adapter.*` call would nest the api lock and deadlock.
+ *
+ * INFRASTRUCTURE ERRORS STOP THE BATCH: see `abortBatchOnInfrastructureError`. Rate limits and
+ * upstream rejections are per item and the loop continues.
+ *
+ * COOPERATIVE DEADLINE: same 0.75 fraction of ACTUAL_OP_TIMEOUT_MS as `setBudgetBatch`,
+ * because `withOpTimeout` cannot cancel this callback. Items not reached go to `failed` with
+ * BUDGET_BATCH_DEADLINE_ERROR and were never sent upstream.
+ */
+export async function createRulesBatch(items: Array<{ index: number; rule: unknown }>, total: number): Promise<RuleBatchResult> {
+  observability.incrementToolCall('actual.rules.createBatch').catch(() => {});
+  return queueWriteOperation(async () => {
+    const startedAt = Date.now();
+    const succeeded: RuleBatchSucceeded[] = [];
+    const failed: RuleBatchFailed[] = [];
+
+    const listings = await loadRuleReferenceListings(items.flatMap((i) => ruleReferences(i.rule)));
+    const toWrite: Array<{ index: number; rule: unknown }> = [];
+    for (const item of items) {
+      try {
+        // The other items may well be created, so the single-rule suffix would be false here.
+        assertRuleReferencesExist(ruleReferences(item.rule), listings, RULE_REFUSAL_BATCH_ITEM);
+        toWrite.push(item);
+      } catch (error) {
+        failed.push({ index: item.index, error: (error as Error).message });
+      }
+    }
+
+    const deadlineMs = config.ACTUAL_OP_TIMEOUT_MS > 0 ? config.ACTUAL_OP_TIMEOUT_MS * BUDGET_BATCH_DEADLINE_FRACTION : 0;
+    for (const { index, rule } of toWrite) {
+      if (deadlineMs > 0 && Date.now() - startedAt > deadlineMs) {
+        failed.push({ index, error: BUDGET_BATCH_DEADLINE_ERROR });
+        continue;
+      }
+      try {
+        const raw = await withConcurrency(() =>
+          retry(() => rawCreateRule(rule) as Promise<string | { id?: string }>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError })
+        );
+        succeeded.push({ index, id: normalizeToId(raw) });
+      } catch (error) {
+        const msg = ruleCreateErrorText(error);
+        abortBatchOnInfrastructureError(error, {
+          label: 'Rules',
+          appliedCount: succeeded.length,
+          total,
+          applied: succeeded.map((x) => x.index).join(', '),
+          message: msg,
+          readBackTool: 'actual_rules_get',
+        });
+        failed.push({ index, error: msg });
+      }
+    }
+
+    succeeded.sort((a, b) => a.index - b.index);
+    failed.sort((a, b) => a.index - b.index);
+    return { succeeded, failed };
+  }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
+}
 export async function createRule(rule: unknown): Promise<string> {
   observability.incrementToolCall('actual.rules.create').catch(() => {});
   return queueWriteOperation(async () => {
-    const raw = await withConcurrency(() => retry(() => rawCreateRule(rule) as Promise<string | { id?: string }>, { retries: 2, backoffMs: 200, isRetryable: isRetryableError }));
+    // #485: the reference guard shares this drain's cached listings with the write.
+    const refs = ruleReferences(rule);
+    assertRuleReferencesExist(refs, await loadRuleReferenceListings(refs), RULE_REFUSAL_CREATED);
+    // retries 0: a slow first attempt that lands followed by a retry stores a duplicate rule.
+    const raw = await withConcurrency(() => retry(() => rawCreateRule(rule) as Promise<string | { id?: string }>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
     const id = normalizeToId(raw);
     return id;
   }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
@@ -2468,7 +3256,7 @@ export async function updateRule(id: string, fields: unknown): Promise<void> {
     const existingRule = (rules as any[]).find((r: any) => r.id === id);
     
     if (!existingRule) {
-      throw new Error(`Rule with id ${id} not found`);
+      throw new NotFoundRefusal('Rule', id, 'actual_rules_get');
     }
     
     const fieldsObj = fields as any;
@@ -2493,7 +3281,14 @@ export async function updateRule(id: string, fields: unknown): Promise<void> {
       actions: fieldsObj.actions ?? existingRule.actions ?? [],
     };
     
-    logger.debug(`[UPDATE RULE] Updating rule ${id} with merged fields: ${JSON.stringify(rule)}`);
+    // Only references this update ADDS are checked: a dangling id already stored does not make
+    // an unrelated edit fail. Diffing the merged rule equals diffing the payload, because an
+    // omitted conditions or actions takes the stored value, which contributes no new refs.
+    const addedRefs = newRuleReferences(rule, existingRule);
+    assertRuleReferencesExist(addedRefs, await loadRuleReferenceListings(addedRefs), RULE_REFUSAL_CHANGED);
+
+    // Rule id only: conditions and actions carry payee ids, notes and amounts (#556).
+    logger.debug(`[UPDATE RULE] Updating rule ${id}`);
     
     await withConcurrency(() => retry(() => rawUpdateRule(rule) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
     logger.debug(`[UPDATE RULE] Update completed for rule ${id}`);
@@ -2553,6 +3348,8 @@ export async function upsertRule(
         conditions: ruleData.conditions ?? (matchedRule as Record<string, unknown>).conditions ?? [],
         actions: ruleData.actions ?? (matchedRule as Record<string, unknown>).actions ?? [],
       };
+      const addedRefs = newRuleReferences(merged, matchedRule);
+      assertRuleReferencesExist(addedRefs, await loadRuleReferenceListings(addedRefs), RULE_REFUSAL_CHANGED);
       // Non-idempotent from upstream's point of view: do not retry the write.
       await withConcurrency(() => retry(() => rawUpdateRule(merged) as Promise<void>, { retries: 0, backoffMs: 200 }));
       return { id: matchedRule.id, created: false };
@@ -2563,6 +3360,8 @@ export async function upsertRule(
     // `Invalid rule stage: undefined`, so the key must be present. null is the correct
     // value: Actual's default stage.
     if (ruleData.stage === undefined) ruleData.stage = null;
+    const createRefs = ruleReferences(ruleData);
+    assertRuleReferencesExist(createRefs, await loadRuleReferenceListings(createRefs), RULE_REFUSAL_CREATED);
     const rawId = await withConcurrency(() => retry(() => rawCreateRule(ruleData) as Promise<unknown>, { retries: 0, backoffMs: 200 }));
     return { id: normalizeToId(rawId), created: true };
   }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
@@ -2627,20 +3426,223 @@ export async function getSchedules(): Promise<unknown[]> {
     return Array.isArray(raw) ? raw : [];
   });
 }
+/**
+ * #479: the dates a schedule falls on, expanded by Actual itself (`api.getScheduleDates`, new in
+ * 26.11.0), so month ends, patterns, intervals and the weekend move match the Actual UI.
+ *
+ * One session: the schedule listing and the expansion run inside the same withActualApi, never
+ * through adapter.getSchedules (the api lock is not reentrant). Upstream takes the schedule row's
+ * `date` field (`scheduleModel.toExternal` maps it from `_date`), a single date or a RecurConfig.
+ * A count is ALWAYS sent, one above what is returned, so an open-ended recurrence returns its next
+ * dates instead of upstream's "needs an end or a count" error, and the extra date is how
+ * `truncated` knows that more dates exist after the last one returned. With both `end` and
+ * `count`, upstream stops at whichever comes first.
+ *
+ * The two refusals a caller can fix are typed and checked BEFORE the upstream call, never chosen
+ * by matching upstream message text: an `end` before `start` (only when both are given; with
+ * `start` omitted upstream uses its own today and its error passes through), and a stored
+ * `skipWeekend` without `weekendSolveMode`. Any other upstream error passes through unchanged.
+ */
+export async function getScheduleDates(
+  scheduleId: string,
+  opts: { start?: string; end?: string; count?: number } = {},
+): Promise<{ schedule_id: string; name: string | null; dates: string[]; count: number; truncated: boolean }> {
+  if (opts.start !== undefined && opts.end !== undefined && opts.end < opts.start) {
+    throw new OutOfRangeRefusal(
+      `end (${opts.end}) is before start (${opts.start}); end must be on or after start.`,
+      opts.end,
+    );
+  }
+  return withActualApi(async () => {
+    observability.incrementToolCall('actual.schedules.dates').catch(() => {});
+    const schedules = await withConcurrency(() =>
+      retry(() => rawGetSchedules() as Promise<Array<{ id?: string; name?: string | null; date?: unknown }>>, { retries: 2, backoffMs: 200 })
+    );
+    const schedule = Array.isArray(schedules) ? schedules.find((s) => s?.id === scheduleId) : undefined;
+    if (!schedule) {
+      throw new NotFoundRefusal('Schedule', scheduleId, 'actual_schedules_get');
+    }
+    const recur = schedule.date as { skipWeekend?: unknown; weekendSolveMode?: unknown } | null;
+    if (recur && typeof recur === 'object' && recur.skipWeekend && !recur.weekendSolveMode) {
+      throw new OutOfRangeRefusal(
+        `Schedule ${scheduleId} has skipWeekend set without weekendSolveMode, so its dates cannot be ` +
+          "computed. Set weekendSolveMode to 'before' or 'after' with actual_schedules_update.",
+        'weekendSolveMode',
+      );
+    }
+    const limit = Math.min(opts.count ?? SCHEDULE_DATES_CAP, SCHEDULE_DATES_CAP);
+    const raw = await withConcurrency(() =>
+      rawGetScheduleDates(schedule.date, {
+        ...(opts.start !== undefined ? { start: opts.start } : {}),
+        ...(opts.end !== undefined ? { end: opts.end } : {}),
+        count: limit + 1,
+      }) as Promise<unknown>
+    );
+    const all = Array.isArray(raw) ? (raw as string[]) : [];
+    const dates = all.slice(0, limit);
+    return {
+      schedule_id: scheduleId,
+      name: typeof schedule.name === 'string' ? schedule.name : null,
+      dates,
+      count: dates.length,
+      truncated: all.length > limit,
+    };
+  });
+}
+/**
+ * #547: upstream builds a schedule's rule with one `is` condition per field and STRINGIFIES the
+ * value on create (`scheduleModel.fromExternal` in loot-core/src/server/api-models.ts), so an
+ * OMITTED payee or account becomes the literal string "undefined". On update
+ * (`api/schedule-update`) an EXISTING condition takes the raw value and only a MISSING one is
+ * pushed as String(value); the server read back the literal "null" after a clear all the same,
+ * and the layer that stringifies it was not identified, so the strip treats raw null, "null"
+ * and "undefined" alike. None of them can ever equal an id, so the rule never links a
+ * transaction: the schedule shows in the UI and in actual_schedules_get but is inert. Reproduced through the server on 2026-10-13 with
+ * @actual-app/api 26.10.0 on every shape (no payee, no account, neither, payee cleared, account
+ * cleared); the control with both fields linked its import.
+ *
+ * The repair drops the dead condition from the schedule's rule inside the SAME drain as the
+ * schedule write, so the rule is right before the drain's api.sync() and no later reader sees
+ * the inert shape. Only a condition whose value is nullish or one of those two literals is
+ * dropped: if upstream stops emitting it there is nothing to strip and no rule write happens.
+ * A schedule without a payee or an account is a legitimate shape (the UI builds it and the tool
+ * description promises it), so it is repaired rather than refused.
+ *
+ * The rule is read back inside the drain, straight after a raw write (the #493 measurement:
+ * upstream can resolve before the row lands), so the read is a bounded poll with the #489 shape.
+ *
+ * A RAW null value is treated as dead too. Upstream's rule engine would match it ("transactions
+ * with no payee"), but the only way it reaches a schedule rule is through a field the caller sent
+ * as null, and the tool contract says null CLEARS the link. Stripping it enforces that contract;
+ * it never deletes a user-authored condition.
+ */
+const DEAD_SCHEDULE_CONDITION_VALUES: ReadonlySet<string> = new Set(['undefined', 'null']);
+type ScheduleLinkField = 'payee' | 'account';
+type RawScheduleRule = {
+  id?: string;
+  stage?: unknown;
+  conditionsOp?: unknown;
+  conditions?: Array<{ field?: string; value?: unknown }>;
+  actions?: Array<{ op?: string; value?: unknown }>;
+};
+
+function isDeadScheduleCondition(cond: { field?: string; value?: unknown }, fields: readonly ScheduleLinkField[]): boolean {
+  if (!fields.includes(cond?.field as ScheduleLinkField)) return false;
+  const v = cond.value;
+  return v == null || (typeof v === 'string' && DEAD_SCHEDULE_CONDITION_VALUES.has(v));
+}
+
+/** Which of the two linkable fields the caller left unset (create) or set to null (update). */
+function unsetScheduleLinkFields(input: Record<string, unknown>, mode: 'create' | 'update'): ScheduleLinkField[] {
+  const unset = (field: ScheduleLinkField) => (mode === 'create' ? input[field] == null : input[field] === null);
+  return (['payee', 'account'] as const).filter(unset);
+}
+
+async function stripDeadScheduleConditions(
+  scheduleId: string,
+  fields: readonly ScheduleLinkField[],
+  opStartedAt: number,
+  mode: 'create' | 'update',
+): Promise<void> {
+  if (fields.length === 0) return;
+  const repair = fields.map((f) => `actual_schedules_update { ${f}: null }`).join(' or ');
+  // Every message below avoids the TRANSIENT_ERROR_PATTERNS substrings ("timed out" included):
+  // _shouldDropPoolOnError would otherwise drop the session's connection. Upstream causes stay
+  // in `cause`, never in the text, for the same reason.
+  const tail = mode === 'create'
+    ? `The schedule EXISTS, so do not create it again: repair it with ${repair}, or delete it with actual_schedules_delete.`
+    : `The schedule was updated; retrying ${repair} is safe.`;
+  const failed = (what: string, err: unknown) =>
+    new Error(`Schedule "${scheduleId}" was saved, but ${what}, so the ${fields.join(' and ')} condition may not be cleared and the schedule may not link any transaction. ${tail}`, { cause: err });
+  // #494: same cap as the split poll, measured from the start of the operation.
+  const T = config.ACTUAL_OP_TIMEOUT_MS;
+  const deadline = T > 0
+    ? Math.min(Date.now() + SPLIT_VERIFY_TIMEOUT_MS, opStartedAt + Math.floor(T / 2))
+    : Date.now() + SPLIT_VERIFY_TIMEOUT_MS;
+  const boundMs = T > 0 ? Math.min(SPLIT_VERIFY_TIMEOUT_MS, Math.floor(T / 2)) : SPLIT_VERIFY_TIMEOUT_MS;
+  let rule: RawScheduleRule | undefined;
+  for (;;) {
+    let rules: RawScheduleRule[];
+    try {
+      rules = await withConcurrency(() => retry(() => rawGetRules() as Promise<RawScheduleRule[]>, { retries: 2, backoffMs: 200 }));
+    } catch (err) {
+      throw failed('its rule could not be read back', err);
+    }
+    rule = (Array.isArray(rules) ? rules : []).find((r) =>
+      (Array.isArray(r?.actions) ? r.actions : []).some((a) => a?.op === 'link-schedule' && a?.value === scheduleId)
+    );
+    if (rule) break;
+    if (Date.now() >= deadline) {
+      // Thrown from the callback so the caller sees it (the drain's closing api.sync() still
+      // saves the schedule).
+      throw new Error(
+        `Schedule "${scheduleId}" was saved, but its rule was not visible within ${boundMs}ms, so the ${fields.join(' and ')} ` +
+          `condition could not be cleared and the schedule will not link any transaction. ${tail}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, SPLIT_VERIFY_INTERVAL_MS));
+  }
+  const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
+  // Review round 1: the rule is in hand, so drop EVERY dead link condition, not only the fields
+  // this call unset. A schedule created before this fix with a payee and no account carries a
+  // dead account condition; the prescribed repair `{ payee: null }` must clear it too, or the
+  // call reports success and the schedule still never links. `fields` only decides whether the
+  // strip runs at all (a name-only update does not reach here) and words the error.
+  const kept = conditions.filter((c) => !isDeadScheduleCondition(c, ['payee', 'account']));
+  if (kept.length === conditions.length) return;
+  try {
+    await withConcurrency(() => retry(() => rawUpdateRule({ ...rule, conditions: kept }) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+  } catch (err) {
+    throw failed('its rule could not be rewritten', err);
+  }
+}
 export async function createSchedule(schedule: unknown): Promise<string> {
   observability.incrementToolCall('actual.schedules.create').catch(() => {});
   return queueWriteOperation(async () => {
+    const opStartedAt = Date.now();
+    const input = (schedule ?? {}) as Record<string, unknown>;
     // Note: rawCreateSchedule(schedule) passes the external schedule object directly.
-    // Do NOT wrap in { schedule: ... } — that would double-nest and break date parsing.
-    const raw = await withConcurrency(() => retry(() => rawCreateSchedule(schedule as Record<string, unknown>) as Promise<string>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    // Do NOT wrap in { schedule: ... }: that would double-nest and break date parsing.
+    const raw = await withConcurrency(() => retry(() => rawCreateSchedule(input) as Promise<string>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
     const id = normalizeToId(raw);
+    // #547: an omitted payee or account is stored as a condition that can never match.
+    await stripDeadScheduleConditions(id, unsetScheduleLinkFields(input, 'create'), opStartedAt, 'create');
     return id;
   }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
 }
 export async function updateSchedule(id: string, fields: unknown, resetNextDate?: boolean): Promise<void> {
   observability.incrementToolCall('actual.schedules.update').catch(() => {});
   return queueWriteOperation(async () => {
-    await withConcurrency(() => retry(() => rawUpdateSchedule(id, fields as Record<string, unknown>, resetNextDate) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    const opStartedAt = Date.now();
+    // #527: upstream MERGES a partial update, so `amountOp` alone keeps the stored amount and
+    // `amount` alone keeps the stored op. Whether the pair fits ('isbetween' takes a
+    // { num1, num2 } range, every other op a number) therefore depends on the stored row when
+    // only one of the two is supplied. The tool's own refinement covers both-supplied. Decided
+    // and thrown BEFORE the non-retried write, so a refusal is never retried or swallowed. A
+    // schedule that is not found falls through to upstream's own not-found error, unchanged.
+    const patch = (fields ?? {}) as Record<string, unknown>;
+    const hasAmount = patch.amount !== undefined;
+    const hasOp = patch.amountOp !== undefined;
+    if (hasAmount !== hasOp) {
+      const schedules = await withConcurrency(() =>
+        retry(() => rawGetSchedules() as Promise<Array<{ id?: string; amount?: unknown; amountOp?: unknown }>>, { retries: 2, backoffMs: 200 })
+      );
+      const stored = Array.isArray(schedules) ? schedules.find((sch) => sch?.id === id) : undefined;
+      if (stored) {
+        const op = hasOp ? patch.amountOp : stored.amountOp;
+        const amount = hasAmount ? patch.amount : stored.amount;
+        const message = amountOpMismatch(op, amount);
+        if (message) {
+          throw new OutOfRangeRefusal(
+            `Schedule "${id}" was not updated: ${message} (stored amountOp ${JSON.stringify(stored.amountOp ?? null)}, stored amount ${JSON.stringify(stored.amount ?? null)}).`,
+            JSON.stringify({ amountOp: op ?? null, amount: amount ?? null }),
+          );
+        }
+      }
+    }
+    await withConcurrency(() => retry(() => rawUpdateSchedule(id, patch, resetNextDate) as Promise<void>, { retries: 0, backoffMs: 200, isRetryable: isRetryableError }));
+    // #547: a payee or account cleared with null is stored as the literal string "null".
+    await stripDeadScheduleConditions(id, unsetScheduleLinkFields(patch, 'update'), opStartedAt, 'update');
   }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
 }
 /**
@@ -3072,22 +4074,146 @@ export async function getPayeeRules(payeeId: string): Promise<unknown[]> {
     return filtered;
   });
 }
+/** One item of `setBudgetBatch`. At least one of `amount` / `carryover` is set (the tool's schema enforces it). */
+export interface BudgetBatchItem {
+  month: string;
+  categoryId: string;
+  amount?: number;
+  carryover?: boolean;
+}
+export interface BudgetBatchSucceeded { index: number; month: string; categoryId: string }
+export interface BudgetBatchFailed extends BudgetBatchSucceeded { error: string }
+export interface BudgetBatchResult { succeeded: BudgetBatchSucceeded[]; failed: BudgetBatchFailed[] }
+
+/** Error recorded for every item the cooperative deadline stopped before it was written. */
+export const BUDGET_BATCH_DEADLINE_ERROR = 'not attempted: batch time budget exhausted';
+/** Fraction of ACTUAL_OP_TIMEOUT_MS the item loop may consume; the rest is left for the trailing sync. */
+const BUDGET_BATCH_DEADLINE_FRACTION = 0.75;
+
 /**
- * #378 CAVEAT ON THIS METHOD'S preservesListings CLAIM. This forwards an arbitrary callback to
- * rawBatchBudgetUpdates, which upstream is only a batch-budget-start / await func() /
- * batch-budget-end transaction bracket: it performs no writes of its own, so the annotation is
- * really a claim about whatever the CALLBACK does. It holds today because
- * src/tools/budget_updates_batch.ts is the only caller passing a real callback and it calls
- * only rawSetBudgetAmount and rawSetBudgetCarryover, both verified listing-safe. Nothing in
- * the signature or upstream constrains that. RE-AUDIT THIS when a second caller appears: a
- * callback reaching rawCreateCategory or rawDeleteAccount would violate the claim with no
- * compiler or runtime signal, and the symptom would be a false not-found elsewhere in the drain.
+ * #516: set budget amounts and/or carryover flags for many (month, category) pairs in ONE
+ * write cycle, with a verdict per item. NOT atomic and no rollback: items applied before a
+ * failure stay applied.
+ *
+ * NO `batchBudgetUpdates` BRACKET (#539). Each raw write is awaited on its own. Outside a
+ * bracket upstream applies the write (`_sendMessages` then `applyMessages`) before the call
+ * returns and rethrows an apply failure (read from the shipped upstream source, not verified by
+ * a read-back), so `succeeded` means the write call returned without error and a failed
+ * apply lands on that item's verdict. Under the bracket (#516 to #539) upstream applied the
+ * queued writes AFTER `batch-budget-end` returned, on a promise it never awaits, so an apply
+ * failure was an unhandled rejection that exited the server after we had reported success. The
+ * cost is one apply per write instead of one per batch; the server sync is a debounced timer
+ * (`scheduleFullSync`), so it still runs once, except under NODE_ENV=test where upstream syncs on
+ * every write. Do not reintroduce the bracket (a unit test guards this).
+ *
+ * TWO PHASES inside one `queueWriteOperation`:
+ *  1. Before any write: read the categories listing and the budget months ONCE each, then
+ *     decide a typed refusal per item. The guards apply to EVERY item, a carryover-only item
+ *     included, because upstream `api/budget-set-amount` validates neither category nor month
+ *     (it INSERTs an orphan `<month>-<category>` row) and the two fields should refuse alike.
+ *  2. Raw writes for the items that passed, each caught per item so one failure does not lose
+ *     the other verdicts. Only `raw*` calls run here: an `adapter.*` call would nest the api
+ *     lock and deadlock.
+ *
+ * INCOME CATEGORIES (maintainer decision): a carryover item whose category is an income
+ * category is refused in phase 1. Upstream `api/budget-set-carryover` rejects income
+ * categories too, but only AFTER an amount written for the same item has landed, so without
+ * this check an item setting both would half-apply. Upstream's own rejection stays as a
+ * backstop and is reported per item.
+ *
+ * RETRY: none. A refusal must never replay, an apply failure is deterministic, a retry would
+ * spend the deadline, and infrastructure errors abort the batch instead; the client re-reads
+ * (`actual_budgets_get_month`) and retries.
+ *
+ * COOPERATIVE DEADLINE. The whole operation runs under one `withOpTimeout`, a `Promise.race`
+ * that cannot cancel the callback, so an abandoned loop would keep writing after the caller was
+ * told it timed out (as in `createRulesBatch`). So the loop checks, before each item write, the
+ * time since this operation started against 75% of ACTUAL_OP_TIMEOUT_MS (skipped when it is 0,
+ * the documented "no bound" setting) and stops writing once it is exceeded; the remaining items
+ * go to `failed`. The 25% left over covers the drain's trailing sync.
+ * WHY NOT `queueWriteOperation`'s `timeoutMs` option: it would LENGTHEN the hold on the
+ * process-global api lock, and it still would not stop an abandoned loop from writing.
+ *
+ * `preservesListings` claim is safe: only raw budget amount and carryover writes run here.
  */
-export async function batchBudgetUpdates(fn: () => Promise<void>): Promise<void> {
-  observability.incrementToolCall('actual.budgets.batchUpdates').catch(() => {});
+export async function setBudgetBatch(items: BudgetBatchItem[]): Promise<BudgetBatchResult> {
+  observability.incrementToolCall('actual.budgets.setBatch').catch(() => {});
   return queueWriteOperation(async () => {
-    await withConcurrency(() => retry(() => rawBatchBudgetUpdates(fn) as Promise<void>, { retries: 2, backoffMs: 200 }));
-  }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
+    const startedAt = Date.now();
+    const succeeded: BudgetBatchSucceeded[] = [];
+    const failed: BudgetBatchFailed[] = [];
+
+    // Phase 1: reads, then refusal decisions. Both reads happen BEFORE the first write.
+    const categories = await withConcurrency(() =>
+      retry(() => readDrainListing('categories', () => rawGetCategories() as Promise<Array<{ id: string; is_income?: boolean }>>), { retries: 2, backoffMs: 200 })
+    );
+    const categoryById = new Map<string, { id: string; is_income?: boolean }>();
+    for (const c of categories as Array<{ id: string; is_income?: boolean }>) categoryById.set(c.id, c);
+    const months = await withConcurrency(() =>
+      retry(() => rawGetBudgetMonths() as Promise<string[]>, { retries: 2, backoffMs: 200 })
+    );
+    const monthKnown = Array.isArray(months) && months.length > 0;
+
+    const toWrite: Array<{ index: number; item: BudgetBatchItem }> = [];
+    items.forEach((item, index) => {
+      let refusal: Error | null = null;
+      const category = categoryById.get(item.categoryId);
+      if (!category) {
+        refusal = new NotFoundRefusal('Category', String(item.categoryId), 'actual_categories_get');
+      } else if (monthKnown && !months.includes(String(item.month))) {
+        refusal = new OutOfRangeRefusal(
+          `Month "${item.month}" is outside this budget's range, which runs from ${months[0]} to ` +
+            `${months[months.length - 1]}. Use actual_budgets_get_months to see the months you can budget to.`,
+          String(item.month),
+        );
+      } else if (item.carryover !== undefined && category.is_income) {
+        refusal = new OutOfRangeRefusal(
+          `Category "${item.categoryId}" is an income category, which cannot carry over. ` +
+            'Nothing was written for this item.',
+          String(item.categoryId),
+        );
+      }
+      if (refusal) failed.push({ index, month: item.month, categoryId: item.categoryId, error: refusal.message });
+      else toWrite.push({ index, item });
+    });
+
+    // Phase 2: raw writes only, each awaited on its own (no bracket, see #539 above).
+    const deadlineMs = config.ACTUAL_OP_TIMEOUT_MS > 0 ? config.ACTUAL_OP_TIMEOUT_MS * BUDGET_BATCH_DEADLINE_FRACTION : 0;
+    for (const { index, item } of toWrite) {
+      const ref = { index, month: item.month, categoryId: item.categoryId };
+      if (deadlineMs > 0 && Date.now() - startedAt > deadlineMs) {
+        failed.push({ ...ref, error: BUDGET_BATCH_DEADLINE_ERROR });
+        continue;
+      }
+      let amountWritten = false;
+      try {
+        if (item.amount !== undefined) {
+          await withConcurrency(() => rawSetBudgetAmount(item.month, item.categoryId, item.amount) as Promise<void>);
+          amountWritten = true;
+        }
+        if (item.carryover !== undefined) {
+          await withConcurrency(() => rawSetBudgetCarryover(item.month, item.categoryId, item.carryover) as Promise<void>);
+        }
+        succeeded.push(ref);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        // Infrastructure errors stop the batch (see abortBatchOnInfrastructureError).
+        abortBatchOnInfrastructureError(error, {
+          label: 'Budget',
+          appliedCount: succeeded.length,
+          total: items.length,
+          applied: succeeded.map((x) => x.index).join(', '),
+          message: msg,
+          readBackTool: 'actual_budgets_get_month',
+        });
+        failed.push({ ...ref, error: amountWritten ? `amount was applied, then the carryover failed: ${msg}` : msg });
+      }
+    }
+
+    succeeded.sort((a, b) => a.index - b.index);
+    failed.sort((a, b) => a.index - b.index);
+    return { succeeded, failed };
+  }, { preservesListings: ['accounts', 'categories', 'categoryGroups', 'payees'] });
 }
 /**
  * #355: RETURNS the upstream verdict instead of discarding it.
@@ -3148,6 +4274,43 @@ export async function resetBudgetHold(month: string): Promise<void> {
     await withConcurrency(() => retry(() => rawResetBudgetHold(month) as Promise<void>, { retries: 2, backoffMs: 200 }));
   }, { preservesListings: PRESERVES_ALL_ENTITY_LISTINGS });
 }
+/**
+ * #561: an empty result whose category.name, payee.name or account.name condition names no
+ * existing entity gains a sibling `hint` naming the value and the query that lists the exact
+ * names. Runs INSIDE runQuery's withActualApi session: raw reads only, never `adapter.*` (the api
+ * lock is not reentrant). Each lookup is a `q()` filter object carrying the main query's own
+ * operator and value, so the value never reaches a query string. A non-empty result, or one with
+ * no name condition, is returned untouched with no lookup; a failed lookup drops the hint rather
+ * than failing a query that succeeded.
+ */
+async function withEmptyResultHint(result: unknown, query: any, q: any): Promise<unknown> {
+  // Upstream answers `{ data }`; a bare array is tolerated the way getFinancialAnalysisSnapshot does.
+  const rows = (r: unknown): unknown[] | undefined =>
+    Array.isArray(r) ? r : Array.isArray((r as { data?: unknown } | null)?.data) ? (r as { data: unknown[] }).data : undefined;
+  const data = rows(result);
+  if (!data || data.length > 0) return result;
+  const lookups = nameConditionLookups(query.serialize?.().filterExpressions ?? []);
+  if (lookups.length === 0) return result;
+  try {
+    const lines: string[] = [];
+    for (const lookup of lookups) {
+      const found = await withConcurrency(() =>
+        rawRunQuery(lookup.inValues
+          ? q(lookup.table).filter({ name: lookup.nameFilter }).select(['name'])
+          : q(lookup.table).filter({ name: lookup.nameFilter }).select(['name']).limit(1)) as Promise<unknown>,
+      );
+      const names = (rows(found) ?? []).map((row) => String((row as { name?: unknown } | null)?.name ?? ''));
+      lines.push(...nameConditionHintLines(lookup, names));
+    }
+    if (lines.length === 0) return result;
+    const hint = lines.join('\n');
+    return Array.isArray(result) ? { data: result, hint } : { ...(result as object), hint };
+  } catch (err) {
+    logger.warn('[ADAPTER] Empty-result name lookup failed; returning the result without a hint', errorLogFields(err));
+    return result;
+  }
+}
+
 export async function runQuery(queryString: string | any): Promise<unknown> {
   try {
     return await withActualApi(async () => {
@@ -3175,7 +4338,7 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
             } catch (err: any) {
               // Catch errors from the query execution to prevent unhandled rejections
               const msg = err?.message || String(err);
-              logger.error(`[ADAPTER] Query execution error: ${msg}`);
+              logger.error('[ADAPTER] Query execution error', errorLogFields(err)); // #559: msg can quote the query
               if (msg.includes('does not exist in table') || msg.includes('Field') || msg.includes('does not exist')) {
                 throw new Error(`Invalid field in query: ${msg}`);
               }
@@ -3193,6 +4356,7 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
     
     const trimmed = queryString.trim();
     let query;
+    let hasWhereClause = false;   // #561: only a parsed SQL WHERE can carry a name condition
     
     // Check for GraphQL-like query syntax: query Name { table(...) { fields } }
     const graphqlMatch = trimmed.match(/^query\s+\w+\s*\{\s*(\w+)\s*\(([^)]*)\)\s*\{([^}]+)\}\s*\}$/is);
@@ -3268,6 +4432,7 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
         // types and coerce boolean literals to real booleans (#420).
         if (whereClause) {
           query = parseWhereClause(query, whereClause, tableName);
+          hasWhereClause = true;
         }
         
         // Apply ORDER BY
@@ -3286,19 +4451,20 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
     }
     
     try {
-      return await withConcurrency(async () => {
+      const result = await withConcurrency(async () => {
         try {
           return await rawRunQuery(query) as Promise<unknown>;
         } catch (err: any) {
           // Catch errors from the query execution to prevent unhandled rejections
           const msg = err?.message || String(err);
-          logger.error(`[ADAPTER] Query execution error: ${msg}`);
+          logger.error('[ADAPTER] Query execution error', errorLogFields(err)); // #559: msg can quote the query
           if (msg.includes('does not exist in table') || msg.includes('Field') || msg.includes('does not exist')) {
             throw new Error(`Invalid field in query: ${msg}`);
           }
           throw err;
         }
       });
+      return hasWhereClause ? await withEmptyResultHint(result, query, q) : result;
     } catch (error: any) {
       // Enhance error messages with helpful context
       const errorMsg = error?.message || String(error);
@@ -3329,7 +4495,8 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
   } catch (error: any) {
     // Top-level catch to ensure no unhandled rejections escape
     const errorMsg = error?.message || String(error);
-    logger.error(`[ADAPTER] Query execution failed: ${errorMsg}`);
+    // The message can embed the whole query (#559); the client still receives it below.
+    logger.error('[ADAPTER] Query execution failed', errorLogFields(error));
     
     // If the error already contains formatted validation errors with suggestions, preserve them
     if (errorMsg.includes('Invalid SQL query:') && (errorMsg.includes('Available fields:') || errorMsg.includes('Available tables:'))) {
@@ -3426,87 +4593,108 @@ export async function getFinancialAnalysisSnapshot(params: {
 
 // WHERE-clause translation extracted to ./actual-adapter/query.ts (#166).
 // Imported for internal use by runQuery and re-exported (unit-tested directly).
-import { parseWhereClause } from './actual-adapter/query.js';
+import { parseWhereClause, nameConditionLookups, nameConditionHintLines } from './actual-adapter/query.js';
 export { parseWhereClause };
-export async function runBankSync(accountId?: string): Promise<void> {
+/**
+ * What `api.runBankSync` resolves with since @actual-app/api 26.11.0 (#548): transaction ids,
+ * transaction ids and account ids. Declared here because the upstream type lives in
+ * `@actual-app/core`, which tsconfig redirects to the do-not-modify stub in `types/`.
+ * `updatedAccounts` lists only accounts that received NEW transactions; `matchedTransactions`
+ * are existing transactions the sync reconciled, not new ones.
+ */
+export interface BankSyncReport {
+  newTransactions: string[];
+  matchedTransactions: string[];
+  updatedAccounts: string[];
+}
+
+function normaliseBankSyncReport(raw: unknown): BankSyncReport {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const list = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
+  return {
+    newTransactions: list(r.newTransactions),
+    matchedTransactions: list(r.matchedTransactions),
+    updatedAccounts: list(r.updatedAccounts),
+  };
+}
+
+const BANK_SYNC_SETUP_HINT =
+  'To use bank sync, link your account(s) with a supported provider (GoCardless or SimpleFIN) in the Actual Budget UI. ' +
+  'See https://actualbudget.org/docs/advanced/bank-sync for setup instructions.';
+
+export async function runBankSync(accountId?: string): Promise<BankSyncReport> {
   try {
-    return await withActualApi(async () => {
+    // #548: a write, so the import and the bank_sync_status row reach the server. In pooled
+    // mode withActualApiWrite pushes once after a RESOLVED sync and never in a rejection path;
+    // on the fallback (init/op/shutdown) path, shutdown still syncs whatever a partial
+    // all-accounts run imported before it failed. Not queueWriteOperation: bank sync is one
+    // upstream call, and the queue's per-call bound has no env knob, which #619 owns.
+    return await withActualApiWrite(async () => {
       observability.incrementToolCall('actual.bank.sync').catch(() => {});
-      // Bank sync must NOT be retried — retrying could import duplicate transactions.
+      // Bank sync must NOT be retried: retrying could import duplicate transactions.
       // Pass { accountId } for a specific account, or {} to sync all linked accounts.
       const args = accountId != null ? { accountId } : {};
 
-      // Pre-check: verify bank-linked accounts exist before calling rawRunBankSync.
-      // The SDK silently resolves void for local accounts (account_sync_source: null),
-      // which would otherwise be misreported as success and cause an unnecessary 30s wait.
+      // Pre-check: upstream resolves silently for a local account and skips a closed one,
+      // which would read as an empty but successful sync. Refusals are typed (#377).
       if (accountId != null) {
-        // Per-account check: verify the specified account is bank-linked.
         const { data: acctRows } = await rawRunQuery(
           (api as any).q('accounts')
-            .select(['account_sync_source', 'name'])
+            .select(['account_sync_source', 'account_id', 'name', 'closed'])
             .filter({ id: accountId, tombstone: false })
-        ) as { data: Array<{ account_sync_source: string | null; name: string }> };
+        ) as { data: Array<{ account_sync_source: string | null; account_id: string | null; name: string; closed: boolean | number }> };
 
         const acct = acctRows?.[0];
         if (!acct) {
-          throw new Error(`Bank sync failed: Account not found (id: ${accountId})`);
+          // Only reachable on a race: the tool resolves the id with verifyExists first (#388).
+          throw new NotFoundRefusal('Account', accountId, 'actual_accounts_list');
         }
         if (!acct.account_sync_source) {
-          throw new Error(
-            `Bank sync failed: Account "${acct.name}" is a local account — not configured for bank sync. ` +
-            `To use bank sync, link your account with a supported provider (GoCardless or SimpleFIN) in the Actual Budget UI. ` +
-            `See https://actualbudget.org/docs/advanced/bank-sync for setup instructions.`
+          throw new OutOfRangeRefusal(
+            `Bank sync failed: Account "${acct.name}" is a local account, not configured for bank sync. ${BANK_SYNC_SETUP_HINT}`,
+            accountId,
+          );
+        }
+        if (acct.closed) {
+          throw new OutOfRangeRefusal(
+            `Bank sync failed: Account "${acct.name}" is closed; Actual skips closed accounts in bank sync. Reopen it in Actual to sync it.`,
+            accountId,
+          );
+        }
+        // Upstream also skips an account without a provider account id (and one without a bank
+        // row, which AQL does not expose, so that rarer half-link still reads as an empty sync).
+        if (!acct.account_id) {
+          throw new OutOfRangeRefusal(
+            `Bank sync failed: Account "${acct.name}" has a ${acct.account_sync_source} link with no provider account; Actual skips it in bank sync. Re-link it in the Actual Budget UI.`,
+            accountId,
           );
         }
       } else {
-        // Global check: verify at least one bank-linked account exists across the budget.
         const { data: allAccounts } = await rawRunQuery(
           (api as any).q('accounts')
-            .select(['account_sync_source'])
+            .select(['account_sync_source', 'account_id', 'closed'])
             .filter({ tombstone: false })
-        ) as { data: Array<{ account_sync_source: string | null }> };
+        ) as { data: Array<{ account_sync_source: string | null; account_id: string | null; closed: boolean | number }> };
 
-        const linkedCount = allAccounts?.filter(a => a.account_sync_source).length ?? 0;
-        if (linkedCount === 0) {
-          throw new Error(
-            `Bank sync failed: No accounts are configured for bank sync. ` +
-            `To use bank sync, link your account(s) with a supported provider (GoCardless or SimpleFIN) in the Actual Budget UI. ` +
-            `See https://actualbudget.org/docs/advanced/bank-sync for setup instructions.`
+        const linked = (allAccounts ?? []).filter(a => a.account_sync_source && a.account_id);
+        if (!linked.some(a => !a.closed)) {
+          throw new OutOfRangeRefusal(
+            linked.length > 0
+              ? 'Bank sync failed: Every bank-linked account is closed; Actual skips closed accounts in bank sync. Reopen one in Actual to sync it.'
+              : `Bank sync failed: No accounts are configured for bank sync. ${BANK_SYNC_SETUP_HINT}`,
+            'all',
           );
         }
       }
 
-      // rawRunBankSync returns void immediately; the actual provider call runs on
-      // a background promise inside the SDK and surfaces errors as unhandledRejection.
-      // We install a temporary listener to capture any BankSyncError and re-throw.
-      let capturedRejection: any = null;
-      const rejectionHandler = (reason: any) => {
-        const msg: string = reason?.message || String(reason);
-        if (
-          reason?.type === 'BankSyncError' ||
-          msg.includes('BankSyncError') ||
-          msg.includes('NORDIGEN_ERROR') ||
-          msg.includes('Rate limit exceeded') ||
-          msg.includes('Failed syncing account') ||
-          msg.includes('GoCardless') ||
-          msg.includes('SimpleFIN')
-        ) {
-          capturedRejection = reason;
-        }
-      };
-      process.on('unhandledRejection', rejectionHandler);
-      try {
-        await rawRunBankSync(args) as unknown as void;
-        // Wait for the SDK's background promise to resolve/reject.
-        // Provider errors (rate limits, auth failures) arrive in < 3s in practice;
-        // BANK_SYNC_SETTLE_MS gives a comfortable margin to catch them.
-        await new Promise(resolve => setTimeout(resolve, BANK_SYNC_SETTLE_MS));
-        if (capturedRejection !== null) throw capturedRejection;
-      } finally {
-        process.off('unhandledRejection', rejectionHandler);
-      }
+      // Since 26.11 upstream awaits the provider and rejects this call itself, so the old
+      // settle sleep and the process-wide unhandledRejection listener are gone (#548).
+      return normaliseBankSyncReport(await rawRunBankSync(args as any));
     });
   } catch (error: any) {
+    // A typed refusal is already the caller-facing answer; the text mapping below would
+    // rewrite "not configured" into a generic message and lose the brand.
+    if (isPreflightRefusal(error)) throw error;
     const errorMsg = error?.message || String(error);
 
     // Network / connectivity errors (includes "fetch failed" from Node.js native fetch)
@@ -3538,28 +4726,18 @@ export async function runBankSync(accountId?: string): Promise<void> {
       );
     }
 
-    // GoCardless / SimpleFIN provider-level errors
-    // BankSyncError objects (from @actual-app/api) may have { type, category, code, message }
-    const bankSyncCategory = (error as any)?.category || '';
-    if (
-      errorMsg.includes('Rate limit exceeded') ||
-      errorMsg.includes('RATE_LIMIT_EXCEEDED') ||
-      bankSyncCategory === 'RATE_LIMIT_EXCEEDED'
-    ) {
-      const reset = (error as any)?.details?.rateLimitHeaders?.http_x_ratelimit_account_success_reset;
-      const retryIn = reset ? ` Retry in ~${Math.ceil(Number(reset) / 60)} minute(s).` : '';
+    // Provider errors. Since 26.11 the rejection is a plain Error with `.code` only (no
+    // category, type or details), so the upstream message is the one rate-limit signal.
+    if (errorMsg.includes('Rate limit exceeded')) {
       throw new Error(
-        `Bank sync failed: GoCardless rate limit exceeded for this account.${retryIn} ` +
+        `Bank sync failed: GoCardless rate limit exceeded for this account. ` +
         `(NORDIGEN RATE_LIMIT_EXCEEDED: account success quota exhausted)`
       );
     }
-    if (
-      (error as any)?.type === 'BankSyncError' ||
-      errorMsg.includes('BankSyncError') ||
-      errorMsg.includes('NORDIGEN_ERROR') ||
-      errorMsg.includes('Failed syncing account')
-    ) {
-      throw new Error(`Bank sync failed: Provider error: ${errorMsg}`, { cause: error });
+    if (errorMsg.includes('Failed syncing account')) {
+      // The message names only the account; `.code` is the one hint at why (re-link or retry).
+      const code = typeof error?.code === 'string' && error.code ? ` (code ${error.code})` : '';
+      throw new Error(`Bank sync failed: Provider error: ${errorMsg}${code}`, { cause: error });
     }
 
     throw new Error(`Bank sync failed: ${errorMsg}`, { cause: error });   // #452: keep the brand
@@ -3569,7 +4747,17 @@ export async function getBudgets(): Promise<unknown[]> {
   return withActualApi(async () => {
     observability.incrementToolCall('actual.budgets.getAll').catch(() => {});
     const raw = await withConcurrency(() => retry(() => rawGetBudgets() as Promise<unknown>, { retries: 2, backoffMs: 200 }));
-    return Array.isArray(raw) ? raw : [];
+    const files = Array.isArray(raw) ? raw : [];
+    // #570: a restricted caller sees only files whose groupId (the sync id) it may
+    // use. A file with no groupId was never uploaded and belongs to no list. The
+    // dynamic ACL resolver calls this under its own `allowedBudgets: ['*']`, so it
+    // still sees every file.
+    const allowed = restrictedAllowedBudgets('actual_budgets_get_all');
+    if (!allowed) return files;
+    return files.filter(f => {
+      const groupId = (f as { groupId?: unknown } | null)?.groupId;
+      return typeof groupId === 'string' && allowed.includes(groupId);
+    });
   });
 }
 
@@ -3611,18 +4799,29 @@ export async function switchBudget(name: string): Promise<{ name: string; syncId
 
   const key = name.toLowerCase();
   const found: BudgetConfig | undefined = budgetRegistry.get(key);
-  if (!found) {
-    const available = [...budgetRegistry.values()].map(b => `"${b.name}"`).join(', ');
-    throw new Error(
+  // #570: a restricted caller is told only about budgets it may use.
+  const notFound = (): Error => {
+    const permitted = restrictedAllowedBudgets('actual_budgets_switch');
+    const available = [...budgetRegistry.values()]
+      .filter(b => !permitted || permitted.includes(b.syncId))
+      .map(b => `"${b.name}"`).join(', ') || 'none permitted for this session';
+    return new Error(
       `Budget "${name}" not found in configuration. ` +
       `Available budgets: ${available}. ` +
       `Add BUDGET_n_NAME/SYNC_ID/SERVER_URL vars to configure additional budgets.`,
     );
-  }
+  };
+  if (!found) throw notFound();
+  // #628: tool results show the server origin only, never a userinfo credential, path or query.
+  // `found` keeps the raw URL, which the login below still needs.
+  const shownServerUrl = logSafeOrigin(found.serverUrl);
 
   // ACL enforcement: the target budget must be in this session's allowedBudgets.
-  // OIDC mode: explicit ACL required. Non-OIDC: short-circuit allow (single-user).
-  if (config.AUTH_PROVIDER === 'oidc') {
+  // OIDC mode: explicit ACL required. #572: any mode whose request carries a
+  // restricting list (MCP_STATIC_TOKENS) is checked against it too; with no list
+  // outside OIDC the caller is unrestricted (legacy bearer, no-auth).
+  const restricting = restrictingAllowList(allowedBudgets);
+  if (config.AUTH_PROVIDER === 'oidc' || restricting) {
     if (!allowedBudgets) {
       logger.warn(
         JSON.stringify({
@@ -3637,7 +4836,7 @@ export async function switchBudget(name: string): Promise<{ name: string; syncId
         `Budget ACL: cannot switch to "${found.name}". No allowedBudgets in request context.`,
       );
     }
-    if (!allowedBudgets.includes('*') && !allowedBudgets.includes(found.syncId)) {
+    if (restricting && !restricting.includes(found.syncId)) {
       logger.warn(
         JSON.stringify({
           event: 'acl_denied',
@@ -3647,9 +4846,12 @@ export async function switchBudget(name: string): Promise<{ name: string; syncId
           tool: 'actual_budgets_switch',
         }),
       );
-      throw new Error(
-        `Budget ACL: budget "${found.name}" (${found.syncId}) is not in this session's allowedBudgets.`,
-      );
+      // #570: a denied budget gets the SAME error as an unknown name, so guessing
+      // names cannot confirm that a budget outside the list exists. The round 1
+      // review accepted a distinct "Budget ACL:" refusal here; that was reversed
+      // because hiding other budgets is the point of this ticket. The log above
+      // keeps the syncId for the operator.
+      throw notFound();
     }
   }
 
@@ -3672,13 +4874,13 @@ export async function switchBudget(name: string): Promise<{ name: string; syncId
 
   if (sameAuth && currentEntry!.syncId === found.syncId) {
     // No-op: already on this exact budget. Keep session map consistent and return.
-    sessionBudgetState.set(sessionId, key);
+    setSessionBudget(sessionId, key);
     setPreferredBudgetSyncId(store?.principal, found.syncId); // #189: persist at commit
 
     logger.info(
       `[ADAPTER] switchBudget no-op for session ${sessionId}: already on "${found.name}" (${found.syncId})`,
     );
-    return { name: found.name, syncId: found.syncId, serverUrl: found.serverUrl };
+    return { name: found.name, syncId: found.syncId, serverUrl: shownServerUrl };
   }
 
   if (sameAuth) {
@@ -3692,96 +4894,120 @@ export async function switchBudget(name: string): Promise<{ name: string; syncId
       // path was taken by spying on connectionPool.shutdownConnection.
     } else {
       await withApiLock(async () => {
-        // Bound the in-place budget reload too (#270).
-        await loadBudgetTracked(found.syncId, found.encryptionPassword);
+        // Bound the in-place budget reload too (#270). #571: "same auth" compares against THIS
+        // session's pool entry, but the singleton may be logged in to another session's server by
+        // now, so the load still has to make sure it is talking to this budget's server.
+        await loadBudgetOnItsServer(found);
       });
     }
     connectionPool.updateLoadedSyncId(sessionId, found.syncId);
-    sessionBudgetState.set(sessionId, key);
+    setSessionBudget(sessionId, key);
     setPreferredBudgetSyncId(store?.principal, found.syncId); // #189: persist at commit
 
     logger.info(
-      `[ADAPTER] Active budget switched for session ${sessionId} to: "${found.name}" (${found.syncId}) on ${found.serverUrl}`,
+      `[ADAPTER] Active budget switched for session ${sessionId} to: "${found.name}" (${found.syncId}) on ${logSafeOrigin(found.serverUrl)}`,
     );
-    return { name: found.name, syncId: found.syncId, serverUrl: found.serverUrl };
+    return { name: found.name, syncId: found.syncId, serverUrl: shownServerUrl };
   }
 
-  // Slow path: different server or credentials. Release the existing pool
-  // entry (bound to the previous syncId / server) BEFORE mutating the session
-  // map. Swallow shutdown errors: a stale or missing pool entry is benign.
+  // #581: hold this session's slot across the window between releasing the old entry and
+  // creating the new one, so a concurrent initialize cannot take it and leave this session over
+  // the cap. A session that holds a slot always re-reserves; one whose entry was already dropped
+  // may be refused when the pool is full, and getConnection below then fails the same way it
+  // always has (the legacy fallback). stdio never has a pool entry, so it reserves nothing.
+  const holdsSlot = store?.transport !== 'stdio' && connectionPool.reserveSession(sessionId);
+  if (store?.transport !== 'stdio' && !holdsSlot) {
+    logger.warn(
+      `[ADAPTER] switchBudget: session ${sessionId} holds no pool slot and the pool is full; ` +
+        'the switch proceeds on the legacy init+shutdown fallback.',
+    );
+  }
   try {
-    await connectionPool.shutdownConnection(sessionId);
-  } catch (e) {
-    logger.debug(`[ADAPTER] switchBudget: shutdownConnection raised (likely no prior entry): ${e}`);
-  }
-
-  // Update the per-session active-budget slot. Subsequent getActiveBudgetConfig
-  // calls for this session now return the new budget.
-  sessionBudgetState.set(sessionId, key);
-  setPreferredBudgetSyncId(store?.principal, found.syncId); // #189: persist at commit
-
-  // Materialise a fresh pool entry bound to the new budget. Without this, the
-  // next withActualApi call would find no pool entry and fall back to the
-  // legacy init+shutdown path. Failure here is logged but not fatal: the
-  // legacy fallback still works, just less efficiently.
-  //
-  // #348 EXCEPTION: never for a stdio session. stdio gained a synthetic session
-  // id so it could switch budgets at all, but it must stay on the legacy
-  // init/shutdown cycle. A pooled entry for stdio would be created here and then
-  // NEVER refreshed, because connectionPool.touch() is called only from
-  // httpServer.ts; it would expire after SESSION_IDLE_TIMEOUT_MINUTES and
-  // cleanupIdleConnections would tear it down. Since #392 that teardown takes the api mutex and
-  // re-checks expiry, so it is no longer a mid-operation hazard, but an entry that is never
-  // refreshed still expires, and that is the reason that matters here. The
-  // legacy path re-reads getActiveBudgetConfig() on every call, so the switch
-  // still takes effect; it just costs an init per operation, which is what stdio
-  // already did before this ticket.
-  if (store?.transport === 'stdio') {
-    logger.debug(
-      `[ADAPTER] switchBudget: session ${sessionId} is stdio; skipping pool materialisation ` +
-        '(stdio stays on the legacy init/shutdown path by design, #348).',
-    );
-  } else if (_skipApiInitForTests) {
-    setApiInitialized(true);
-  } else {
+    // Slow path: different server or credentials. Release the existing pool
+    // entry (bound to the previous syncId / server) BEFORE mutating the session
+    // map. Swallow shutdown errors: a stale or missing pool entry is benign.
     try {
-      await connectionPool.getConnection(sessionId, {
-        serverUrl: found.serverUrl,
-        password: found.password || '',
-        syncId: found.syncId,
-        encryptionPassword: found.encryptionPassword,
-      });
-    } catch (poolErr) {
-      logger.warn(
-        `[ADAPTER] switchBudget: failed to materialise new pool entry for session ${sessionId}: ${poolErr}. ` +
-          'Subsequent calls will use the legacy init+shutdown fallback.',
-      );
+      await connectionPool.shutdownConnection(sessionId);
+    } catch (e) {
+      logger.debug(`[ADAPTER] switchBudget: shutdownConnection raised (likely no prior entry): ${e}`);
     }
+
+    // Update the per-session active-budget slot. Subsequent getActiveBudgetConfig
+    // calls for this session now return the new budget.
+    setSessionBudget(sessionId, key);
+    setPreferredBudgetSyncId(store?.principal, found.syncId); // #189: persist at commit
+
+    // Materialise a fresh pool entry bound to the new budget. Without this, the
+    // next withActualApi call would find no pool entry and fall back to the
+    // legacy init+shutdown path. Failure here is logged but not fatal: the
+    // legacy fallback still works, just less efficiently.
+    //
+    // #348 EXCEPTION: never for a stdio session. stdio gained a synthetic session
+    // id so it could switch budgets at all, but it must stay on the legacy
+    // init/shutdown cycle. A pooled entry for stdio would be created here and then
+    // NEVER refreshed, because connectionPool.touch() is called only from
+    // httpServer.ts; it would expire after SESSION_IDLE_TIMEOUT_MINUTES and
+    // cleanupIdleConnections would tear it down. Since #392 that teardown takes the api mutex and
+    // re-checks expiry, so it is no longer a mid-operation hazard, but an entry that is never
+    // refreshed still expires, and that is the reason that matters here. The
+    // legacy path re-reads getActiveBudgetConfig() on every call, so the switch
+    // still takes effect; it just costs an init per operation, which is what stdio
+    // already did before this ticket.
+    if (store?.transport === 'stdio') {
+      logger.debug(
+        `[ADAPTER] switchBudget: session ${sessionId} is stdio; skipping pool materialisation ` +
+          '(stdio stays on the legacy init/shutdown path by design, #348).',
+      );
+    } else if (_skipApiInitForTests) {
+      setApiInitialized(true);
+    } else {
+      try {
+        await connectionPool.getConnection(sessionId, {
+          serverUrl: found.serverUrl,
+          password: found.password || '',
+          syncId: found.syncId,
+          encryptionPassword: found.encryptionPassword,
+        });
+      } catch (poolErr) {
+        logger.warn(
+          `[ADAPTER] switchBudget: failed to materialise new pool entry for session ${sessionId}: ${poolErr}. ` +
+            'Subsequent calls will use the legacy init+shutdown fallback.',
+        );
+      }
+    }
+  } finally {
+    // A no-op once getConnection handed the reservation over to the new entry.
+    if (holdsSlot) connectionPool.releaseReservation(sessionId);
   }
 
   logger.info(
-    `[ADAPTER] Active budget switched for session ${sessionId} to: "${found.name}" (${found.syncId}) on ${found.serverUrl}`,
+    `[ADAPTER] Active budget switched for session ${sessionId} to: "${found.name}" (${found.syncId}) on ${logSafeOrigin(found.serverUrl)}`,
   );
-  return { name: found.name, syncId: found.syncId, serverUrl: found.serverUrl };
+  return { name: found.name, syncId: found.syncId, serverUrl: shownServerUrl };
 }
 
 /**
- * Clear the per-session budget state for a session. Called from
- * session_close so the per-session map does not accumulate stale entries
- * after a session ends. See #156.
+ * Clear the per-session budget state for a session, so the map does not
+ * accumulate entries for ended sessions (#156). Called from the HTTP
+ * transport's teardownSession on every session end (#564) and from
+ * session_close, which also covers stdio.
  */
 export function clearSessionBudgetState(sessionId: string): void {
   sessionBudgetState.delete(sessionId);
 }
 
 /**
- * Return all configured budgets from the registry (for listing in actual_budgets_list_available).
+ * Return the configured budgets this caller may use (for actual_budgets_list_available).
+ * A restricted caller sees only its permitted entries (#570); the startup registry log
+ * reads the Map directly and is not filtered.
  */
 export function getBudgetRegistry(): Array<{ name: string; syncId: string; serverUrl: string; hasEncryption: boolean }> {
-  return [...budgetRegistry.values()].map(b => ({
+  const allowed = restrictedAllowedBudgets('actual_budgets_list_available');
+  return [...budgetRegistry.values()].filter(b => !allowed || allowed.includes(b.syncId)).map(b => ({
     name: b.name,
     syncId: b.syncId,
-    serverUrl: b.serverUrl,
+    // #628: origin only; the registry entry itself keeps the raw URL for the login.
+    serverUrl: logSafeOrigin(b.serverUrl),
     hasEncryption: !!b.encryptionPassword,
   }));
 }
@@ -4005,14 +5231,35 @@ export async function exportBudget(): Promise<Uint8Array> {
  * Side effect worth knowing at every call site: upstream `importBudget` LOADS the
  * imported budget, so the session's active budget changes to the new file. It is
  * therefore outside the `BUDGET_N_*` registry and outside whatever budget the ACL
- * resolved for this request. The write queue still enforces the ACL on entry, so a
- * caller cannot use this to escape a budget they were already denied, but the
- * resulting budget is un-ACL'd because it did not exist when the ACL was built.
+ * resolved for this request. The resulting budget is un-ACL'd because it did not
+ * exist when the ACL was built, so a RESTRICTED caller is refused outright (#570),
+ * before any lock or upstream call. Wildcard and unrestricted callers can still
+ * import; the write queue also enforces the ACL on their active budget.
+ *
+ * Upstream creates a NEW cloud file for the import (fresh id, best-effort upload),
+ * so it never overwrites another budget on the server. The local copy is keyed by
+ * the archive's own id, so an archive of budget X replaces X's LOCAL copy.
  */
 export async function importBudget(
   input: string | Uint8Array,
   opts: { type?: string; filename?: string } = {},
 ): Promise<{ id: string }> {
+  const restricted = restrictedAllowedBudgets('actual_budgets_import');
+  if (restricted) {
+    logger.warn(
+      JSON.stringify({
+        event: 'acl_denied',
+        reason: 'import_by_restricted_principal',
+        allowedBudgets: restricted,
+        sessionId: requestContext.getStore()?.sessionId ?? null,
+        tool: 'actual_budgets_import',
+      }),
+    );
+    throw new Error(
+      'Budget ACL: actual_budgets_import is not available to a session with a restricted ' +
+        'allowedBudgets list: the imported budget would belong to no permitted list.',
+    );
+  }
   observability.incrementToolCall('actual.budgets.import').catch(() => {});
   const result = await queueWriteOperation(async () => {
     // #394: an import re-points the process-global singleton exactly as a download does, so it
@@ -4148,12 +5395,14 @@ export default {
   deleteAccount,
   updateTransaction,
   deleteTransaction,
+  mergeTransactions,
   updateCategory,
   deleteCategory,
   updatePayee,
   deletePayee,
   getRules,
   createRule,
+  createRulesBatch,
   updateRule,
   deleteRule,
   upsertRule,
@@ -4166,7 +5415,7 @@ export default {
   deleteCategoryGroup,
   mergePayees,
   getPayeeRules,
-  batchBudgetUpdates,
+  setBudgetBatch,
   transferBudgetAmount,
   holdBudgetForNextMonth,
   resetBudgetHold,
@@ -4178,6 +5427,7 @@ export default {
   getIDByName,
   getServerVersion,
   getSchedules,
+  getScheduleDates,
   createSchedule,
   updateSchedule,
   deleteSchedule,
@@ -4186,5 +5436,6 @@ export default {
   exportBudget,
   importBudget,
   getPreferences,
+  getContext,
   notifications,
 };

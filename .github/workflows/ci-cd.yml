@@ -201,6 +201,71 @@ jobs:
           echo "- **Version**: \`${{ needs.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
 
   # --------------------------------------------------------------------------
+  # #602: documentation checks (`npm run docs:check`): an offline link and anchor
+  # check run by lychee, the recursive version-marker guard, and (#604) the
+  # config-drift guard, which needs the build step below.
+  # --------------------------------------------------------------------------
+  docs-check:
+    name: Docs check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: version
+    # Least privilege, as in the lint job: this job downloads lychee at runtime.
+    # lychee runs with --offline, so no repository content leaves the runner.
+    permissions:
+      contents: read
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      # #604: the config-drift module reads the compiled schema and registry under
+      # dist/. Without this build it would skip, which CI turns into a failure.
+      - name: 🏗️ Build
+        run: npm run build
+
+      # Installed from the release tarball and checked against a pinned sha256, as
+      # actionlint is (#328): a moved action tag or a replaced asset fails here
+      # instead of running unverified code that could report every link as fine.
+      # scripts/docs/links.mjs parses lychee's JSON report and needs 0.24 or later.
+      - name: 🔗 Install lychee
+        env:
+          LYCHEE_VERSION: v0.24.2
+          LYCHEE_SHA256: 1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a
+        run: |
+          dir="$RUNNER_TEMP/lychee"
+          mkdir -p "$dir"
+          tarball="lychee-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sfL -o "$dir/$tarball" "https://github.com/lycheeverse/lychee/releases/download/lychee-${LYCHEE_VERSION}/$tarball"
+          echo "$LYCHEE_SHA256  $dir/$tarball" | sha256sum -c -
+          tar -xzf "$dir/$tarball" -C "$dir"
+          bin="$(dirname "$(find "$dir" -type f -name lychee | head -1)")"
+          "$bin/lychee" --version
+          echo "$bin" >> "$GITHUB_PATH"
+
+      # CI is set, so a missing lychee fails here as `links: lychee required but
+      # not found` instead of skipping.
+      - name: 📚 Check docs (links, anchors, version markers, config drift)
+        run: npm run docs:check
+
+      # The fixture test also runs in the `test` job, where there is no lychee and
+      # it skips. Here the opt-in makes a missing lychee a failure, so the negative
+      # fixture (three broken links, plus the without-fragments control) is proven
+      # against the pinned lychee on every run.
+      - name: 🧪 Prove the link check catches the negative fixture
+        env:
+          DOCS_CHECK_REQUIRE_LYCHEE: '1'
+        run: node tests/unit/docs_links_fixture.test.js
+
+  # --------------------------------------------------------------------------
   # Job 3: Run Tests (Unit & Smoke)
   # --------------------------------------------------------------------------
   # #275: prove the Node floor guard actually fires on an unsupported interpreter.
@@ -355,12 +420,25 @@ jobs:
   docker-e2e:
     name: Docker E2E Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # #593: the job cap sits above the run step's own timeout (below) so that step always fires
+    # first. Measured on the runs before #593: the steps before it take about 1 minute warm, the
+    # log dump and teardown under 15 seconds, the image cache save under 30 seconds, so a run that
+    # stalls to the step limit still ends with over 5 minutes of job time to spare. 37 since the
+    # step went to 30 (#678).
+    timeout-minutes: 37
     needs: version
     if: ${{ github.event.inputs.skip_tests != 'true' }}
+    # #600: this job only checks out, uses the Actions cache and builds images locally. It pushes
+    # nothing and never logs in to a registry, so it needs no write scope; actions/cache uses the
+    # runtime token, not GITHUB_TOKEN.
+    permissions:
+      contents: read
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v7
+        with:
+          # #600: later steps run repository scripts; do not leave the token in .git/config.
+          persist-credentials: false
 
       - name: 🔧 Setup Node.js
         uses: actions/setup-node@v7
@@ -372,15 +450,15 @@ jobs:
         run: npm ci
 
       # Playwright browsers are NOT installed on the host: tests run inside the
-      # mcr.microsoft.com/playwright:v1.62.1-jammy Docker container (e2e-test-runner
-      # service in docker-compose.test.yaml) which already has Playwright pre-installed.
+      # mcr.microsoft.com/playwright:v1.64.1-jammy Docker container (e2e-test-runner
+      # service in tests/e2e/compose.yaml) which already has Playwright pre-installed.
 
       - name: 🗄️ Restore Docker image cache
         id: docker-cache
         uses: actions/cache@v6
         with:
           path: /tmp/docker-image-cache
-          key: docker-e2e-images-${{ runner.os }}-${{ hashFiles('docker-compose.test.yaml') }}
+          key: docker-e2e-images-${{ runner.os }}-${{ hashFiles('tests/e2e/compose.yaml') }}
           restore-keys: docker-e2e-images-${{ runner.os }}-
 
       - name: 🐳 Load cached Docker images
@@ -390,8 +468,40 @@ jobs:
             [ -f "$f" ] && docker load -i "$f" && echo "Loaded $f" || true
           done
 
+      # #593: a step-level timeout. A stall inside this step used to run into the job timeout and
+      # end as job `cancelled` (indistinguishable from a superseded push); a step timeout ends it
+      # as `failure` and still runs the always() steps below. `timeout-minutes` on a step counts
+      # only that step: across the 25 successful runs before this change it took 11.5 to 12.6
+      # minutes with warm image caches, and a cold cache (first run after the compose file
+      # changes) pulls two images inside it, so 18 leaves over 5 minutes on a healthy run. When
+      # this step timed out in a test run (40330966576, timeout 1), nothing from the script's
+      # EXIT trap reached the job log and the containers were still up at the cleanup step, so
+      # that step dumps the service logs too.
+      # #678: 30, not 18. The compact surface rows grew the suite to 257 tests per leg,
+      # and the stdio leg is paced at 90 calls a minute: run 43378416460 passed HTTP in 5.2
+      # minutes and was cut off in the last stdio rows at 18; the same sha took 12.3 minutes for
+      # stdio alone locally. A healthy run is now about 19 minutes.
       - name: 🧪 Run Docker E2E tests (FULL - 63 tests)
+        id: e2e
+        timeout-minutes: 30
         run: npm run test:e2e:docker:full
+
+      # #593: this runs BEFORE the image cache save so the dump is the first thing after a stalled
+      # run step, not something a later step can push past the job timeout. When the run step
+      # timed out in a test run, nothing from the script's EXIT trap reached the job log and the
+      # containers were still up here, so their logs are the only record of what stalled. After a
+      # failure the script exited on its own, its trap already dumped and removed them, and this
+      # prints nothing. The runner's output is not dumped: it streams into the step log live.
+      - name: 🧹 Cleanup Docker containers
+        if: always()
+        run: |
+          if [ "${{ steps.e2e.outcome }}" != "success" ]; then
+            echo "::group::Service container logs (last 200 lines each; empty when the script already tore down)"
+            docker compose -f tests/e2e/compose.yaml logs --no-color --tail=200 \
+              mcp-server-test actual-budget-test actual-budget-stdio-test || true
+            echo "::endgroup::"
+          fi
+          docker compose -f tests/e2e/compose.yaml down -v
 
       - name: 🐳 Save Docker images to cache
         if: always()
@@ -399,12 +509,23 @@ jobs:
           mkdir -p /tmp/docker-image-cache
           docker save actualbudget/actual-server:latest \
             -o /tmp/docker-image-cache/actual-server.tar 2>/dev/null || true
-          docker save "mcr.microsoft.com/playwright:v1.62.1-jammy" \
+          docker save "mcr.microsoft.com/playwright:v1.64.1-jammy" \
             -o /tmp/docker-image-cache/playwright-jammy.tar 2>/dev/null || true
 
-      - name: 🧹 Cleanup Docker containers
-        if: always()
-        run: docker compose -f docker-compose.test.yaml down -v
+      # #600: start the published image the way the README documents it. The step builds the
+      # image from source, creates .env with the README env-token block, and runs the README
+      # docker-run block with only the image and --name swapped (scripts/install-snippets.mjs,
+      # argv array, no shell). Dummy Actual settings: it proves the container starts and the auth
+      # posture accepts the documented configuration, not that a budget loads.
+      # Margin (#593): it is skipped unless the E2E run succeeded, so a stalled run keeps its
+      # just over 5 spare minutes. Worst success path: 1 + 18 + 0.25 + 0.5 + 4 = 23.75 minutes,
+      # under the 25 minute job. docker build runs inside this step and counts against its 4.
+      - name: 🚀 Install snippet startup smoke
+        if: steps.e2e.outcome == 'success'
+        timeout-minutes: 4
+        run: |
+          docker build -t actual-mcp-server:ci-smoke .
+          node scripts/install-snippets.mjs smoke --image actual-mcp-server:ci-smoke
 
       - name: 📋 Docker E2E summary
         if: always()
@@ -796,6 +917,143 @@ jobs:
         run: node scripts/verify-published-artifacts.mjs
 
   # --------------------------------------------------------------------------
+  # Job 7b2: MCP Registry (#610)
+  #
+  # server.json is committed with 0.0.0 in its version slots; both jobs stamp a
+  # copy with the package version. The publisher binary is pinned, its sigstore
+  # bundle verified against the registry's own release workflow, and its hash
+  # checked before it runs. Both jobs hold job-level permissions only, so the
+  # downloaded binary never inherits the workflow-level write scopes.
+  #
+  # Both jobs are continue-on-error: the registry is a preview service, and
+  # validate and publish both talk to it, so an outage would otherwise turn the
+  # run red, which blocks the develop-to-main promotion and makes the dependency
+  # train report a released tag as failed. A failure instead ends in a warning
+  # annotation and a "failure" row in the Pipeline Summary (from the job's
+  # `outcome` output: needs.<job>.result reads success under continue-on-error).
+  # The content of server.json is still gated by tests/unit/mcp_server_json.test.js.
+  #
+  # validate: every push and PR.
+  #
+  # publish: tag-only, after the npm and image read-back, because the registry
+  # checks mcpName in the PUBLISHED npm tarball and the OCI label in the
+  # published image. NOT in release.needs: a registry failure must never fail a
+  # release whose npm and Docker artifacts are already public. The release
+  # skill checks the registry listing after every tag. Recovery: re-run this job
+  # only. Registry versions are immutable, so never re-tag.
+  # --------------------------------------------------------------------------
+  mcp-registry-validate:
+    name: MCP Registry Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    outputs:
+      outcome: ${{ steps.outcome.outputs.outcome }}
+    needs: version
+    permissions:
+      contents: read
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.7
+      MCP_PUBLISHER_SHA256: 00b21004149a4ce66f0782508ae4a2bce67d1bea395a8da0bd8028159fb59579
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 🔏 Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: 📦 Install mcp-publisher (pinned, signature and hash verified)
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          ASSET=mcp-publisher_linux_amd64.tar.gz
+          curl -fsSLO "${BASE}/${ASSET}"
+          curl -fsSLO "${BASE}/${ASSET}.sigstore.json"
+          cosign verify-blob "${ASSET}" --bundle "${ASSET}.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          echo "${MCP_PUBLISHER_SHA256}  ${ASSET}" | sha256sum -c
+          tar -xzf "${ASSET}" mcp-publisher
+          ./mcp-publisher --version
+
+      - name: 🏷️ Stamp server.json
+        run: node scripts/mcp-server-json.mjs stamp --out server.stamped.json
+
+      - name: ✅ Validate server.json
+        run: ./mcp-publisher validate server.stamped.json
+
+      - name: 📝 Record outcome
+        id: outcome
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          echo "outcome=${JOB_STATUS}" >> "$GITHUB_OUTPUT"
+          if [ "${JOB_STATUS}" != success ]; then
+            echo "::warning::MCP Registry validate ${JOB_STATUS}; re-run this job once the registry is reachable"
+          fi
+
+  mcp-registry-publish:
+    name: MCP Registry Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    outputs:
+      outcome: ${{ steps.outcome.outputs.outcome }}
+    needs: [version, verify-published-artifacts]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.7
+      MCP_PUBLISHER_SHA256: 00b21004149a4ce66f0782508ae4a2bce67d1bea395a8da0bd8028159fb59579
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 🔏 Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: 📦 Install mcp-publisher (pinned, signature and hash verified)
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          ASSET=mcp-publisher_linux_amd64.tar.gz
+          curl -fsSLO "${BASE}/${ASSET}"
+          curl -fsSLO "${BASE}/${ASSET}.sigstore.json"
+          cosign verify-blob "${ASSET}" --bundle "${ASSET}.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          echo "${MCP_PUBLISHER_SHA256}  ${ASSET}" | sha256sum -c
+          tar -xzf "${ASSET}" mcp-publisher
+          ./mcp-publisher --version
+
+      - name: 🏷️ Stamp server.json (tag, VERSION and package.json must agree)
+        run: node scripts/mcp-server-json.mjs stamp --out server.stamped.json --expect-version "${GITHUB_REF_NAME#v}"
+
+      - name: 🔑 Log in to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: 🚀 Publish to the MCP Registry
+        run: ./mcp-publisher publish server.stamped.json
+
+      - name: 📝 Record outcome
+        id: outcome
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          echo "outcome=${JOB_STATUS}" >> "$GITHUB_OUTPUT"
+          if [ "${JOB_STATUS}" != success ]; then
+            echo "::warning::MCP Registry publish ${JOB_STATUS}; re-run this job once the registry is reachable"
+          fi
+
+  # --------------------------------------------------------------------------
   # Job 7c: Train liveness (#327)
   #
   # #325 reports a train that FAILED. It cannot report one that never RAN: no
@@ -943,14 +1201,17 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKER_IMAGE_NAME }}
           short-description: ${{ steps.get-desc.outputs.short }}
-          readme-filepath: ./docker/description/long.md
+          readme-filepath: ./README.md
+          # #607: rewrites the README's relative links to absolute GitHub URLs on upload.
+          # scripts/docs/readme-size.mjs keeps the upload under Docker Hub's 25,000 byte cap.
+          enable-url-completion: true
 
       - name: 📋 Docker Hub update summary
         run: |
           echo "### 🐳 Docker Hub Description Updated" >> $GITHUB_STEP_SUMMARY
           echo "- **Repository**: \`${{ env.DOCKER_IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Short Description**: ${{ steps.get-desc.outputs.short }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Long Description**: Updated from docker/description/long.md" >> $GITHUB_STEP_SUMMARY
+          echo "- **Long Description**: Updated from README.md" >> $GITHUB_STEP_SUMMARY
 
   # --------------------------------------------------------------------------
   # Job 10: Deployment Test
@@ -1054,8 +1315,13 @@ jobs:
           # Canonical tool count via scripts/tool-count.mjs (#193): never a
           # literal, which is how the old "62 MCP tools" body drifted (#261 fix 4).
           TOOL_COUNT=$(node -e "import('./scripts/tool-count.mjs').then(m => console.log(m.getCanonicalCount()))")
+          # #680: the default surface publishes the compact tools, so the headline is
+          # "N tools over M operations". N is the length of the COMPACT_TOOLS array literal.
+          COMPACT_COUNT=$(grep -m1 '^export const COMPACT_TOOLS' src/compact/registry.ts \
+            | sed -E 's/.*= *\[(.*)\].*/\1/' | awk -F',' '{ n = 0; for (i = 1; i <= NF; i++) if ($i ~ /[A-Za-z0-9_]/) n++; print n }')
           API_VERSION=$(node -p "require('./package.json').dependencies['@actual-app/api'].replace(/^[^0-9]*/, '')")
           echo "tool_count=$TOOL_COUNT" >> $GITHUB_OUTPUT
+          echo "compact_count=$COMPACT_COUNT" >> $GITHUB_OUTPUT
           echo "api_version=$API_VERSION" >> $GITHUB_OUTPUT
           echo "Release facts: ${TOOL_COUNT} tools, @actual-app/api ${API_VERSION}"
 
@@ -1104,7 +1370,7 @@ jobs:
             ### 📊 What this release ships
 
             - `@actual-app/api` pinned at `${{ steps.facts.outputs.api_version }}`
-            - All ${{ steps.facts.outputs.tool_count }} MCP tools registered and validated on this tag
+            - ${{ steps.facts.outputs.compact_count }} tools over ${{ steps.facts.outputs.tool_count }} operations registered and validated on this tag
 
             ### 🔒 Security
 
@@ -1130,8 +1396,9 @@ jobs:
     name: Pipeline Summary
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [version, lint, test, node-version-guard, docker-e2e, validate-short-description,
-            docker-build, docker-publish, npm-publish, security-scan, deployment-test, release]
+    needs: [version, lint, docs-check, test, node-version-guard, docker-e2e, validate-short-description,
+            docker-build, docker-publish, npm-publish, security-scan, deployment-test, release,
+            mcp-registry-validate, mcp-registry-publish]
     if: always()
     steps:
       - name: 📊 Generate pipeline summary
@@ -1142,6 +1409,7 @@ jobs:
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Version Generation | ${{ needs.version.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docs check | ${{ needs.docs-check.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Docker E2E | ${{ needs.docker-e2e.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Validate Description | ${{ needs.validate-short-description.result }} |" >> $GITHUB_STEP_SUMMARY
@@ -1150,6 +1418,8 @@ jobs:
           echo "| Security Scan | ${{ needs.security-scan.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Deployment Test | ${{ needs.deployment-test.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Release | ${{ needs.release.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MCP Registry Validate | ${{ needs.mcp-registry-validate.outputs.outcome || needs.mcp-registry-validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MCP Registry Publish | ${{ needs.mcp-registry-publish.outputs.outcome || needs.mcp-registry-publish.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version**: \`${{ needs.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
 

@@ -1,0 +1,21 @@
+import { z } from 'zod';
+import type { ToolDefinition } from '../../types/tool.d.js';
+import adapter from '../lib/actual-adapter.js';
+
+const InputSchema = z.object({
+  month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'month must be in YYYY-MM format').describe('Budget month in YYYY-MM format'),
+});
+
+const tool: ToolDefinition = {
+  name: 'actual_budgets_reset_hold',
+  description:
+    "Release the amount held for next month in one month (YYYY-MM), undoing actual_budgets_hold_for_next_month: the held amount goes back to that month's to-budget. Safe to repeat; a month with no hold is left as it is. Returns { success: true }.",
+  inputSchema: InputSchema,
+  call: async (args: unknown, _meta?: unknown) => {
+    const input = InputSchema.parse(args || {});
+    await adapter.resetBudgetHold(input.month);
+    return { success: true };
+  },
+};
+
+export default tool;

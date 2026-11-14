@@ -10,6 +10,10 @@
 
 import assert from 'assert';
 
+process.env.ACTUAL_SERVER_URL ??= 'http://localhost:5006';
+process.env.ACTUAL_PASSWORD ??= 'dummy';
+process.env.ACTUAL_BUDGET_SYNC_ID ??= '00000000-0000-0000-0000-000000000000';
+
 const { validateQueryShape, validateQuery } = await import('../../dist/src/lib/query-validator.js');
 const { ACTUAL_SCHEMA } = await import('../../dist/src/lib/actual-schema.js');
 
@@ -77,6 +81,34 @@ const VALID_COLUMN = [
 for (const q of VALID_COLUMN) {
   ok(`accepts real column: ${q.slice(40)}`, () => assert.strictEqual(validateQuery(q).valid, true));
 }
+
+// #566: after a joined name (`payee.name`) the scan read the keyword NOT as a column, so a valid
+// `payee.name NOT LIKE` was rejected with `Field "NOT" does not exist`. NOT IN and NOT BETWEEN
+// misread the same way; they now pass validation and reach the parser, which refuses them by name.
+console.log('\n[query-run-validation] #566 NOT after a joined field is a keyword, not a column');
+const fieldErrors = (q) => validateQuery(q).errors.map((e) => e.message);
+for (const join of ['payee.name', 'category.name', 'account.name']) {
+  const q = `SELECT id FROM transactions WHERE ${join} NOT LIKE '%x%'`;
+  ok(`accepts ${join} NOT LIKE`, () => assert.deepStrictEqual(fieldErrors(q), []));
+}
+for (const q of [
+  "SELECT id FROM transactions WHERE payee.name NOT IN ('a')",
+  "SELECT id FROM transactions WHERE payee.name NOT BETWEEN 'a' AND 'b'",
+  "SELECT id FROM transactions WHERE amount < 0 AND payee.name NOT LIKE '%x%' AND notes NOT LIKE '%y%'",
+]) {
+  ok(`no "NOT" field error: ${q.slice(40)}`, () => assert.ok(!fieldErrors(q).some((m) => /"NOT"/i.test(m)), JSON.stringify(fieldErrors(q))));
+}
+ok('a real unknown field before NOT LIKE is still rejected by name', () => {
+  const errs = fieldErrors("SELECT id FROM transactions WHERE bogus NOT LIKE '%x%'");
+  assert.ok(errs.some((m) => m.includes('"bogus"')) && !errs.some((m) => /"NOT"/i.test(m)), JSON.stringify(errs));
+});
+ok('an unknown field after a joined NOT LIKE is still rejected by name', () => {
+  const errs = fieldErrors("SELECT id FROM transactions WHERE payee.name NOT LIKE '%x%' AND bogus = 1");
+  assert.ok(errs.some((m) => m.includes('"bogus"')), JSON.stringify(errs));
+});
+ok('lowercase not after a joined field is handled the same way', () => {
+  assert.deepStrictEqual(fieldErrors("SELECT id FROM transactions WHERE payee.name not like '%x%'"), []);
+});
 
 // #450: the clause terminators had no word boundaries, so the lazy match cut the WHERE clause at
 // the first occurrence of the LETTERS `GROUP`, `ORDER` or `LIMIT` anywhere, including inside a
@@ -250,6 +282,32 @@ console.log('\n[query-run-validation] #450 generative: no schema field may mask 
     assert.deepStrictEqual(falseReject, [], `false rejections: ${falseReject.join(' | ')}`);
   });
   ok('the generative sweep actually ran', () => assert.ok(checked > 100, `only ${checked} fields checked`));
+}
+
+console.log('\n[query-run-validation] #526 description date example and syntax-error pointer');
+{
+  const queryRun = (await import('../../dist/src/tools/query_run.js')).default;
+  const adapter = (await import('../../dist/src/lib/actual-adapter.js')).default;
+  const DATE_Q = "SELECT id, date FROM transactions WHERE date >= '2025-01-01'";
+  const messageOf = async (thrown) => {
+    adapter.runQuery = async () => { throw new Error(thrown); };
+    try { await queryRun.call({ query: 'SELECT * FROM transactions' }); } catch (e) { return e.message; }
+    return null;
+  };
+  ok("the description shows how a date is written: date >= '2025-01-01'", () => assert.ok(queryRun.description.includes("date >= '2025-01-01'")));
+  ok('the documented date query passes validateQueryShape and validateQuery', () => {
+    validateQueryShape(DATE_Q);
+    assert.strictEqual(validateQuery(DATE_Q).valid, true);
+  });
+  const syntaxMsg = await messageOf('parse error near FROM');
+  ok('a parse failure is a "Query syntax error" naming the original text', () => assert.ok(/^Query syntax error: parse error near FROM/.test(syntaxMsg), String(syntaxMsg)));
+  ok('the syntax error points at the supported WHERE operators', () => assert.ok(syntaxMsg.includes('See the tool description for the supported WHERE operators'), syntaxMsg));
+  ok('the stale "for more examples" pointer is gone', () => assert.ok(!syntaxMsg.includes('for more examples'), syntaxMsg));
+  const boomMsg = await messageOf('boom');
+  ok('any other failure is still "Query execution failed: boom"', () => assert.strictEqual(boomMsg, 'Query execution failed: boom'));
+  let emptyRejected = false;
+  try { await queryRun.call({ query: '' }); } catch { emptyRejected = true; }
+  ok('an empty query is still rejected by the min(1) constraint', () => assert.ok(emptyRejected));
 }
 
 console.log(`\n[query-run-validation] Results: ${passed} passed, ${failed} failed`);

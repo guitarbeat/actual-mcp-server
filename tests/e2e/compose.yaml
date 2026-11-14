@@ -1,0 +1,292 @@
+# Docker Compose configuration for E2E testing
+# This spins up a complete stack: Actual Budget server + MCP server + test runner
+# Usage: docker compose -f tests/e2e/compose.yaml up --abort-on-container-exit
+#
+# Relative paths below resolve from THIS file's directory (tests/e2e/), not the repo root.
+# `name:` pins the project name; without it Compose would derive "e2e" from the directory.
+name: actual-mcp-e2e
+
+services:
+  # Actual Budget server for testing
+  actual-budget-test:
+    image: actualbudget/actual-server:latest
+    container_name: actual-budget-e2e-test
+    ports:
+      - "127.0.0.1:5007:5006" # Use port 5007 to avoid conflicts with dev instances
+    volumes:
+      - actual-test-data:/data
+    environment:
+      - NODE_ENV=production
+    networks:
+      - e2e-test-network
+
+  # Bootstrap & init: Sets password and imports test budget with data
+  actual-budget-bootstrap:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: actual-budget-bootstrap
+    depends_on:
+      - actual-budget-test
+    environment:
+      - ACTUAL_SERVER_URL=http://actual-budget-test:5006
+      - ACTUAL_PASSWORD=test123
+    working_dir: /app
+    volumes:
+      - bootstrap-data:/tmp
+      # Host dir tests/fixtures/budgets, in-container /app/test-data: the name split is deliberate
+      # (scripts/bootstrap-and-init.sh and scripts/import-test-budget.sh resolve test-data/ under /app).
+      - ../fixtures/budgets:/app/test-data:ro
+    user: root
+    entrypoint: [ "/bin/sh" ]
+    command:
+      - -c
+      - |
+        apk add --no-cache curl -q
+        echo "Waiting for Actual Budget server..."
+        for i in $$(seq 1 30); do
+          if wget --spider -q http://actual-budget-test:5006/health 2>/dev/null; then
+            echo "Server is ready!"
+            break
+          fi
+          echo "Waiting... ($$i/30)"
+          sleep 2
+        done
+        # Skip the wait in bootstrap script since we already waited
+        export SKIP_SERVER_WAIT=true
+        sh scripts/bootstrap-and-init.sh
+    networks:
+      - e2e-test-network
+
+  # #423: a SECOND Actual Budget server, used ONLY by the stdio leg.
+  #
+  # WHY. Both legs used to drive the one server, so they shared its 500-requests-per-minute
+  # window, and the 75s cool-down between them was an estimate of how long that window takes to
+  # drain. It was not enough: a throttled api.sync makes upstream CLOSE the budget (#396 shape),
+  # the next operation needs a re-download and so a fresh login, and that login is refused inside
+  # the same full window. Four tests in the write-heavy block failed that way, two of them after
+  # a 25s withAuthRetry backoff.
+  #
+  # Options considered and rejected are on #423: pacing by requests tunes a number that drifts
+  # every time a test is added (which is how the ticket was created), and a longer cool-down
+  # guesses at a window nobody can observe. A second server REMOVES the coupling instead of
+  # timing around it, which is what makes the leg safe to gate on.
+  #
+  # It is the same image and the same fixture data, so the two legs start from identical budgets.
+  actual-budget-stdio-test:
+    image: actualbudget/actual-server:latest
+    container_name: actual-budget-e2e-stdio
+    ports:
+      - "127.0.0.1:5008:5006" # 5007 is the HTTP leg's server; 5006 is a dev instance
+    volumes:
+      - actual-stdio-test-data:/data
+    environment:
+      - NODE_ENV=production
+    networks:
+      - e2e-test-network
+
+  # Bootstrap for the stdio server. Identical to the one above except for its target and its
+  # /tmp volume: the sync ids MUST live in separate volumes, or the stdio leg could silently
+  # open the HTTP leg's budget and the whole point of the separation would be lost.
+  actual-budget-stdio-bootstrap:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: actual-budget-stdio-bootstrap
+    depends_on:
+      - actual-budget-stdio-test
+    environment:
+      - ACTUAL_SERVER_URL=http://actual-budget-stdio-test:5006
+      - ACTUAL_PASSWORD=test123
+    working_dir: /app
+    volumes:
+      - bootstrap-stdio-data:/tmp
+      # Host dir tests/fixtures/budgets, in-container /app/test-data: the name split is deliberate
+      # (scripts/bootstrap-and-init.sh and scripts/import-test-budget.sh resolve test-data/ under /app).
+      - ../fixtures/budgets:/app/test-data:ro
+    user: root
+    entrypoint: [ "/bin/sh" ]
+    command:
+      - -c
+      - |
+        apk add --no-cache curl -q
+        echo "Waiting for the stdio Actual Budget server..."
+        for i in $$(seq 1 30); do
+          if wget --spider -q http://actual-budget-stdio-test:5006/health 2>/dev/null; then
+            echo "Server is ready!"
+            break
+          fi
+          echo "Waiting... ($$i/30)"
+          sleep 2
+        done
+        export SKIP_SERVER_WAIT=true
+        sh scripts/bootstrap-and-init.sh
+    networks:
+      - e2e-test-network
+
+  # MCP server under test (built from current source)
+  mcp-server-test:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: mcp-server-e2e-test
+    ports:
+      - "127.0.0.1:3602:3600" # Use port 3602 to avoid conflicts
+    depends_on:
+      actual-budget-bootstrap:
+        condition: service_completed_successfully
+      # NOTE: deliberately NO depends_on for actual-budget-stdio-bootstrap.
+      #
+      # It was added here first and broke every level that does not run the stdio leg.
+      # `docker compose create mcp-server-test` creates a declared dependency, and creating it
+      # needs its IMAGE, which only the stdio path builds, so `test:e2e:docker:smoke`, `test:all`
+      # and a `full` run with RUN_STDIO_E2E=false all died with "No such image" before any test
+      # ran. Reproduced on Compose v5.5.1.
+      #
+      # Ordering is the SCRIPT's job instead: run-docker-e2e.sh brings the stdio server and its
+      # bootstrap up in step 4b/4c, before it creates this container in step 5, and only when the
+      # stdio leg is actually enabled. The /tmp-stdio mount below is harmless when that never
+      # happens: the named volume is simply created empty and nothing reads it.
+    environment:
+      - ACTUAL_SERVER_URL=http://actual-budget-test:5006
+      - ACTUAL_PASSWORD=test123
+      - MCP_BRIDGE_PORT=3600
+      - MCP_BRIDGE_DATA_DIR=/app/data
+      - MCP_BRIDGE_LOG_LEVEL=info
+      - MAX_CONCURRENT_SESSIONS=15
+      - NODE_ENV=test
+      # #671: the E2E suite drives the legacy tool names. `all` keeps them published and adds
+      # the compact tools as they land (#672 onward), so the suite can cover both.
+      - MCP_TOOL_SURFACE=all
+      # No auth for testing; MCP_SSE_AUTHORIZATION left empty intentionally.
+      # #242 makes HTTP auth required-by-default on a non-loopback (0.0.0.0) bind,
+      # so the open posture this suite exercises must opt out explicitly or the
+      # server refuses to start.
+      - MCP_SSE_AUTHORIZATION=
+      - MCP_ALLOW_UNAUTHENTICATED=true
+      # #612: an open-mode server accepts only localhost, 127.0.0.1 and [::1] as Host
+      # (DNS rebinding protection). The Playwright runner reaches it by service name.
+      - MCP_ALLOWED_HOSTS=mcp-server-test
+      # #615: the advertised host is accepted in open mode without being listed above.
+      # Keep it OUT of MCP_ALLOWED_HOSTS, or the advertised-host E2E row passes without the fix.
+      - MCP_BRIDGE_PUBLIC_HOST=mcp-advertised
+    volumes:
+      - mcp-test-data:/app/data
+      # #383: a SEPARATE writable volume for the stdio pass's budget cache.
+      #
+      # It cannot share /app/data. Two @actual-app/api instances must never share one budget
+      # cache, and the HTTP server owns that directory. It also cannot use /tmp: this image's
+      # root filesystem is read-only, which is how the first attempt failed (every stdio test
+      # errored in ~50ms because the worker fixture could not create its data dir). A named
+      # volume is writable, isolated, and discarded by `docker compose down -v` with the rest
+      # of the stack.
+      - mcp-test-stdio-data:/app/stdio-data
+      - bootstrap-data:/tmp:ro
+      # #423: the stdio leg's sync id, in its OWN path. Read-only, and deliberately NOT /tmp:
+      # the HTTP entrypoint reads /tmp/actual-sync-id.txt, and one file shadowing the other is
+      # exactly the confusion the second server exists to prevent.
+      - bootstrap-stdio-data:/tmp-stdio:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if [ -f /tmp/actual-sync-id.txt ]; then
+          export ACTUAL_BUDGET_SYNC_ID=$$(cat /tmp/actual-sync-id.txt)
+          echo "Using sync ID: $$ACTUAL_BUDGET_SYNC_ID"
+        else
+          echo "ERROR: No sync ID found at /tmp/actual-sync-id.txt"
+          exit 1
+        fi
+        exec node dist/src/index.js --http
+    healthcheck:
+      test: [ "CMD", "node", "-e", "require('http').get('http://localhost:3600/health', r => process.exit(r.statusCode === 200 ? 0 : 1))" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    networks:
+      e2e-test-network:
+        # #615: two extra names for the HTTP-only Host check in docker-all-tools.
+        # mcp-advertised is MCP_BRIDGE_PUBLIC_HOST (accepted without being listed);
+        # mcp-unlisted is in neither list, so it must get 403.
+        aliases:
+          - mcp-advertised
+          - mcp-unlisted
+
+  # Playwright test runner
+  e2e-test-runner:
+    image: mcr.microsoft.com/playwright:v1.64.1-jammy
+    container_name: e2e-test-runner
+    depends_on:
+      mcp-server-test:
+        condition: service_healthy
+    working_dir: /workspace
+    # #381: `npm ci`, NOT `npm install`. The lockfile is bind-mounted from the host, and
+    # `npm install` WRITES to it, so every test run dirtied the working tree. Worse, it
+    # prunes: one run removed the @emnapi optional peer entries, and the next run then
+    # failed inside the image build with "npm ci can only install packages when your
+    # package.json and package-lock.json are in sync", an error that names the Dockerfile
+    # and reads as a dependency problem in whatever change is under test.
+    #
+    # npm's own docs: `npm ci` "will never write to package.json or any of the
+    # package-locks: installs are essentially frozen", and it is "meant to be used in
+    # automated environments such as test platforms". It also turns an out-of-sync lockfile
+    # into a loud failure instead of a silent rewrite, and installs exactly what CI does.
+    #
+    # #508 / #593: `npm ci --ignore-scripts`, and NO apt prologue. From @actual-app/api 26.10.0
+    # the tree carries better-sqlite3 13.x, whose binding.gyp makes a plain `npm ci` run
+    # `node-gyp rebuild`; the Playwright image has no compiler, so that died with "gyp ERR!
+    # stack Error: not found: make" (#508). #508 answered by installing make and g++ from the
+    # Ubuntu mirrors first, which hung 3 of 6 CI runs on 2026-10-26: no output for 18 minutes,
+    # then the job was cancelled by its timeout (#593, where the stall is reproduced).
+    #
+    # The runner never needs that build. Nothing under tests/e2e/ (the Playwright config included)
+    # imports @actual-app/api, src/ or better-sqlite3; the specs talk to the server over HTTP
+    # and the browsers ship in the image. better-sqlite3 is the only binding.gyp package in the
+    # lockfile and nothing in it has hasInstallScript, so --ignore-scripts skips exactly that
+    # one build. Probed in this image with no toolchain: `npm ci --ignore-scripts` installs 232
+    # packages in 16 s and @playwright/test loads; plain `npm ci` fails on the missing make.
+    # The server image is unaffected: its Dockerfile build stage installs python3, make and g++.
+    # tests/unit/playwright_version_drift.test.js pins this command shape.
+    command: >
+      sh -c "
+        npm ci --ignore-scripts &&
+        npx playwright test --config=tests/e2e/playwright.config.docker.ts --project=$${PLAYWRIGHT_PROJECT:-docker-e2e-smoke}
+      "
+    environment:
+      - MCP_SERVER_URL=http://mcp-server-test:3600
+      - ACTUAL_SERVER_URL=http://actual-budget-test:5006
+      - CI=true
+      - PLAYWRIGHT_PROJECT=${PLAYWRIGHT_PROJECT:-docker-e2e-smoke}
+    volumes:
+      # Mounts tests/ (the parent of this file's directory), so the Playwright config sits at
+      # /workspace/tests/e2e/ in the container, exactly where it sits on the host.
+      - ..:/workspace/tests
+      # Mounted READ-ONLY (#381). npm ci never writes them, so this costs nothing and
+      # converts a future regression to `npm install` from a silent host-file rewrite into
+      # an immediate, obvious container-side failure.
+      - ../../package.json:/workspace/package.json:ro
+      - ../../package-lock.json:/workspace/package-lock.json:ro
+      - e2e-test-results:/workspace/test-results
+    networks:
+      - e2e-test-network
+
+volumes:
+  mcp-test-stdio-data:
+  actual-stdio-test-data:
+    name: actual-e2e-stdio-data
+  bootstrap-stdio-data:
+    name: bootstrap-e2e-stdio-data
+  actual-test-data:
+    name: actual-e2e-test-data
+  mcp-test-data:
+    name: mcp-e2e-test-data
+  bootstrap-data:
+    name: bootstrap-e2e-data
+  e2e-test-results:
+    name: e2e-test-results
+
+networks:
+  e2e-test-network:
+    name: e2e-test-network
+    driver: bridge

@@ -18,7 +18,7 @@ console.log('Running generated tools smoke tests');
   const apiMod = await import('@actual-app/api');
   const apiDefault = (apiMod.default || apiMod);
   apiDefault.sync = async () => {};
-  // #371: accounts_close, accounts_reopen and budgets_holdForNextMonth used to reach the raw
+  // #371: accounts_close, accounts_reopen and budgets_hold_for_next_month used to reach the raw
   // api directly and needed faithful raw fakes here. Their guards now live in the adapter,
   // which this harness stubs wholesale, so the raw fakes are gone and the adapter stubs
   // below carry the contract instead. See stubResponses for the shapes they must return.
@@ -45,6 +45,9 @@ console.log('Running generated tools smoke tests');
 
   const toolsIndex = await import('../../dist/src/tools/index.js');
   const adapterMod = await import('../../dist/src/lib/actual-adapter.js');
+  // #483: server_info reports the publication policy, which fails closed until initialize()
+  // has resolved it. Production resolves it at startup; this harness calls tools directly.
+  await (await import('../../dist/src/actualToolsManager.js')).default.initialize();
 
   // Simple monkeypatch map: for any adapter function we'll return a predictable value
   const stubResponses = {
@@ -85,6 +88,11 @@ console.log('Running generated tools smoke tests');
     mergePayees: ['22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333'],
     getRules: [{ id: '30000000-0000-4000-8000-000000000001', conditions: [] }],
     createRule: 'rule-new',
+    // #485: createRulesBatch returns the per-item verdicts (original indices); the tool adds the counts.
+    createRulesBatch: {
+      succeeded: [{ index: 0, id: 'rule-new' }],
+      failed: [],
+    },
     deleteRule: null,
     updateRule: null,
     // #376: rules_create_or_update calls adapter.upsertRule now (the read-match-write
@@ -96,7 +104,7 @@ console.log('Running generated tools smoke tests');
       month: '2025-12', 
       categoryGroups: [
         { 
-          id: '20000000-0000-4000-8000-000000000001',
+          id: '20000000-0000-4000-8000-000000000001', 
           name: 'Test Group',
           categories: [
             { id: '10000000-0000-4000-8000-000000000001', name: 'Category 1', budgeted: 1000 },
@@ -111,7 +119,11 @@ console.log('Running generated tools smoke tests');
     // for 10000, so returning that models a hold that was granted in full.
     holdBudgetForNextMonth: 10000,
     resetBudgetHold: null,
-    batchBudgetUpdates: null,
+    // #516: setBudgetBatch returns the per-item verdicts; the tool adds the counts.
+    setBudgetBatch: {
+      succeeded: [{ index: 0, month: '2025-12', categoryId: '10000000-0000-4000-8000-000000000001' }],
+      failed: [],
+    },
     createAccount: 'acct-new',
     updateAccount: null,
     deleteAccount: null,
@@ -124,13 +136,15 @@ console.log('Running generated tools smoke tests');
     reopenAccount: { outcome: 'reopened', name: 'Cash' },
     getAccountBalance: 12345,
     deleteTransaction: null,
+    mergeTransactions: { keptId: '22222222-2222-4222-8222-222222222222', deletedId: '11111111-1111-4111-8111-111111111111' },
     updateTransaction: null,
     updateTransactionBatch: { succeeded: [{ id: '00000000-0000-0000-0000-000000000001' }], failed: [] },
     // #305: is_parent + amount let the transactions_update split example pass the
     // adapter pre-flight (an existing split of -300). Extra fields are harmless to
     // actual_query_run and the #212 existence checks (they only read row count).
     runQuery: [{ id: 'result1', value: 100, is_parent: true, amount: -300 }],
-    runBankSync: null,
+    // #548: runBankSync reports what it imported; the tool caps and counts each list.
+    runBankSync: { newTransactions: ['t1'], matchedTransactions: [], updatedAccounts: ['acct_1'] },
     getBudgets: [{ name: 'My Budget', cloudFileId: '00000000-0000-0000-0000-000000000001', hasKey: false, state: 'remote' }],
     switchBudget: { name: 'My Budget', syncId: '00000000-0000-0000-0000-000000000001', serverUrl: 'http://localhost:5006' },
     getBudgetRegistry: [{ name: 'My Budget', syncId: '00000000-0000-0000-0000-000000000001', serverUrl: 'http://localhost:5006', hasEncryption: false }],
@@ -140,6 +154,7 @@ console.log('Running generated tools smoke tests');
     createSchedule: '00000000-0000-0000-0000-000000000099',
     updateSchedule: null,
     deleteSchedule: null,
+    getScheduleDates: { schedule_id: '00000000-0000-0000-0000-000000000099', name: 'Rent', dates: ['2026-04-01'], count: 1, truncated: false },
     createTransfer: { success: true, from_id: '00000000-0000-0000-0000-000000000003', to_id: null },
     getTags: [{ id: '00000000-0000-0000-0000-0000000000aa', tag: 'groceries' }],
     getAccountGroups: [{ id: '00000000-0000-0000-0000-0000000000bb', name: 'Savings', sort_order: 0 }],
@@ -156,6 +171,13 @@ console.log('Running generated tools smoke tests');
     exportBudget: new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00]),
     importBudget: { id: '00000000-0000-0000-0000-0000000000ee' },
     getPreferences: { dateFormat: 'yyyy-MM-dd', numberFormat: 'dot-comma', firstDayOfWeekIdx: '1' },
+    getContext: {
+      accounts: [{ id: 'a1', name: 'Cash', offbudget: false, closed: false }],
+      categoryGroups: [{ id: 'g1', name: 'Expenses', is_income: false, categories: [{ id: 'c1', name: 'Food', hidden: false }] }],
+      payees: [{ id: 'p1', name: 'Kroger', transfer_acct: null }],
+      payeesTruncated: false,
+      payeeTotal: 1,
+    },
     // #141: transferBudgetAmount is the new atomic adapter method.
     transferBudgetAmount: {
       transferred: 5000,
@@ -203,6 +225,7 @@ console.log('Running generated tools smoke tests');
   if (name.includes('account_flow_summary')) inputExample.startDate = '2025-01-01', inputExample.endDate = '2025-01-31', inputExample.accountIds = ['a1'];
   if (name.includes('recurring_expenses_summary')) inputExample.months = 12; // #426: months alone satisfies the startDate-XOR-months rule; minOccurrences/includeInactive default
   if (name.includes('transactions_get')) inputExample.accountId = 'a1'; // matches getAccounts stub { id: 'a1' } — nil-UUID would hit not-found path and return { error } without result
+  if (name.includes('transactions_merge')) inputExample.ids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
   if (name.includes('transactions_delete')) inputExample.id = '00000000-0000-0000-0000-000000000001';
   if (name.includes('transactions_update') && !name.includes('batch')) inputExample.id = '00000000-0000-0000-0000-000000000001', inputExample.fields = { notes: 'test', subtransactions: [{ amount: -200 }, { amount: -100 }] }; // #305: edit an existing split (-300 per runQuery stub)
   if (name.includes('transactions_update_batch')) inputExample.updates = [{ id: '00000000-0000-0000-0000-000000000001', fields: { notes: 'batch-test' } }];
@@ -228,16 +251,18 @@ console.log('Running generated tools smoke tests');
   if (name.includes('payees_update')) inputExample.id = '00000000-0000-0000-0000-000000000001', inputExample.fields = { name: 'Updated' };
   if (name.includes('payees_merge')) inputExample.targetId = '11111111-1111-4111-8111-111111111111', inputExample.mergeIds = ['22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333'];
   if (name.includes('payee_rules_get')) inputExample.payeeId = '40000000-0000-4000-8000-000000000001';
-  if (name.includes('rules_create') && !name.includes('or_update')) inputExample.conditions = [{ field: 'description', op: 'contains', value: 'test' }], inputExample.actions = [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }];
+  if (name.includes('rules_create') && !name.includes('or_update') && !name.includes('batch')) inputExample.conditions = [{ field: 'description', op: 'contains', value: 'test' }], inputExample.actions = [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }];
+  // #485: rules_create_batch takes an array of rules (the plain rules_create example above must not match it).
+  if (name.includes('rules_create_batch')) inputExample.rules = [{ conditions: [{ field: 'description', op: 'contains', value: 'test' }], actions: [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }] }];
   if (name.includes('rules_create_or_update')) inputExample.conditions = [{ field: 'description', op: 'contains', value: 'test' }], inputExample.actions = [{ op: 'set', field: 'category', value: '00000000-0000-0000-0000-000000000001' }];
   if (name.includes('rules_delete')) inputExample.id = '30000000-0000-4000-8000-000000000001'; // matches getRules stub: { id: '30000000-0000-4000-8000-000000000001' }
   if (name.includes('rules_update')) inputExample.id = '30000000-0000-4000-8000-000000000001', inputExample.fields = { conditions: [] };
-  if (name.includes('budgets_setAmount')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.amount = 100;
-  if (name.includes('budgets_getMonth')) inputExample.month = '2025-12';
+  if (name.includes('budgets_set_amount')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.amount = 100;
+  if (name.includes('budgets_get_month')) inputExample.month = '2025-12';
   if (name.includes('budget_updates_batch')) inputExample.operations = [{ month: '2025-12', categoryId: '10000000-0000-4000-8000-000000000001', amount: 100 }];
-  if (name.includes('budgets_holdForNextMonth')) inputExample.month = '2025-12', inputExample.amount = 10000;
-  if (name.includes('budgets_resetHold')) inputExample.month = '2025-12'; // no categoryId — tool operates on whole month
-  if (name.includes('budgets_setCarryover')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.flag = true;
+  if (name.includes('budgets_hold_for_next_month')) inputExample.month = '2025-12', inputExample.amount = 10000;
+  if (name.includes('budgets_reset_hold')) inputExample.month = '2025-12'; // no categoryId: tool operates on the whole month
+  if (name.includes('budgets_set_carryover')) inputExample.month = '2025-12', inputExample.categoryId = '10000000-0000-4000-8000-000000000001', inputExample.flag = true;
   // #332: a fixed name keeps the smoke run from accumulating timestamped files.
   if (name.includes('budgets_export')) inputExample.filename = 'smoke-export.zip';
   // #334: the schema requires exactly one of path/base64; base64 avoids needing a real file.
@@ -250,6 +275,7 @@ console.log('Running generated tools smoke tests');
   if (name.includes('schedules_create')) inputExample.date = '2026-06-01';
   if (name.includes('schedules_update')) inputExample.id = '00000000-0000-0000-0000-000000000099';
   if (name.includes('schedules_delete')) inputExample.id = '00000000-0000-0000-0000-000000000099';
+  if (name.includes('schedules_dates')) inputExample.schedule_id = '00000000-0000-0000-0000-000000000099';
   if (name.includes('transfers_create')) inputExample.from_account = '11111111-1111-1111-1111-111111111111', inputExample.to_account = '22222222-2222-2222-2222-222222222222', inputExample.amount = 5000, inputExample.date = '2025-01-15';
   if (name.includes('tags_create')) inputExample.tag = 'groceries';
   if (name.includes('tags_update')) inputExample.id = '00000000-0000-0000-0000-0000000000aa', inputExample.tag = 'food';
@@ -282,12 +308,29 @@ console.log('Running generated tools smoke tests');
       // List/get tools that return a { result } wrapper
       // accounts_create / payees_create use createTool which wraps the returned id in { result }
       const resultWrappers = ['accounts_list', 'categories_get',
-        'payees_get', 'budgets_getMonth', 'budgets_getMonths', 'budgets_get_all',
+        'payees_get', 'budgets_get_month', 'budgets_get_months', 'budgets_get_all',
         'query_run', 'transactions_filter', 'transactions_get', 'transactions_import',
-        'bank_sync', 'budgets_setAmount', 'budgets_transfer',
-        'accounts_create', 'payees_create'];
+        'bank_sync', 'budgets_set_amount', 'budgets_transfer',
+        'accounts_create', 'payees_create', 'get_context'];
       if (resultWrappers.includes(n)) {
         if (!res || !('result' in res)) shapeErr(`expected { result } wrapper`);
+      }
+
+      if (n === 'get_context') {
+        const r = res?.result;
+        if (!Array.isArray(r?.accounts)) shapeErr('expected accounts array');
+        if (!Array.isArray(r?.categoryGroups)) shapeErr('expected categoryGroups array');
+        if (!Array.isArray(r?.payees)) shapeErr('expected payees array');
+        if (typeof r?.payeesTruncated !== 'boolean') shapeErr('expected payeesTruncated boolean');
+        if (typeof r?.payeeTotal !== 'number') shapeErr('expected payeeTotal number');
+      }
+
+      if (n === 'bank_sync') {
+        for (const k of ['newTransactions', 'matchedTransactions', 'updatedAccounts']) {
+          if (typeof res?.[k]?.count !== 'number' || !Array.isArray(res?.[k]?.ids)) shapeErr(`expected ${k} as { count, ids }`);
+        }
+        if (res.newTransactions.count !== 1 || res.newTransactions.ids[0] !== 't1') shapeErr('expected the stubbed new transaction');
+        if (typeof res?.truncated !== 'boolean') shapeErr('expected truncated boolean');
       }
 
       // Mutate / delete tools that return { success: true }
@@ -297,10 +340,25 @@ console.log('Running generated tools smoke tests');
         'rules_delete', 'rules_update',
         'schedules_delete', 'schedules_update',
         'transactions_delete', 'transactions_update',
-        'budgets_resetHold', 'budgets_holdForNextMonth',
-        'budgets_setCarryover', 'budget_updates_batch'];
+        'budgets_reset_hold', 'budgets_hold_for_next_month',
+        'budgets_set_carryover'];
       if (successTools.includes(n)) {
         if (!res || res.success !== true) shapeErr(`expected success=true`);
+      }
+
+      // #514: actual_transactions_merge reports which transaction survived
+      if (n === 'transactions_merge') {
+        const m = res?.result; // createTool wraps its return value in { result }
+        if (m?.success !== true) shapeErr('expected result.success=true');
+        if (typeof m?.keptId !== 'string') shapeErr('expected result.keptId string');
+        if (typeof m?.deletedId !== 'string') shapeErr('expected result.deletedId string');
+      }
+
+      // #516: actual_budget_updates_batch reports per-item verdicts, not { success }
+      if (n === 'budget_updates_batch') {
+        if (!Array.isArray(res?.succeeded)) shapeErr('expected succeeded array');
+        if (!Array.isArray(res?.failed)) shapeErr('expected failed array');
+        if (res?.total !== 1 || res?.successCount !== 1 || res?.failureCount !== 0) shapeErr('expected total/successCount/failureCount counts');
       }
 
       // Tools with custom named keys (not { result })
@@ -313,6 +371,11 @@ console.log('Running generated tools smoke tests');
       if (n === 'schedules_get') {
         if (!Array.isArray(res?.schedules)) shapeErr(`expected schedules array`);
         if (typeof res?.count !== 'number') shapeErr(`expected count number`);
+      }
+      if (n === 'schedules_dates') {
+        const d = res?.result; // createTool wraps its return value in { result }
+        if (!Array.isArray(d?.dates)) shapeErr('expected result.dates array');
+        if (typeof d?.truncated !== 'boolean') shapeErr('expected result.truncated boolean');
       }
       if (n === 'schedules_create') {
         if (typeof res?.id !== 'string') shapeErr(`expected id string`);
@@ -398,6 +461,14 @@ console.log('Running generated tools smoke tests');
       if (n === 'category_groups_create') {
         if (typeof res?.id !== 'string') shapeErr(`expected id string`);
         if (res?.success !== true) shapeErr(`expected success=true`);
+      }
+      // rules_create_batch: createTool wraps the batch verdicts in { result }
+      if (n === 'rules_create_batch') {
+        const r = res?.result;
+        if (!Array.isArray(r?.succeeded)) shapeErr(`expected result.succeeded array`);
+        if (!Array.isArray(r?.failed)) shapeErr(`expected result.failed array`);
+        if (r?.total !== 1 || r?.successCount !== 1 || r?.failureCount !== 0) shapeErr(`expected total 1, successCount 1, failureCount 0`);
+        if (r?.succeeded?.[0]?.id !== 'rule-new') shapeErr(`expected succeeded[0].id rule-new`);
       }
       // rules_create: old ToolDefinition pattern, returns { id, success }
       if (n === 'rules_create') {
@@ -610,6 +681,37 @@ console.log('Running generated tools smoke tests');
     }
   }
   // ── End regression #79 ───────────────────────────────────────────────────
+
+  // ── #478: a patterned recur config, and one without endMode, reach the adapter intact ──
+  // The recur object used to be a stripping z.object: patterns vanished on the way to
+  // createSchedule while the tool reported success.
+  {
+    console.log('\n[#478] schedules_create forwards patterns and does not inject endMode');
+    const seen = [];
+    adapterMod.default.createSchedule = async (schedule) => { seen.push(schedule); return stubResponses.createSchedule; };
+    try {
+      const mod  = toolsIndex['schedules_create'];
+      const tool = mod?.default ?? mod;
+      const patterned = { frequency: 'monthly', start: '2026-06-01', endMode: 'never', patterns: [{ type: 'day', value: -1 }] };
+      const r1 = await tool.call({ name: 'Rent', date: patterned });
+      const r2 = await tool.call({ name: 'Gym', date: { frequency: 'monthly', start: '2026-06-01' } });
+      if (r1?.id !== stubResponses.createSchedule || r2?.id !== stubResponses.createSchedule) {
+        console.error('[#478] expected { id } from both creates'); failures++;
+      } else if (JSON.stringify(seen[0]?.date?.patterns) !== JSON.stringify(patterned.patterns)) {
+        console.error(`[#478] patterns did not reach the adapter: ${JSON.stringify(seen[0]?.date)}`); failures++;
+      } else if (seen[1]?.date && 'endMode' in seen[1].date) {
+        console.error(`[#478] an endMode was injected: ${JSON.stringify(seen[1].date)}`); failures++;
+      } else {
+        console.log('OK [#478] patterns forwarded unchanged; a config without endMode forwarded without one');
+      }
+    } catch (e) {
+      console.error('[#478] unexpected error:', e && e.message);
+      failures++;
+    } finally {
+      adapterMod.default.createSchedule = async (..._args) => stubResponses.createSchedule;
+    }
+  }
+  // ── End #478 ─────────────────────────────────────────────────────────────
 
   // restore adapter
   Object.assign(adapterMod.default, originalAdapter);

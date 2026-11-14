@@ -18,12 +18,16 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { isApiInitialized, setApiInitialized } from './apiState.js';
+import { initApiLoggedIn } from './apiLogin.js';
 import { withApiLock, isApiLockHeld } from './apiLock.js';
 import { loadBudgetTracked } from './budgetLoader.js';
-import { withOpTimeout } from './opTimeout.js';
-import { initializeActualApi } from './actual-init-config.js';
 
 const DEFAULT_DATA_DIR = path.resolve(os.homedir() || '.', '.actual');
+
+/** Why a session left the pool: `evicted` is the #167 path (idle entry or explicit close),
+ *  `orphaned` is #530 (registered id, no entry, one idle window without a served request). */
+// #563: `closed` is a client-initiated DELETE; httpServer tears the session down itself.
+export type EvictionReason = 'evicted' | 'orphaned' | 'closed';
 
 interface ActualConnection {
   sessionId: string;
@@ -56,12 +60,47 @@ class ActualConnectionPool {
   // same window. This is callback-based eager teardown, not lazy query-on-demand:
   // a lazily-cleaned table would leak transport objects for sessions a client
   // abandons without reconnecting.
-  private evictionCallbacks: Array<(sessionId: string) => void> = [];
+  private evictionCallbacks: Array<(sessionId: string, reason: EvictionReason) => void> = [];
+  // #530: every HTTP session the transport layer registered, with the time it was last
+  // served. An entry in `connections` is not the only thing that must expire: an
+  // infra-error drop (or `switchBudget`'s slow path) removes the pool entry WITHOUT
+  // evicting the transport, and before #530 a client that then went away left its
+  // transport, owner record and init promise behind forever, because nothing timed an
+  // entry-less session. The sweep reaps a registered id that has no entry and was not
+  // served for one idle window ("orphaned"). `touch()` stamps it, so a served request
+  // keeps the session alive whether or not the entry is back.
+  private registered: Map<string, number> = new Map();
+  // #530 (review M1): requests currently being served per session. The orphan sweep skips a
+  // session with a request in flight: an entry-less session running a long operation (an
+  // import past the idle window, or a request queued behind another session's drain) has
+  // stamped its registration only at the START of the request, so without this the sweep
+  // would close its transport mid-operation. Entries have the #392 lock re-check and the
+  // #378 in-drain touch for the same hazard; registrations have neither.
+  private inFlight: Map<string, number> = new Map();
+  // #581: session ids that hold a slot under MAX_CONCURRENT_SESSIONS but have no initialized
+  // entry yet. Before this the cap counted initialized entries only, and an entry is created
+  // after the login and budget download, so every initialize that arrived while those were in
+  // flight saw the same count and was admitted: 6 parallel initializes all logged in under a cap
+  // of 2. A slot is now taken synchronously at admission (`reserveSession`) and handed over to
+  // the entry in one synchronous block in `getConnection`. Ids only: this count reaches the
+  // unauthenticated /health as a number, never as a list.
+  private reservations: Set<string> = new Set();
+  // #577: session id to the principal its admission was capped under, for the session's whole
+  // lifetime (not the pool entry's: a mid-session pool drop keeps the session, so it keeps
+  // counting). A principal's count is the number of values equal to it, computed by iterating,
+  // so there is no counter to drift and a principal with no sessions has no value here. Only
+  // capped admissions are recorded: the cap must be set and the caller must pass a principal.
+  // Deleted by `forgetSession` (every session end) and `releaseAdmission` (an initialize that
+  // never registered). Never logged, never in getStats.
+  private admissions: Map<string, string> = new Map();
+  private readonly MAX_SESSIONS_PER_PRINCIPAL: number | undefined;
 
   constructor() {
     // Read from environment variable or default to 15
     // @actual-app/api is a singleton, so concurrent sessions cause conflicts
     this.MAX_CONCURRENT_SESSIONS = parseInt(process.env.MAX_CONCURRENT_SESSIONS || '15', 10);
+    // #577: validated by the config schema, so no raw read here.
+    this.MAX_SESSIONS_PER_PRINCIPAL = config.MAX_SESSIONS_PER_PRINCIPAL;
     
     // Configurable idle timeout (in minutes)
     const idleTimeoutMinutes = parseInt(process.env.SESSION_IDLE_TIMEOUT_MINUTES || '5', 10);
@@ -71,6 +110,9 @@ class ActualConnectionPool {
     this.CLEANUP_INTERVAL = Math.max(Math.floor(this.IDLE_TIMEOUT / 5), 2 * 60 * 1000);
     
     logger.info(`[ConnectionPool] Max concurrent sessions: ${this.MAX_CONCURRENT_SESSIONS}`);
+    if (this.MAX_SESSIONS_PER_PRINCIPAL !== undefined) {
+      logger.info(`[ConnectionPool] Max sessions per principal: ${this.MAX_SESSIONS_PER_PRINCIPAL}`);
+    }
     logger.info(`[ConnectionPool] Session idle timeout: ${idleTimeoutMinutes} minutes`);
     logger.info(`[ConnectionPool] Cleanup interval: ${Math.floor(this.CLEANUP_INTERVAL / 1000)}s`);
     
@@ -150,7 +192,33 @@ class ActualConnectionPool {
    * sweep so the two can never disagree about where the boundary is (#167).
    */
   private isExpired(conn: ActualConnection): boolean {
-    return (Date.now() - conn.lastActivity) > this.IDLE_TIMEOUT;
+    // #530: a registered session's clock is the later of the entry's lastActivity and its
+    // last served request, so a recycled entry cannot make a session look idle.
+    return this.isPastIdle(Math.max(conn.lastActivity, this.registered.get(conn.sessionId) ?? 0));
+  }
+
+  /** The one boundary for entries and registrations alike (#167, #530). */
+  private isPastIdle(lastActivity: number): boolean {
+    return (Date.now() - lastActivity) > this.IDLE_TIMEOUT;
+  }
+
+  /**
+   * #530: the transport layer registers each HTTP session when it registers the transport,
+   * so the pool can time it even while it has no entry. Idempotent; stamps "now".
+   */
+  registerSession(sessionId: string): void {
+    this.registered.set(sessionId, Date.now());
+  }
+
+  /**
+   * #530: drop a registration (idempotent). Every eviction path calls this itself.
+   * #577: also drops the session's per-principal admission. Every session end (DELETE, idle
+   * eviction, an evicting shutdown, the orphan sweep) reaches here through the transport's
+   * teardown; a non-evicting `shutdownConnection` does not, so the session keeps counting.
+   */
+  forgetSession(sessionId: string): void {
+    this.registered.delete(sessionId);
+    this.admissions.delete(sessionId);
   }
 
   /**
@@ -159,13 +227,43 @@ class ActualConnectionPool {
    * this, the pool only stamped lastActivity at init/switch, so an actively
    * used session's pool clock never advanced; httpServer kept a parallel
    * activity map to compensate, which is the drift this consolidation removes.
-   * No-op for unknown sessions (does NOT create an entry).
+   * No-op for unknown sessions (does NOT create an entry). #530: also stamps the session's
+   * registration when it has one, so a session whose entry was dropped stays alive while
+   * it is being served (the #378 in-drain touch feeds the same clock). Never registers.
    */
   touch(sessionId: string): void {
+    const now = Date.now();
     const conn = this.connections.get(sessionId);
     if (conn) {
-      conn.lastActivity = Date.now();
+      conn.lastActivity = now;
     }
+    if (this.registered.has(sessionId)) {
+      this.registered.set(sessionId, now);
+    }
+  }
+
+  /**
+   * #530: mark a request as in flight for the session (and touch it). While the count is
+   * above zero the orphan sweep leaves the session alone. httpServer calls this on POST only:
+   * an open GET event stream is idle by nature and must not pin an orphan.
+   */
+  beginRequest(sessionId: string): void {
+    this.touch(sessionId);
+    this.inFlight.set(sessionId, (this.inFlight.get(sessionId) ?? 0) + 1);
+  }
+
+  /**
+   * #530: the request has ended (response finished or the client went away). Drops the
+   * in-flight count and touches, so the idle window starts from the END of a long request,
+   * not its start. Idempotent for an unknown or already-evicted session.
+   */
+  endRequest(sessionId: string): void {
+    const n = this.inFlight.get(sessionId);
+    if (n !== undefined) {
+      if (n <= 1) this.inFlight.delete(sessionId);
+      else this.inFlight.set(sessionId, n - 1);
+    }
+    this.touch(sessionId);
   }
 
   /**
@@ -173,16 +271,19 @@ class ActualConnectionPool {
    * explicit close). httpServer registers one that closes the transport and
    * drops its table entries, keeping both tables consistent (#167). Listeners
    * must not throw; any error is logged and swallowed so one bad listener
-   * cannot abort the removal of others.
+   * cannot abort the removal of others. #530: the listener also receives the reason
+   * (`evicted` for the #167 paths, `orphaned` for the entry-less sweep).
    */
-  onSessionEvicted(cb: (sessionId: string) => void): void {
+  onSessionEvicted(cb: (sessionId: string, reason: EvictionReason) => void): void {
     this.evictionCallbacks.push(cb);
   }
 
-  private fireEviction(sessionId: string): void {
+  private fireEviction(sessionId: string, reason: EvictionReason = 'evicted'): void {
+    this.registered.delete(sessionId); // #530: whatever the path, the session is gone
+    this.inFlight.delete(sessionId); // #530: a late endRequest finds nothing to decrement
     for (const cb of this.evictionCallbacks) {
       try {
-        cb(sessionId);
+        cb(sessionId, reason);
       } catch (err) {
         logger.error(`[ConnectionPool] Eviction listener threw for session ${sessionId} (ignoring):`, err);
       }
@@ -190,12 +291,77 @@ class ActualConnectionPool {
   }
 
   /**
-   * Check if we can accept a new session (under the concurrent limit)
-   * Returns true if limit not reached, false otherwise
+   * #581: slots held under MAX_CONCURRENT_SESSIONS, optionally leaving one session out: every
+   * initialized entry, plus every reservation whose id has no initialized entry (a session that
+   * holds both counts once).
    */
-  canAcceptNewSession(): boolean {
-    const activeConnections = Array.from(this.connections.values()).filter(c => c.initialized).length;
-    return activeConnections < this.MAX_CONCURRENT_SESSIONS;
+  private slotsInUse(exclude?: string): number {
+    let n = 0;
+    for (const [id, c] of this.connections) if (c.initialized && id !== exclude) n++;
+    for (const id of this.reservations) if (id !== exclude && !this.connections.get(id)?.initialized) n++;
+    return n;
+  }
+
+  /** #581: reservations still waiting for their entry (a count only, see `reservations`). */
+  private pendingReservations(): number {
+    let n = 0;
+    for (const id of this.reservations) if (!this.connections.get(id)?.initialized) n++;
+    return n;
+  }
+
+  /**
+   * #581: take a slot for `sessionId`, synchronously. The count and the add have no `await`
+   * between them, which is the whole fix: parallel callers cannot all see the same count.
+   * A session that already holds a slot (an initialized entry or a reservation) reserves again
+   * without counting twice, which is how switchBudget keeps its slot across its slow path.
+   * Every successful call must be paired with `releaseReservation` on the caller's exit path;
+   * `getConnection` hands a reservation over to the entry on success.
+   */
+  reserveSession(sessionId: string): boolean {
+    return this.admitSession(sessionId).admitted;
+  }
+
+  /**
+   * #577: `reserveSession` plus the per-principal cap, in the same synchronous call. The global
+   * check runs first, then the per-principal one; a refusal of either scope records nothing.
+   * Only the initialize route passes a principal, and only for a request that is capped (see
+   * `capPrincipal` in httpServer.ts); every other caller is bounded by the global cap alone.
+   * A principal refusal carries the caller's own cap and count and nothing about anyone else.
+   */
+  admitSession(sessionId: string, principal?: string): AdmissionResult {
+    const holds = this.reservations.has(sessionId) || this.connections.get(sessionId)?.initialized === true;
+    if (!holds && this.slotsInUse() >= this.MAX_CONCURRENT_SESSIONS) return { admitted: false, scope: 'global' };
+    const cap = this.MAX_SESSIONS_PER_PRINCIPAL;
+    const capped = principal !== undefined && cap !== undefined;
+    if (capped && !this.admissions.has(sessionId)) {
+      const count = this.principalSessions(principal);
+      if (count >= cap) return { admitted: false, scope: 'principal', cap, count };
+    }
+    this.reservations.add(sessionId);
+    if (capped) this.admissions.set(sessionId, principal);
+    return { admitted: true };
+  }
+
+  /** #577: sessions admitted under `principal` (iterated, see `admissions`). */
+  private principalSessions(principal: string): number {
+    let n = 0;
+    for (const p of this.admissions.values()) if (p === principal) n++;
+    return n;
+  }
+
+  /** #581: give back a slot that never became an entry. Idempotent; a no-op after the hand-over. */
+  releaseReservation(sessionId: string): void {
+    this.reservations.delete(sessionId);
+  }
+
+  /**
+   * #577: give back everything an initialize that never registered took: its slot and its
+   * per-principal admission. Idempotent. A session that did register keeps its admission until
+   * `forgetSession`.
+   */
+  releaseAdmission(sessionId: string): void {
+    this.reservations.delete(sessionId);
+    this.admissions.delete(sessionId);
   }
 
   /**
@@ -265,8 +431,11 @@ class ActualConnectionPool {
       return;
     }
 
-    // Check concurrent session limit
-    const activeConnections = Array.from(this.connections.values()).filter(c => c.initialized).length;
+    // Check concurrent session limit. #581: against every OTHER session's slot, reservations
+    // included, and take this session's slot in the same synchronous block, so a caller that
+    // did not reserve first (switchBudget's slow path, a non-HTTP caller) is just as atomic as
+    // the initialize route. A caller that already reserved keeps its reservation.
+    const activeConnections = this.slotsInUse(sessionId);
     if (activeConnections >= this.MAX_CONCURRENT_SESSIONS) {
       const errorMsg = `[ConnectionPool] Max concurrent sessions (${this.MAX_CONCURRENT_SESSIONS}) reached. Active: ${activeConnections}. Please close some connections or wait for idle sessions to timeout.`;
       logger.warn(errorMsg);
@@ -279,7 +448,9 @@ class ActualConnectionPool {
     const SERVER_URL = budgetOverride?.serverUrl ?? config.ACTUAL_SERVER_URL;
     const PASSWORD = budgetOverride?.password ?? config.ACTUAL_PASSWORD;
     const BUDGET_SYNC_ID = budgetOverride?.syncId ?? config.ACTUAL_BUDGET_SYNC_ID;
-    const BUDGET_PASSWORD = budgetOverride?.encryptionPassword ?? process.env.ACTUAL_BUDGET_PASSWORD;
+    // #571: an override carries its own budget's encryption password, absent included. Falling back
+    // to the default budget's would bind a budget from another server to a password it never had.
+    const BUDGET_PASSWORD = budgetOverride ? budgetOverride.encryptionPassword : process.env.ACTUAL_BUDGET_PASSWORD;
 
     // Use shared data directory so changes persist across sessions
     // This is critical: all sessions must share the same database to avoid data loss
@@ -289,6 +460,9 @@ class ActualConnectionPool {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
 
+    // #581: taken here, still with no `await` since the check above, so that a throw before the
+    // try (the mkdir) cannot leave a slot behind; the catch below releases it on any failure.
+    this.reservations.add(sessionId);
     try {
       // #390 round 2: hold the api mutex across init + download.
       //
@@ -307,10 +481,7 @@ class ActualConnectionPool {
       // Bound the session-open init/download (#270): this is the HTTP exposure.
       // A stalled upstream here would otherwise hang session open unbounded and,
       // because the api singleton is process-global, wedge other sessions too.
-      await withOpTimeout(
-        () => initializeActualApi(DATA_DIR, SERVER_URL, PASSWORD),
-        'pool init',
-      );
+      await initApiLoggedIn(DATA_DIR, { serverUrl: SERVER_URL, password: PASSWORD || '' }, 'pool init');
 
       logger.info(`[ConnectionPool] Downloading budget for session: ${sessionId}`);
 
@@ -340,7 +511,10 @@ class ActualConnectionPool {
         syncId: BUDGET_SYNC_ID,
       };
 
+      // #581: the hand-over. Both in one synchronous block, so the slot is never counted twice
+      // (entry plus reservation) or not at all.
       this.connections.set(sessionId, conn);
+      this.reservations.delete(sessionId);
       logger.info(`[ConnectionPool] Connection ready for session: ${sessionId}`);
 
     } catch (err) {
@@ -375,6 +549,8 @@ class ActualConnectionPool {
 
       // Ensure this session is not in the connections map
       this.connections.delete(sessionId);
+      // #581: and holds no slot.
+      this.reservations.delete(sessionId);
 
       throw err;
     }
@@ -406,10 +582,7 @@ class ActualConnectionPool {
       // process-global singleton, so it takes the same mutex.
       await withApiLock(async () => {
       // Bound the session-open init/download (#270), same as getConnection.
-      await withOpTimeout(
-        () => initializeActualApi(DATA_DIR, SERVER_URL, PASSWORD),
-        'pool init',
-      );
+      await initApiLoggedIn(DATA_DIR, { serverUrl: SERVER_URL, password: PASSWORD || '' }, 'pool init');
 
       // #390: the shared tracked loader, not a hand-written download. It clears the record
       // BEFORE starting and keeps an abandoned load registered, so a session-open download that
@@ -725,6 +898,24 @@ class ActualConnectionPool {
         await this.shutdownConnection(sessionId, { evict: true, onlyIfExpired: true });
       }
     }
+
+    // #530: registered sessions with no entry. Walked AFTER the entry evictions (each of
+    // which already dropped its registration) and synchronously: there is no api call to
+    // make, only the transport layer's tables to clear, so the lock is not involved and a
+    // request served in the meantime has already stamped the registration. A session with
+    // a request still in flight is never an orphan, however long that request runs.
+    const orphans: string[] = [];
+    for (const [sessionId, lastServed] of this.registered.entries()) {
+      if (!this.connections.has(sessionId) && !this.inFlight.has(sessionId) && this.isPastIdle(lastServed)) {
+        orphans.push(sessionId);
+      }
+    }
+    if (orphans.length > 0) {
+      logger.info(`[ConnectionPool] Reaping ${orphans.length} orphaned sessions (no pool entry, idle for one window)`);
+      for (const sessionId of orphans) {
+        this.fireEviction(sessionId, 'orphaned');
+      }
+    }
   }
 
   /**
@@ -779,6 +970,8 @@ class ActualConnectionPool {
       await teardown(true).catch(() => { /* cleanup is best effort */ });
     });
 
+    this.registered.clear(); // #530: the transport layer is going down with the pool
+    this.inFlight.clear();
     logger.info('[ConnectionPool] All connections shut down');
   }
 
@@ -795,6 +988,7 @@ class ActualConnectionPool {
   getStats(): { 
     totalSessions: number; 
     activeSessions: number;
+    pendingReservations: number;
     maxConcurrent: number;
     sharedConnection: boolean;
     sessions: Array<{ sessionId: string; lastActivity: Date; idleMinutes: number }>;
@@ -809,12 +1003,19 @@ class ActualConnectionPool {
     return {
       totalSessions: this.connections.size,
       activeSessions: Array.from(this.connections.values()).filter(c => c.initialized).length,
+      pendingReservations: this.pendingReservations(),
       maxConcurrent: this.MAX_CONCURRENT_SESSIONS,
       sharedConnection: this.sharedConnection?.initialized || false,
       sessions
     };
   }
 }
+
+/** #577: the outcome of `admitSession`. A refusal records nothing. */
+export type AdmissionResult =
+  | { admitted: true }
+  | { admitted: false; scope: 'global' }
+  | { admitted: false; scope: 'principal'; cap: number; count: number };
 
 // Export singleton instance
 export const connectionPool = new ActualConnectionPool();

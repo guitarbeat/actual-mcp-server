@@ -13,7 +13,7 @@ set -e  # Exit on error
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-COMPOSE_FILE="$PROJECT_ROOT/docker-compose.test.yaml"
+COMPOSE_FILE="$PROJECT_ROOT/tests/e2e/compose.yaml"
 
 # Parse arguments
 NO_CLEANUP=false
@@ -85,16 +85,30 @@ log_error() {
   echo -e "${RED}✗${NC} $1"
 }
 
-# Cleanup function
+# Cleanup function. Runs from the EXIT trap, so `$?` on its first line is the exit status the
+# script is leaving with; capturing it first is what lets the dump below run only on failure.
+#
+# #593: on a failed run, print the service containers' logs BEFORE `down -v` removes them. A
+# later CI step cannot do this for a run that FAILED: this trap has already torn the stack down
+# by then. A run the CI step timeout KILLS is different: when that was tried (run 40330966576,
+# timeout 1), nothing from this trap reached the job log and the containers were still up at the
+# next step, so the workflow's cleanup step dumps them as well (ci-cd.yml, job docker-e2e). The
+# runner's own output is not dumped here because the `tee` below already streams it. `|| true`
+# keeps the dump from ever changing the exit code.
 cleanup() {
+  local rc=$?
   if [ "$NO_CLEANUP" = false ]; then
-    log_info "Cleaning up Docker resources..."
     cd "$PROJECT_ROOT"
+    if [ "$rc" -ne 0 ]; then
+      log_warn "Run failed (exit $rc): last 200 lines of each service container, before teardown"
+      docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200 mcp-server-test actual-budget-test actual-budget-stdio-test 2>&1 || true
+    fi
+    log_info "Cleaning up Docker resources..."
     docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
     log_success "Cleanup complete"
   else
     log_warn "Skipping cleanup (--no-cleanup flag set)"
-    log_info "To manually cleanup: cd $PROJECT_ROOT && docker compose -f docker-compose.test.yaml down -v"
+    log_info "To manually cleanup: cd $PROJECT_ROOT && docker compose -f tests/e2e/compose.yaml down -v"
   fi
 }
 
@@ -165,7 +179,13 @@ fi
 
 # Step 2: Start Actual Budget server and bootstrap
 log_info "Step 2/5: Starting Actual Budget server..."
+# #618: compose never pulls a tag it already has, so a local run kept testing whatever
+# actual-server:latest was cached (26.7.0 while 26.11.0 was out). CI starts clean either way.
+# Offline, a failed pull falls back to the cached image instead of aborting the run.
+docker compose -f "$COMPOSE_FILE" pull --quiet actual-budget-test \
+  || log_warn "Could not pull actual-server:latest, testing the cached image"
 docker compose -f "$COMPOSE_FILE" up -d actual-budget-test
+log_info "Actual Budget server $(docker compose -f "$COMPOSE_FILE" exec -T actual-budget-test node -p "require('/app/package.json').version" 2>/dev/null || echo 'version unknown')"
 
 log_info "Step 3/5: Waiting for Actual Budget to be ready..."
 sleep 3
@@ -349,7 +369,7 @@ if [ "$TEST_LEVEL" = "full" ] && [ $TEST_EXIT_CODE -eq 0 ] && [ "${RUN_STDIO_E2E
   # set -e is active, so capture the exit through an `if` (a bare `cmd; rc=$?` would exit the
   # script the moment playwright fails, before the advisory check below ever runs).
   if MCP_TEST_TRANSPORT=stdio npx playwright test \
-    --config=playwright.config.docker.ts --project=docker-e2e-full-stdio; then
+    --config=tests/e2e/playwright.config.docker.ts --project=docker-e2e-full-stdio; then
     STDIO_EXIT_CODE=0
   else
     STDIO_EXIT_CODE=$?
@@ -362,13 +382,53 @@ if [ "$TEST_LEVEL" = "full" ] && [ $TEST_EXIT_CODE -eq 0 ] && [ "${RUN_STDIO_E2E
       log_error "STDIO transport FAILED (the HTTP transport passed)."
       log_info "Re-run just it with:"
       log_info "  MCP_STDIO_SERVER_URL=http://actual-budget-stdio-test:5006 MCP_STDIO_SYNC_ID_FILE=/tmp-stdio/actual-sync-id.txt \\"
-      log_info "  MCP_TEST_TRANSPORT=stdio npx playwright test --config=playwright.config.docker.ts --project=docker-e2e-full-stdio"
+      log_info "  MCP_TEST_TRANSPORT=stdio npx playwright test --config=tests/e2e/playwright.config.docker.ts --project=docker-e2e-full-stdio"
       TEST_EXIT_CODE=$STDIO_EXIT_CODE
     else
       log_warn "STDIO transport had failures (advisory: STDIO_E2E_GATING=false)."
     fi
   else
     log_success "STDIO transport passed"
+  fi
+  echo ""
+fi
+
+# Step 6c (#681): the compact tool surface, over stdio, on the HOST like Step 6b.
+#
+# Independent of 6b: it needs the stack, not the 6b result, so a 6b failure does not hide a
+# compact-leg failure (and the other way round). It runs at the full level whenever
+# RUN_STDIO_E2E is not false, and gates under STDIO_E2E_GATING exactly as 6b does. It reuses 6b's
+# dedicated stdio Actual server and budget; the legs are sequential, so nothing is shared at once.
+# MCP_E2E_TOOL_SURFACE=compact makes tests/e2e/stdio-client.ts exec the server with
+# MCP_TOOL_SURFACE=compact: the only run of the compact-only dispatch path.
+if [ "$TEST_LEVEL" != "full" ]; then
+  log_info "Step 6c skipped: the compact leg runs only at the full level (level is $TEST_LEVEL)"
+elif [ "${RUN_STDIO_E2E:-true}" = "false" ]; then
+  log_info "Step 6c skipped: RUN_STDIO_E2E=false"
+else
+  export MCP_STDIO_SERVER_URL="${MCP_STDIO_SERVER_URL:-http://actual-budget-stdio-test:5006}"
+  export MCP_STDIO_SYNC_ID_FILE="${MCP_STDIO_SYNC_ID_FILE:-/tmp-stdio/actual-sync-id.txt}"
+
+  log_info "Step 6c: Running the compact surface leg over STDIO (host-side, docker exec)..."
+  echo ""
+  if MCP_TEST_TRANSPORT=stdio MCP_E2E_TOOL_SURFACE=compact npx playwright test \
+    --config=tests/e2e/playwright.config.docker.ts --project=docker-e2e-compact-stdio; then
+    COMPACT_EXIT_CODE=0
+  else
+    COMPACT_EXIT_CODE=$?
+  fi
+  if [ $COMPACT_EXIT_CODE -ne 0 ]; then
+    if [ "${STDIO_E2E_GATING:-true}" = "true" ]; then
+      log_error "Compact surface leg FAILED."
+      log_info "Re-run just it with:"
+      log_info "  MCP_STDIO_SERVER_URL=http://actual-budget-stdio-test:5006 MCP_STDIO_SYNC_ID_FILE=/tmp-stdio/actual-sync-id.txt \\"
+      log_info "  MCP_TEST_TRANSPORT=stdio MCP_E2E_TOOL_SURFACE=compact npx playwright test --config=tests/e2e/playwright.config.docker.ts --project=docker-e2e-compact-stdio"
+      TEST_EXIT_CODE=$COMPACT_EXIT_CODE
+    else
+      log_warn "Compact surface leg had failures (advisory: STDIO_E2E_GATING=false)."
+    fi
+  else
+    log_success "Compact surface leg passed"
   fi
   echo ""
 fi
